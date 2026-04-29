@@ -76,11 +76,10 @@ def send_result(api_key, job_id, output):
 
 
 def send_job_status(api_key: str, job_id: int, status: str):
-
     requests.post(
         "http://127.0.0.1:8000/agents/job-status",
+        headers={"x-api-key": api_key},
         json={
-            "api_key": api_key,
             "job_id": job_id,
             "status": status
         }
