@@ -215,12 +215,12 @@ def get_next_job(
     if not jobs:
         return None
         
-    agent_caps = agent.capabilities.split(".")
+    agent_caps = agent.capabilities.split(",")
 
     # prioritize jobs assigned to this agent OR unassigned
     eligible_jobs = [
         j for j in jobs
-        if j.agent_id is None or j.agent_id == agent.id
+        if (j.agent_id is None or j.agent_id == agent.id)
         and j.type in agent_caps
     ]
 
