@@ -7,15 +7,17 @@ import requests
 import subprocess
 import xml.etree.ElementTree as ET
 
-SERVER_URL = "http://127.0.0.1:8000"
-AGENT_NAME = "agent-1"
-API_KEY_FILE = "agent_key.txt"
+# --- CONFIG ---
+SERVER_URL = os.environ.get("VAPT_SERVER_URL", "http://127.0.0.1:8000")
+AGENT_NAME = os.environ.get("VAPT_AGENT_NAME", "agent-default")
+CAPABILITIES = os.environ.get("VAPT_CAPABILITIES", "nmap_scan")
+API_KEY_FILE = os.environ.get("VAPT_KEY_FILE", f"{AGENT_NAME}_key.txt")
 
 
 def register():
     payload = {
         "name": AGENT_NAME,
-        "capabilities": "nmap_scan",
+        "capabilities": CAPABILITIES,
     }
 
     response = requests.post(
@@ -32,7 +34,7 @@ def register():
     with open(API_KEY_FILE, "w") as f:
         f.write(api_key)
 
-    print(f"[+] Registered. API Key saved: {api_key}")
+    print(f"[+] Registered as '{AGENT_NAME}'. API Key saved.")
     return api_key
 
 
@@ -77,7 +79,7 @@ def send_result(api_key, job_id, output):
 
 def send_job_status(api_key: str, job_id: int, status: str):
     requests.post(
-        "http://127.0.0.1:8000/agents/job-status",
+        f"{SERVER_URL}/agents/job-status",
         headers={"x-api-key": api_key},
         json={
             "job_id": job_id,
@@ -143,7 +145,6 @@ def run_nmap(target):
     return parsed
 
 
-#This is the sixth execute_job ive made...kill me
 def execute_job(job: dict, api_key: str):
 
     job_type = job.get("type")
@@ -153,7 +154,6 @@ def execute_job(job: dict, api_key: str):
     try:
         print(f"[DEBUG] Job {job_id} → RUNNING")
 
-        # This job status below will tell server job started
         send_job_status(api_key, job_id, "running")
 
         if job_type == "nmap_scan":
@@ -170,8 +170,7 @@ def execute_job(job: dict, api_key: str):
         print("[+] Result + status sent")
 
     except Exception as e:
-        print(f"[ERROR] Job Execution failed: {e}")
-
+        print(f"[ERROR] Job execution failed: {e}")
         send_job_status(api_key, job_id, "failed")
 
 
@@ -181,7 +180,7 @@ def main():
     if not api_key:
         api_key = register()
 
-    print("[*] Starting job polling...")
+    print(f"[*] Starting job polling as '{AGENT_NAME}'...")
 
     while True:
         try:
@@ -202,9 +201,9 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
+    
+    
+    
 #IMPORTS
 
 #CONFIG/CONSTANTS

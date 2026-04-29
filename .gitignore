@@ -1,5 +1,4 @@
-agent_key.txt
-agent2_key.txt
+*_key.txt
 vapt.db
 __pycache__/
 *.pyc
