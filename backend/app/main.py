@@ -267,15 +267,27 @@ def heartbeat(
 
 
 @app.post("/agents/job-status")
-def update_job_status(data: dict, db: Session = Depends(get_db)):
+def update_job_status(
+    data: dict,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    agent = get_agent_by_api_key(x_api_key, db)
+
     job = db.query(Job).filter(Job.id == data["job_id"]).first()
 
-    if job:
-        job.status = data["status"]
-        
-        if data["status"] == "running":
-            job.started_at = datetime.utcnow()
-        db.commit()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="This job does not belong to you")
+
+    job.status = data["status"]
+
+    if data["status"] == "running":
+        job.started_at = datetime.utcnow()
+
+    db.commit()
 
     return {"ok": True}
 
