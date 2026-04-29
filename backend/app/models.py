@@ -2,9 +2,6 @@
 
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
 from datetime import datetime
-
-last_seen = Column(DateTime, default=datetime.utcnow)
-
 import uuid
 
 from .db import Base

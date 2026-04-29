@@ -45,37 +45,6 @@ def get_agent_by_api_key(api_key: str, db: Session):
     return agent
 
 
-# 🚀 NEW ENDPOINT
-@app.get("/agents/jobs", response_model=JobResponse | None)
-def get_job(
-    x_api_key: str = Header(...),
-    db: Session = Depends(get_db)
-):
-    agent = get_agent_by_api_key(x_api_key, db)
-    
-    if not agent.last_seen or (datetime.utcnow() - agent.last_seen) > timedelta(seconds=30):
-        return {"job": None}
-    
-    job = (
-    db.query(Job)
-    .filter(Job.status == "pending")
-    .filter(
-        (Job.agent_id == agent.id) | (Job.agent_id == None)
-    )
-    .first()
-)
-
-    if not job:
-        return None
-
-    job.status = "running"
-    job.agent_id = agent.id
-    db.commit()
-    db.refresh(job)
-
-    return job
-
-
 @app.post("/agents/results")
 def submit_result(
     result: ResultCreate,
