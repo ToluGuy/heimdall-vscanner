@@ -170,6 +170,7 @@ def get_agent_load(db, agent_id: int):
 def get_next_job(
     db: Session = Depends(get_db),
     x_api_key: str = Header(...)
+    x_agent_mode: str = Header(default="agent")
 ):
     now = datetime.utcnow()
 
@@ -180,6 +181,7 @@ def get_next_job(
 
     jobs = db.query(Job).filter(
         Job.status == "pending",
+        Job.mode == x_agent_mode,
         (Job.next_run_at == None) | (Job.next_run_at <= now)
     ).all()
 
@@ -220,8 +222,8 @@ def get_next_job(
     return {
         "id": job.id,
         "type": job.type,
-        "target": job.target
-        "mode": job.mode
+        "target": job.target,
+        "mode": job.mode,
         "profile": job.profile
     }
 
