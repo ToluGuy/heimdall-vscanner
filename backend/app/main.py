@@ -92,13 +92,16 @@ def get_results(db: Session = Depends(get_db)):
 def create_job(job: JobCreate, db: Session = Depends(get_db)):
 
     priority = job.priority if job.priority else "medium"
-
+    
+    
     new_job = Job(
         type=job.type,
         target=job.target,
         agent_id=job.agent_id,
         status="pending",
-        priority=priority
+        priority=job.priority if job.priority else "medium",
+        mode=job.mode if job.mode else "remote",
+        profile=job.profile if job.profile else "standard"
     )
 
     db.add(new_job)
