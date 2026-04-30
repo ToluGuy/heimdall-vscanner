@@ -52,7 +52,10 @@ def load_api_key():
 # --- JOB COMMUNICATION ---
 
 def get_job(api_key):
-    headers = {"x-api-key": api_key}
+    headers = {
+        "x-api-key": api_key,
+        "x-agent-mode": "remote"
+    }
 
     response = requests.get(
         f"{SERVER_URL}/jobs/next",

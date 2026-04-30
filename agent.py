@@ -46,7 +46,10 @@ def load_api_key():
 
 
 def get_job(api_key):
-    headers = {"x-api-key": api_key}
+    headers = {
+        "x-api-key": api_key,
+        "x-agent-mode": "agent"
+    }
 
     response = requests.get(
         f"{SERVER_URL}/jobs/next",
@@ -202,30 +205,3 @@ def main():
 if __name__ == "__main__":
     main()
     
-    
-    
-#IMPORTS
-
-#CONFIG/CONSTANTS
-
-#AUTH FUNCTIONS:
-#register
-#load_api_key
-
-#JOB COMMUNICATION FUNCTION:
-#get_job
-#send_result
-#send_job_status
-
-#AGENT HEALTH:
-#send_heartbeat
-
-#SCANNERS / TOOLS
-#parse_nmap_tools
-#run_nmap
-
-#EXECUTION ENGINE:
-#execute_job
-
-#MAIN LOOP:
-#main
