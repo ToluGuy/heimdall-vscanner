@@ -91,9 +91,6 @@ def get_results(db: Session = Depends(get_db)):
 @app.post("/jobs/create")
 def create_job(job: JobCreate, db: Session = Depends(get_db)):
 
-    priority = job.priority if job.priority else "medium"
-    
-    
     new_job = Job(
         type=job.type,
         target=job.target,
@@ -330,8 +327,20 @@ def dashboard():
 
     <h2>Create Job</h2>
     <div>
-        <input id="target" placeholder="Target (e.g. 127.0.0.1)">
+        <input id="target" placeholder="Target (e.g. 192.168.1.50)">
         <input id="agent_id" placeholder="Agent ID (optional)">
+        <select id="job_type">
+            <option value="nmap_scan">Nmap Scan</option>
+        </select>
+        <select id="mode">
+            <option value="remote">Remote</option>
+            <option value="agent">Agent</option>
+        </select>
+        <select id="profile">
+            <option value="standard">Standard</option>
+            <option value="light">Light</option>
+            <option value="full">Full</option>
+        </select>
         <button onclick="createJob()">Create</button>
     </div>
 
@@ -367,13 +376,19 @@ function setJobFilter(filter) {
     loadJobs();
 }
 
+
 async function createJob() {
     let target = document.getElementById("target").value;
     let agent_id = document.getElementById("agent_id").value;
+    let type = document.getElementById("job_type").value;
+    let mode = document.getElementById("mode").value;
+    let profile = document.getElementById("profile").value;
 
     let payload = {
-        type: "nmap_scan",
-        target: target
+        type: type,
+        target: target,
+        mode: mode,
+        profile: profile
     };
 
     if (agent_id) {
@@ -416,8 +431,7 @@ async function loadJobs() {
         data = data.filter(j => j.status === jobFilter);
     }
     
-
-    let html = "<table><tr><th>ID</th><th>Type</th><th>Target</th><th>Status</th><th>Priority</th><th>Agent</th></tr>";
+    let html = "<table><tr><th>ID</th><th>Type</th><th>Target</th><th>Status</th><th>Priority</th><th>Mode</th><th>Profile</th><th>Agent</th></tr>";
 
     data.forEach(j => {
         html += `<tr>
@@ -426,6 +440,8 @@ async function loadJobs() {
             <td>${j.target}</td>
             <td>${j.status}</td>
             <td>${j.priority}</td>
+            <td>${j.mode}</td>
+            <td>${j.profile}</td>
             <td>${j.agent}</td>
         </tr>`;
     });
