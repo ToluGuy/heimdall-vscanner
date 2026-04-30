@@ -38,6 +38,8 @@ class Job(Base):
     started_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     next_run_at = Column(DateTime, nullable=True)
+    mode = Column(String, default="remote") # agent / remote
+    profile = Column(String,default="standard") # light / standard / full
     
 
 class Result(Base):

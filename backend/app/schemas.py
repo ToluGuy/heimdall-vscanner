@@ -44,3 +44,5 @@ class JobCreate(BaseModel):
     target: str
     agent_id: Optional[int] = None
     priority: str | None = "medium"
+    mode: str | None = "remote"
+    profile: str | None = "standard"
