@@ -221,6 +221,8 @@ def get_next_job(
         "id": job.id,
         "type": job.type,
         "target": job.target
+        "mode": job.mode
+        "profile": job.profile
     }
 
 
