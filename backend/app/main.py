@@ -154,7 +154,9 @@ def get_jobs(db: Session = Depends(get_db)):
             "target": j.target,
             "status": j.status,
             "priority": j.priority,
-            "agent": agent_name or "any"
+            "agent": agent_name or "any",
+            "mode": j.mode,
+            "profile": j.profile
         })
 
     return result
