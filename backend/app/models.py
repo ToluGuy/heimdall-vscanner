@@ -31,15 +31,16 @@ class Job(Base):
     status = Column(String, default="pending")  # pending, running, done
     agent_id = Column(Integer, ForeignKey("agents.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    completed_at = Column(DateTIme, default=datetime.utcnow)
     priority = Column(String,default="medium") #high/medium/low
     retries = Column(Integer, default=0)
     max_retries = Column(Integer, default=3) #max of 3 but can be changed
-    #job model maybe
-    started_at = Column(DateTime, nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     next_run_at = Column(DateTime, nullable=True)
     mode = Column(String, default="remote") # agent / remote
     profile = Column(String,default="standard") # light / standard / full
+    cleared = Column(Bollean, default="True"
     
 
 class Result(Base):
