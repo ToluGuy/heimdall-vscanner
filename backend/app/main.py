@@ -169,7 +169,7 @@ def get_agent_load(db, agent_id: int):
 @app.get("/jobs/next")
 def get_next_job(
     db: Session = Depends(get_db),
-    x_api_key: str = Header(...)
+    x_api_key: str = Header(...),
     x_agent_mode: str = Header(default="agent")
 ):
     now = datetime.utcnow()
