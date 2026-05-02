@@ -133,9 +133,15 @@ def get_agents(db: Session = Depends(get_db)):
 
 #Updated Job Line
 @app.get("/jobs")
-def get_jobs(db: Session = Depends(get_db)):
-    jobs = db.query(Job).all()
-
+def get_jobs(
+    db: Session = Depends(get_db),
+    show_history: bool = False
+):
+    if show_history:
+        jobs = db.query(Job).all()
+    else:
+        jobs = db.query(Job).filter(Job.cleared == False).all()
+        
     result = []
 
     for j in jobs:
@@ -155,6 +161,8 @@ def get_jobs(db: Session = Depends(get_db)):
             "agent": agent_name or "any",
             "mode": j.mode,
             "profile": j.profile
+            "completed_at": j.completed_at,
+            "cleared": j.cleared
         })
 
     return result
@@ -307,6 +315,18 @@ def recover_stuck_jobs(db: Session = Depends(get_db)):
     }
 
 
+@app.post("/jobs/{job_id}/clear")
+def clear_job(job_id: int, db: Session = Depends(get_db)):
+    job = db.query(Job).filter(Job.id == job_id).first()
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job.cleared = True
+    db.commit()
+
+    return {"ok": True}
+
 
 # New Dashboard
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -359,6 +379,7 @@ def dashboard():
     <button onclick="setJobFilter('pending')">Pending</button>
     <button onclick="setJobFilter('running')">Running</button>
     <button onclick="setJobFilter('done')">Done</button>
+    <button onclick="toggleHistory()" id="historyBtn">Show History</button>
     </div>
     
     <div id="jobs"></div>
@@ -429,15 +450,25 @@ async function loadAgents() {
     document.getElementById("agents").innerHTML = html;
 }
 
+let jobFilter = "all";
+let showHistory = false;
+
+function toggleHistory() {
+    showHistory = !showHistory;
+    document.getElementById("historyBtn").innerText = showHistory ? "Hide History" : "Show History";
+    loadJobs();
+}
+
 async function loadJobs() {
-    let res = await fetch('/jobs');
+    let url = showHistory ? '/jobs?show_history=true' : '/jobs';
+    let res = await fetch(url);
     let data = await res.json();
 
     if (jobFilter !== "all") {
         data = data.filter(j => j.status === jobFilter);
     }
-    
-    let html = "<table><tr><th>ID</th><th>Type</th><th>Target</th><th>Status</th><th>Priority</th><th>Mode</th><th>Profile</th><th>Agent</th></tr>";
+
+    let html = "<table><tr><th>ID</th><th>Type</th><th>Target</th><th>Status</th><th>Priority</th><th>Mode</th><th>Profile</th><th>Agent</th><th>Completed</th><th>Action</th></tr>";
 
     data.forEach(j => {
         html += `<tr>
@@ -449,11 +480,18 @@ async function loadJobs() {
             <td>${j.mode}</td>
             <td>${j.profile}</td>
             <td>${j.agent}</td>
+            <td>${j.completed_at || '-'}</td>
+            <td>${j.cleared ? 'archived' : `<button onclick="clearJob(${j.id})">Clear</button>`}</td>
         </tr>`;
     });
 
     html += "</table>";
     document.getElementById("jobs").innerHTML = html;
+}
+
+async function clearJob(job_id) {
+    await fetch(`/jobs/${job_id}/clear`, { method: 'POST' });
+    loadJobs();
 }
 
 async function loadResults() {
