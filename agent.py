@@ -6,6 +6,7 @@ import os
 import requests
 import subprocess
 import xml.etree.ElementTree as ET
+import tempfile
 
 # --- CONFIG ---
 SERVER_URL = os.environ.get("VAPT_SERVER_URL", "http://127.0.0.1:8000")
@@ -177,22 +178,42 @@ def run_nikto(target: str, port: int, profile: str = "standard"):
 
     flags = get_nikto_flags(profile)
 
-    result = subprocess.run(
-        ["nikto", "-h", target, "-p", str(port), "-Format", "json", *flags],
-        capture_output=True,
-        text=True,
-        timeout=300  # nikto can be slow, 5 min timeout
-    )
+    if port == 443:
+        flags = ["-ssl"] + flags
+    else:
+        flags = ["-nossl"] + flags
 
-    if result.returncode not in [0, 1]:  # nikto returns 1 when vulns found, that's fine
-        raise Exception(f"Nikto failed: {result.stderr}")
+    # write to a temp file then read it back
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+        tmp_path = tmp.name
 
     try:
-        parsed = json.loads(result.stdout)
-        return parsed
+        result = subprocess.run(
+            ["nikto", "-h", target, "-p", str(port),
+             "-Format", "json", "-output", tmp_path,
+             "-maxtime", "120s", *flags],
+            capture_output=True,
+            text=True,
+            timeout=150
+        )
+
+        if result.returncode not in [0, 1]:
+            raise Exception(f"Nikto failed: {result.stderr}")
+
+        with open(tmp_path, "r") as f:
+            content = f.read().strip()
+
+        if not content:
+            return {"raw": result.stdout or result.stderr}
+
+        return json.loads(content)
+
     except json.JSONDecodeError:
-        # fallback — return raw output if JSON parsing fails
         return {"raw": result.stdout}
+    finally:
+        # always clean up the temp file
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 def execute_job(job: dict, api_key: str):
     job_type = job.get("type")
