@@ -160,7 +160,7 @@ def get_jobs(
             "priority": j.priority,
             "agent": agent_name or "any",
             "mode": j.mode,
-            "profile": j.profile
+            "profile": j.profile,
             "completed_at": j.completed_at,
             "cleared": j.cleared
         })
@@ -450,7 +450,6 @@ async function loadAgents() {
     document.getElementById("agents").innerHTML = html;
 }
 
-let jobFilter = "all";
 let showHistory = false;
 
 function toggleHistory() {
