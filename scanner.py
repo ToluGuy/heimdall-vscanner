@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 
 # --- CONFIG ---
 SERVER_URL = os.environ.get("VAPT_SERVER_URL", "http://127.0.0.1:8000")
-AGENT_NAME = os.environ.get("VAPT_AGENT_NAME", "scanner-esxi")
+AGENT_NAME = os.environ.get("VAPT_AGENT_NAME", "scanner-1")
 CAPABILITIES = os.environ.get("VAPT_CAPABILITIES", "nmap_scan")
 API_KEY_FILE = os.environ.get("VAPT_KEY_FILE", f"{AGENT_NAME}_key.txt")
 
