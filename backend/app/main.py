@@ -357,6 +357,7 @@ def dashboard():
         <input id="agent_id" placeholder="Agent ID (optional)">
         <select id="job_type">
             <option value="nmap_scan">Nmap Scan</option>
+             <option value="nikto_scan">Nikto Scan</option>
         </select>
         <select id="mode">
             <option value="remote">Remote</option>

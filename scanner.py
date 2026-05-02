@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 # --- CONFIG ---
 SERVER_URL = os.environ.get("VAPT_SERVER_URL", "http://127.0.0.1:8000")
 AGENT_NAME = os.environ.get("VAPT_AGENT_NAME", "scanner-1")
-CAPABILITIES = os.environ.get("VAPT_CAPABILITIES", "nmap_scan")
+CAPABILITIES = os.environ.get("VAPT_CAPABILITIES", "nmap_scan,nikto_scan")
 API_KEY_FILE = os.environ.get("VAPT_KEY_FILE", f"{AGENT_NAME}_key.txt")
 
 
@@ -173,6 +173,39 @@ def run_nmap(target: str, profile: str = "standard"):
     return parsed
 
 
+def get_nikto_flags(profile: str) -> list:
+    """Return nikto flags based on scan profile."""
+    if profile == "light":
+        return ["-Tuning", "1"]          # basic info gathering only
+    elif profile == "full":
+        return ["-Tuning", "x6"]         # all checks except DoS
+    else:                                 # standard
+        return []                         # default nikto checks
+
+
+def run_nikto(target: str, port: int, profile: str = "standard"):
+    print(f"[*] Running Nikto ({profile}) on {target}:{port}...")
+
+    flags = get_nikto_flags(profile)
+
+    result = subprocess.run(
+        ["nikto", "-h", target, "-p", str(port), "-Format", "json", "-output", "/dev/stdout", *flags],
+        capture_output=True,
+        text=True,
+        timeout=300  # nikto can be slow, 5 min timeout
+    )
+
+    if result.returncode not in [0, 1]:  # nikto returns 1 when vulns found, that's fine
+        raise Exception(f"Nikto failed: {result.stderr}")
+
+    try:
+        parsed = json.loads(result.stdout)
+        return parsed
+    except json.JSONDecodeError:
+        # fallback — return raw output if JSON parsing fails
+        return {"raw": result.stdout}
+
+
 # --- EXECUTION ENGINE ---
 
 def execute_job(job: dict, api_key: str):
@@ -193,7 +226,33 @@ def execute_job(job: dict, api_key: str):
         send_job_status(api_key, job_id, "running")
 
         if job_type == "nmap_scan":
-            output = run_nmap(target, profile)
+            nmap_output = run_nmap(target, profile)
+
+            # check if any web ports are open and auto-run Nikto
+            web_ports = []
+            for host in nmap_output:
+                for port_info in host.get("ports", []):
+                    if port_info["state"] == "open" and port_info["port"] in [80, 443, 8080, 8443]:
+                        web_ports.append(port_info["port"])
+
+            output = {"nmap": nmap_output}
+
+            if web_ports:
+                print(f"[*] Web ports found: {web_ports} — running Nikto...")
+                nikto_results = {}
+                for port in web_ports:
+                    try:
+                        nikto_results[str(port)] = run_nikto(target, port, profile)
+                    except Exception as e:
+                        nikto_results[str(port)] = {"error": str(e)}
+                output["nikto"] = nikto_results
+            else:
+                print(f"[-] No web ports found, skipping Nikto")
+
+        elif job_type == "nikto_scan":
+            # standalone Nikto job — assumes port 80 unless target includes port
+            output = {"nikto": run_nikto(target, 80, profile)}
+
         else:
             output = {"error": f"Unsupported job type: {job_type}"}
 
