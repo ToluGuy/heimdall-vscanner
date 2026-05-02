@@ -134,14 +134,28 @@ def parse_nmap_xml(xml_data):
     return hosts
 
 
-def run_nmap(target):
-    print(f"[*] Running Nmap scan on {target}...")
+def get_nmap_flags(profile: str) -> list:
+    if profile == "light":
+        return ["-F"]
+    elif profile == "full":
+        return ["-sV", "-O", "-p-"]
+    else:
+        return ["-sV"]
+
+
+def run_nmap(target, profile: str = "standard"):
+    print(f"[*] Running Nmap ({profile}) on {target}...")
+
+    flags = get_nmap_flags(profile)
 
     result = subprocess.run(
-        ["nmap", "-sV", "-oX", "-", target],
+        ["nmap", *flags, "-oX", "-", target],
         capture_output=True,
         text=True,
     )
+
+    if result.returncode != 0:
+        raise Exception(f"Nmap failed: {result.stderr}")
 
     parsed = parse_nmap_xml(result.stdout)
 
@@ -164,7 +178,7 @@ def run_nikto(target: str, port: int, profile: str = "standard"):
     flags = get_nikto_flags(profile)
 
     result = subprocess.run(
-        ["nikto", "-h", target, "-p", str(port), "-Format", "json", "-output", "/dev/stdout", *flags],
+        ["nikto", "-h", target, "-p", str(port), "-Format", "json", *flags],
         capture_output=True,
         text=True,
         timeout=300  # nikto can be slow, 5 min timeout

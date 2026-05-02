@@ -189,7 +189,7 @@ def run_nikto(target: str, port: int, profile: str = "standard"):
     flags = get_nikto_flags(profile)
 
     result = subprocess.run(
-        ["nikto", "-h", target, "-p", str(port), "-Format", "json", "-output", "/dev/stdout", *flags],
+        ["nikto", "-h", target, "-p", str(port), "-Format", "json", *flags],
         capture_output=True,
         text=True,
         timeout=300  # nikto can be slow, 5 min timeout
