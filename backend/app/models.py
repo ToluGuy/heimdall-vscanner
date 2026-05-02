@@ -1,6 +1,6 @@
 # backend/app/models.py
 
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean
 from datetime import datetime
 import uuid
 
@@ -26,22 +26,22 @@ class Job(Base):
     __tablename__ = "jobs"
 
     id = Column(Integer, primary_key=True, index=True)
-    type = Column(String, nullable=False)  # e.g. nmap_scan
+    type = Column(String, nullable=False)
     target = Column(String, nullable=False)
-    status = Column(String, default="pending")  # pending, running, done
+    status = Column(String, default="pending")
     agent_id = Column(Integer, ForeignKey("agents.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)        # set when job finishes
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    completed_at = Column(DateTIme, default=datetime.utcnow)
-    priority = Column(String,default="medium") #high/medium/low
-    retries = Column(Integer, default=0)
-    max_retries = Column(Integer, default=3) #max of 3 but can be changed
     next_run_at = Column(DateTime, nullable=True)
-    mode = Column(String, default="remote") # agent / remote
-    profile = Column(String,default="standard") # light / standard / full
-    cleared = Column(Bollean, default="True"
-    
+    priority = Column(String, default="medium")
+    retries = Column(Integer, default=0)
+    max_retries = Column(Integer, default=3)
+    mode = Column(String, default="remote")
+    profile = Column(String, default="standard")
+    cleared = Column(Boolean, default=False)              # False = visible, True = archived
+
 
 class Result(Base):
     __tablename__ = "results"

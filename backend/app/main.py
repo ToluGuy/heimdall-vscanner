@@ -64,6 +64,7 @@ def submit_result(
     job = db.query(Job).filter(Job.id == result.job_id).first()
     if job:
         job.status = "done"
+        job.completed_at = datetime.utcnow()
 
     db.commit()
 
@@ -295,6 +296,7 @@ def recover_stuck_jobs(db: Session = Depends(get_db)):
             else:
                 job.status = "failed"
                 job.started_at = None
+                job.completed_at = datetime.utcnow()
                 print(f"[FAILED] Job {job.id} exceeded retries")
 
     db.commit()
