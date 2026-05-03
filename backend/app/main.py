@@ -557,6 +557,14 @@ def dashboard():
             };
             return `<span class="text-xs font-medium ${map[priority] || 'text-gray-400'}">${priority}</span>`;
         }
+        
+        function formatTimestamp(ts) {
+            if (!ts) return '—';
+            const d = new Date(ts);
+            const date = d.toISOString().split('T')[0];
+            const time = d.toTimeString().split(' ')[0];
+            return `${date} at ${time}`;
+        }
 
         async function loadAgents() {
             let res = await apiFetch('/agents');
@@ -579,7 +587,7 @@ def dashboard():
                     <td class="py-2 pr-4 text-gray-400">#${a.id}</td>
                     <td class="py-2 pr-4 font-medium">${a.name}</td>
                     <td class="py-2 pr-4">${dot}${a.status}</td>
-                    <td class="py-2 text-gray-400 text-xs">${a.last_seen || '—'}</td>
+                    <td class="py-2 text-gray-400 text-xs">${formatTimestamp(a.last_seen)}</td>
                 </tr>`;
             });
 
@@ -630,7 +638,7 @@ def dashboard():
                     <td class="py-2 pr-3 text-xs text-gray-300">${j.mode}</td>
                     <td class="py-2 pr-3 text-xs text-gray-300">${j.profile}</td>
                     <td class="py-2 pr-3 text-xs text-gray-300">${j.agent}</td>
-                    <td class="py-2 pr-3 text-xs text-gray-400">${j.completed_at ? j.completed_at.replace('T', ' ').split('.')[0] : '—'}</td>
+                    <td class="py-2 pr-3 text-xs text-gray-400">${formatTimestamp(j.completed_at)}</td>
                     <td class="py-2">${action}</td>
                 </tr>`;
             });
