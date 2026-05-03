@@ -186,6 +186,7 @@ def run_nikto(target: str, port: int, profile: str = "standard"):
             ["timeout", "90", "nikto", "-h", target, "-p", str(port),
             "-Format", "json", "-output", tmp_path,
             "-nolookup", *flags],
+            input="n\n",
             capture_output=True,
             text=True,
             timeout=100
