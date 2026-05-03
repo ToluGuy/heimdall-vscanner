@@ -3,3 +3,4 @@ vapt.db
 __pycache__/
 *.pyc
 .env
+logs/

@@ -14,8 +14,11 @@ from .db import Base, engine, get_db
 from .models import Agent, Job, Result
 from .schemas import AgentCreate, AgentResponse, JobResponse, ResultCreate, ResultResponse, JobCreate
 from dotenv import load_dotenv
+from .logger import get_logger
 
 load_dotenv()
+
+logger = get_logger("vapt.server", "server.log")
 
 JOB_TIMEOUT_SECONDS = 120
 
@@ -319,7 +322,7 @@ def recover_stuck_jobs(db: Session = Depends(get_db)):
         elapsed = now - job.started_at
 
         if elapsed > timedelta(seconds=JOB_TIMEOUT_SECONDS):
-            print(f"[RECOVERY] Job {job.id} stuck for {elapsed}, resetting")
+            logger.warning(f"Job {job.id} stuck for {elapsed}, resetting")
             
             if job.retries < job.max_retries:
                 job.retries += 1
@@ -328,12 +331,12 @@ def recover_stuck_jobs(db: Session = Depends(get_db)):
                 job.status = "pending"
                 job.started_at = None
                 recovered += 1
-                print(f"[RETRY] Job {job.id} in {delay}s ({job.retries}/{job.max_retries})")
+                logger.info(f"Job {job.id} retrying in {delay}s ({job.retries}/{job.max_retries})")
             else:
                 job.status = "failed"
                 job.started_at = None
                 job.completed_at = datetime.utcnow()
-                print(f"[FAILED] Job {job.id} exceeded retries")
+                logger.error(f"Job {job.id} exceeded max retries, marking failed")
 
     db.commit()
 

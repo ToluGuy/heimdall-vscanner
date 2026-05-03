@@ -3,10 +3,25 @@
 import time
 import json
 import os
+import logging
 import requests
 import subprocess
 import xml.etree.ElementTree as ET
 import tempfile
+
+# --- LOGGING ---
+os.makedirs("logs", exist_ok=True)
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(f"logs/agent-{os.environ.get('VAPT_AGENT_NAME', 'default')}.log")
+    ]
+)
+logger = logging.getLogger("vapt.agent")
 
 # --- CONFIG ---
 SERVER_URL = os.environ.get("VAPT_SERVER_URL", "http://127.0.0.1:8000")
@@ -35,7 +50,7 @@ def register():
     with open(API_KEY_FILE, "w") as f:
         f.write(api_key)
 
-    print(f"[+] Registered as '{AGENT_NAME}'. API Key saved.")
+    logger.info(f"Registered as '{AGENT_NAME}'. API key saved.")
     return api_key
 
 
@@ -145,7 +160,7 @@ def get_nmap_flags(profile: str) -> list:
 
 
 def run_nmap(target, profile: str = "standard"):
-    print(f"[*] Running Nmap ({profile}) on {target}...")
+    logger.info(f"Running Nmap ({profile}) on {target}")
 
     flags = get_nmap_flags(profile)
 
@@ -174,7 +189,7 @@ def get_nikto_flags(profile: str) -> list:
 
 
 def run_nikto(target: str, port: int, profile: str = "standard"):
-    print(f"[*] Running Nikto ({profile}) on {target}:{port}...")
+    logger.info(f"Running Nikto ({profile}) on {target}:{port}")
 
     flags = get_nikto_flags(profile)
 
@@ -192,8 +207,8 @@ def run_nikto(target: str, port: int, profile: str = "standard"):
             timeout=100
         )
 
-        print(f"[DEBUG] Nikto returncode: {result.returncode}")
-        print(f"[DEBUG] Nikto stderr: {result.stderr[:200] if result.stderr else 'none'}")
+        logger.debug(f"Nikto returncode: {result.returncode}")
+        logger.debug(f"Nikto stderr: {result.stderr[:200] if result.stderr else 'none'}")
 
         if os.path.exists(tmp_path):
             with open(tmp_path, "r") as f:
@@ -220,7 +235,7 @@ def execute_job(job: dict, api_key: str):
     profile = job.get("profile", "standard")
 
     try:
-        print(f"[DEBUG] Job {job_id} → RUNNING")
+        logger.info(f"Job {job_id} starting — type={job_type} target={target} profile={profile}")
 
         send_job_status(api_key, job_id, "running")
 
@@ -236,7 +251,7 @@ def execute_job(job: dict, api_key: str):
             output = {"nmap": nmap_output}
 
             if web_ports:
-                print(f"[*] Web ports found: {web_ports} — running Nikto...")
+                logger.info(f"Web ports found: {web_ports} — running Nikto")
                 nikto_results = {}
                 for port in web_ports:
                     try:
@@ -245,7 +260,7 @@ def execute_job(job: dict, api_key: str):
                         nikto_results[str(port)] = {"error": str(e)}
                 output["nikto"] = nikto_results
             else:
-                print(f"[-] No web ports found, skipping Nikto")
+                logger.debug(f"No web ports found on {target}, skipping Nikto")
 
         elif job_type == "nikto_scan":
             output = {"nikto": run_nikto(target, 80, profile)}
@@ -253,15 +268,15 @@ def execute_job(job: dict, api_key: str):
         else:
             output = {"error": f"Unknown job type: {job_type}"}
 
-        print(f"[+] Scan complete for job {job_id}")
+        logger.info(f"Job {job_id} complete")
 
         send_result(api_key, job_id, json.dumps(output))
         send_job_status(api_key, job_id, "done")
 
-        print("[+] Result + status sent")
+        logger.info(f"Job {job_id} result and status sent")
 
     except Exception as e:
-        print(f"[ERROR] Job execution failed: {e}")
+        logger.error(f"Job {job_id} execution failed: {e}")
         send_job_status(api_key, job_id, "failed")
 
 
@@ -271,7 +286,7 @@ def main():
     if not api_key:
         api_key = register()
 
-    print(f"[*] Starting job polling as '{AGENT_NAME}'...")
+    logger.info(f"Starting job polling as '{AGENT_NAME}'...")
 
     while True:
         try:
@@ -279,17 +294,16 @@ def main():
             job = get_job(api_key)
 
             if job:
-                print(f"[+] Received job: {job}")
+                logger.info(f"Received job: {job}")
                 execute_job(job, api_key)
             else:
-                print("[-] No jobs available")
+                logger.debug("No jobs available")
 
         except Exception as e:
-            print(f"[ERROR] {e}")
+            logger.error(f"Main loop error: {e}")
 
         time.sleep(10)
 
 
 if __name__ == "__main__":
     main()
-    
