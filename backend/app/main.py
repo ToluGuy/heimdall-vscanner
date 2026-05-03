@@ -1,15 +1,21 @@
 # backend/app/main.py
 
-from fastapi import FastAPI, Depends, Header, HTTPException
-from fastapi.responses import HTMLResponse
+import secrets
+import os
+import json
+from fastapi import FastAPI, Depends, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse, Response
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 
-import json
 from typing import List
 from .db import Base, engine, get_db
 from .models import Agent, Job, Result
 from .schemas import AgentCreate, AgentResponse, JobResponse, ResultCreate, ResultResponse, JobCreate
+from dotenv import load_dotenv
+
+load_dotenv()
 
 JOB_TIMEOUT_SECONDS = 120
 
@@ -17,6 +23,28 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
+
+security = HTTPBasic()
+
+DASHBOARD_USERNAME = os.environ.get("DASHBOARD_USERNAME", "admin")
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "vapt-admin")
+
+def require_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    correct_username = secrets.compare_digest(
+        credentials.username.encode("utf8"),
+        DASHBOARD_USERNAME.encode("utf8")
+    )
+    correct_password = secrets.compare_digest(
+        credentials.password.encode("utf8"),
+        DASHBOARD_PASSWORD.encode("utf8")
+    )
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
 
 @app.get("/")
 def root():
@@ -72,7 +100,7 @@ def submit_result(
     
   
 @app.get("/results", response_model=List[ResultResponse])
-def get_results(db: Session = Depends(get_db)):
+def get_results(db: Session = Depends(get_db), username: str = Depends(require_auth)):
     results = db.query(Result).all()
 
     response = []
@@ -90,7 +118,7 @@ def get_results(db: Session = Depends(get_db)):
 
 
 @app.post("/jobs/create")
-def create_job(job: JobCreate, db: Session = Depends(get_db)):
+def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = Depends(require_auth)):
 
     new_job = Job(
         type=job.type,
@@ -110,7 +138,7 @@ def create_job(job: JobCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/agents")
-def get_agents(db: Session = Depends(get_db)):
+def get_agents(db: Session = Depends(get_db), username: str = Depends(require_auth)):
     agents = db.query(Agent).all()
 
     response = []
@@ -330,7 +358,7 @@ def clear_job(job_id: int, db: Session = Depends(get_db)):
 
 # New Dashboard
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
+def dashboard(username: str = Depends(require_auth)):
     return """
     <!DOCTYPE html>
     <html>
