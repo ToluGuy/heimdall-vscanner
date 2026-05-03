@@ -178,42 +178,39 @@ def run_nikto(target: str, port: int, profile: str = "standard"):
 
     flags = get_nikto_flags(profile)
 
-    if port == 443:
-        flags = ["-ssl"] + flags
-    else:
-        flags = ["-nossl"] + flags
-
-    # write to a temp file then read it back
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         tmp_path = tmp.name
 
     try:
         result = subprocess.run(
-            ["nikto", "-h", target, "-p", str(port),
-             "-Format", "json", "-output", tmp_path,
-             "-maxtime", "120s", *flags],
+            ["timeout", "90", "nikto", "-h", target, "-p", str(port),
+            "-Format", "json", "-output", tmp_path,
+            "-nolookup", *flags],
             capture_output=True,
             text=True,
-            timeout=150
+            timeout=100
         )
 
-        if result.returncode not in [0, 1]:
-            raise Exception(f"Nikto failed: {result.stderr}")
+        print(f"[DEBUG] Nikto returncode: {result.returncode}")
+        print(f"[DEBUG] Nikto stderr: {result.stderr[:200] if result.stderr else 'none'}")
 
-        with open(tmp_path, "r") as f:
-            content = f.read().strip()
+        if os.path.exists(tmp_path):
+            with open(tmp_path, "r") as f:
+                content = f.read().strip()
+            if content:
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    return {"raw": content}
 
-        if not content:
-            return {"raw": result.stdout or result.stderr}
+        return {"raw": result.stdout or result.stderr or "no output"}
 
-        return json.loads(content)
-
-    except json.JSONDecodeError:
-        return {"raw": result.stdout}
+    except subprocess.TimeoutExpired:
+        return {"error": "Nikto timed out"}
     finally:
-        # always clean up the temp file
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+                   
 
 def execute_job(job: dict, api_key: str):
     job_type = job.get("type")
