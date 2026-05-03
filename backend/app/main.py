@@ -358,7 +358,7 @@ def clear_job(job_id: int, db: Session = Depends(get_db)):
 
 # New Dashboard
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(username: str = Depends(require_auth)):
+def dashboard():
     return """
     <!DOCTYPE html>
     <html>
@@ -419,6 +419,30 @@ def dashboard(username: str = Depends(require_auth)):
     <script>
 
 let jobFilter = "all";
+let showHistory = false;
+let authCredentials = "";
+
+function getAuth() {
+    if (authCredentials) return authCredentials;
+    const username = prompt("Username:");
+    const password = prompt("Password:");
+    authCredentials = 'Basic ' + btoa(username + ':' + password);
+    return authCredentials;
+}
+
+async function apiFetch(url, options = {}) {
+    options.headers = {
+        ...options.headers,
+        'Authorization': getAuth()
+    };
+    const res = await fetch(url, options);
+    if (res.status === 401) {
+        authCredentials = "";
+        alert("Invalid credentials. Please refresh and try again.");
+        return null;
+    }
+    return res;
+}
 
 async function loadAll() {
     loadAgents();
@@ -428,10 +452,14 @@ async function loadAll() {
 
 function setJobFilter(filter) {
     jobFilter = filter;
-    console.log("Filter:", filter);
     loadJobs();
 }
 
+function toggleHistory() {
+    showHistory = !showHistory;
+    document.getElementById("historyBtn").innerText = showHistory ? "Hide History" : "Show History";
+    loadJobs();
+}
 
 async function createJob() {
     let target = document.getElementById("target").value;
@@ -451,7 +479,7 @@ async function createJob() {
         payload.agent_id = parseInt(agent_id);
     }
 
-    await fetch('/jobs/create', {
+    await apiFetch('/jobs/create', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(payload)
@@ -461,7 +489,8 @@ async function createJob() {
 }
 
 async function loadAgents() {
-    let res = await fetch('/agents');
+    let res = await apiFetch('/agents');
+    if (!res) return;
     let data = await res.json();
 
     let html = "<table><tr><th>ID</th><th>Name</th><th>Status</th><th>Last Seen</th></tr>";
@@ -479,17 +508,10 @@ async function loadAgents() {
     document.getElementById("agents").innerHTML = html;
 }
 
-let showHistory = false;
-
-function toggleHistory() {
-    showHistory = !showHistory;
-    document.getElementById("historyBtn").innerText = showHistory ? "Hide History" : "Show History";
-    loadJobs();
-}
-
 async function loadJobs() {
     let url = showHistory ? '/jobs?show_history=true' : '/jobs';
-    let res = await fetch(url);
+    let res = await apiFetch(url);
+    if (!res) return;
     let data = await res.json();
 
     if (jobFilter !== "all") {
@@ -518,12 +540,13 @@ async function loadJobs() {
 }
 
 async function clearJob(job_id) {
-    await fetch(`/jobs/${job_id}/clear`, { method: 'POST' });
+    await apiFetch(`/jobs/${job_id}/clear`, { method: 'POST' });
     loadJobs();
 }
 
 async function loadResults() {
-    let res = await fetch('/results');
+    let res = await apiFetch('/results');
+    if (!res) return;
     let data = await res.json();
 
     let html = "<table><tr><th>ID</th><th>Job ID</th><th>Output</th></tr>";
