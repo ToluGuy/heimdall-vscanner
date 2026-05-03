@@ -25,6 +25,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("vapt.scanner")
 
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
+
 # --- CONFIG ---
 SERVER_URL = os.environ.get("VAPT_SERVER_URL", "http://127.0.0.1:8000")
 AGENT_NAME = os.environ.get("VAPT_AGENT_NAME", "scanner-1")
