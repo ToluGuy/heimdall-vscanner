@@ -651,6 +651,14 @@ def dashboard():
             await apiFetch(`/jobs/${job_id}/clear`, { method: 'POST' });
             loadJobs();
         }
+        
+        function toggleResult(id) {
+            const body = document.getElementById(`result-body-${id}`);
+            const arrow = document.getElementById(`result-arrow-${id}`);
+            const isHidden = body.classList.contains('hidden');
+            body.classList.toggle('hidden');
+            arrow.innerText = isHidden ? '▲' : '▼';
+        }
 
         function renderNmapResult(nmap) {
             if (!nmap || !nmap.length) return '<p class="text-gray-500 text-xs">No hosts found.</p>';
@@ -721,20 +729,38 @@ def dashboard():
 
             const html = data.slice().reverse().map(r => {
                 const out = r.output;
-                return `<div class="bg-gray-800 rounded-xl border border-gray-700 p-5">
-                    <div class="flex items-center justify-between mb-3">
-                        <span class="text-sm font-semibold text-white">Result #${r.id}</span>
-                        <span class="text-xs text-gray-400">Job #${r.job_id}</span>
+                const nmapCount = out.nmap ? out.nmap.reduce((acc, h) => acc + (h.ports ? h.ports.length : 0), 0) : 0;
+                const niktoCount = out.nikto ? Object.values(out.nikto).reduce((acc, v) => {
+                    if (v.raw || v.error) return acc;
+                    return acc + (v[0]?.vulnerabilities?.length || 0);
+                }, 0) : 0;
+
+                const summary = [
+                    out.nmap ? `${nmapCount} port(s)` : null,
+                    out.nikto ? `${niktoCount} nikto finding(s)` : null
+                ].filter(Boolean).join(' · ') || 'No data';
+
+                return `<div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+                    <div class="flex items-center justify-between px-5 py-4 cursor-pointer hover:bg-gray-750 transition"
+                        onclick="toggleResult(${r.id})">
+                        <div class="flex items-center gap-4">
+                            <span class="text-sm font-semibold text-white">Result #${r.id}</span>
+                            <span class="text-xs text-gray-400">Job #${r.job_id}</span>
+                            <span class="text-xs text-gray-500">${summary}</span>
+                        </div>
+                        <span id="result-arrow-${r.id}" class="text-gray-400 text-xs">▼</span>
                     </div>
-                    ${out.nmap ? `<div class="mb-3">
-                        <p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Nmap</p>
-                        ${renderNmapResult(out.nmap)}
-                    </div>` : ''}
-                    ${out.nikto ? `<div>
-                        <p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Nikto</p>
-                        ${renderNiktoResult(out.nikto)}
-                    </div>` : ''}
-                    ${!out.nmap && !out.nikto ? `<pre class="text-xs text-gray-400 overflow-x-auto">${JSON.stringify(out, null, 2)}</pre>` : ''}
+                    <div id="result-body-${r.id}" class="hidden px-5 pb-5 border-t border-gray-700 pt-4">
+                        ${out.nmap ? `<div class="mb-3">
+                            <p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Nmap</p>
+                            ${renderNmapResult(out.nmap)}
+                        </div>` : ''}
+                        ${out.nikto ? `<div>
+                            <p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Nikto</p>
+                            ${renderNiktoResult(out.nikto)}
+                        </div>` : ''}
+                        ${!out.nmap && !out.nikto ? `<pre class="text-xs text-gray-400 overflow-x-auto">${JSON.stringify(out, null, 2)}</pre>` : ''}
+                    </div>
                 </div>`;
             }).join('');
 
