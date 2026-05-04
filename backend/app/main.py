@@ -372,6 +372,34 @@ def dashboard():
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-gray-950 text-gray-100 min-h-screen">
+    
+        <!-- Login Overlay -->
+        <div id="loginOverlay" class="fixed inset-0 bg-gray-950 bg-opacity-95 flex items-center justify-center z-50">
+            <div class="bg-gray-900 border border-gray-700 rounded-xl p-8 w-full max-w-sm">
+                <div class="flex items-center gap-3 mb-6">
+                    <div class="w-3 h-3 rounded-full bg-green-400"></div>
+                    <h2 class="text-lg font-bold text-green-400">VAPT Dashboard</h2>
+                </div>
+                <p class="text-sm text-gray-400 mb-6">Sign in to continue</p>
+                <div class="space-y-4">
+                    <div>
+                        <label class="text-xs text-gray-400 mb-1 block">Username</label>
+                        <input id="loginUsername" type="text" placeholder="Username"
+                            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                    </div>
+                    <div>
+                        <label class="text-xs text-gray-400 mb-1 block">Password</label>
+                        <input id="loginPassword" type="password" placeholder="••••••••"
+                            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                    </div>
+                    <p id="loginError" class="text-xs text-red-400 hidden">Invalid credentials. Please try again.</p>
+                    <button onclick="submitLogin()"
+                        class="w-full bg-green-600 hover:bg-green-500 text-white font-semibold py-2 rounded-lg transition text-sm">
+                        Sign In
+                    </button>
+                </div>
+            </div>
+        </div>
 
         <!-- Header -->
         <div class="bg-gray-900 border-b border-gray-800 px-6 py-4 flex items-center justify-between">
@@ -470,23 +498,44 @@ def dashboard():
         let showHistory = false;
         let authCredentials = "";
 
-        function getAuth() {
-            if (authCredentials) return authCredentials;
-            const username = prompt("Username:");
-            const password = prompt("Password:");
+        function submitLogin() {
+            const username = document.getElementById("loginUsername").value;
+            const password = document.getElementById("loginPassword").value;
+            if (!username || !password) return;
             authCredentials = 'Basic ' + btoa(username + ':' + password);
-            return authCredentials;
+            // test credentials before hiding overlay
+            fetch('/agents', {
+                headers: { 'Authorization': authCredentials }
+            }).then(res => {
+                if (res.status === 401) {
+                    authCredentials = "";
+                    document.getElementById("loginError").classList.remove('hidden');
+                } else {
+                    document.getElementById("loginOverlay").classList.add('hidden');
+                    loadAll();
+                }
+            });
         }
+
+        // allow pressing Enter in password field
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById("loginPassword").addEventListener('keydown', e => {
+                if (e.key === 'Enter') submitLogin();
+            });
+            document.getElementById("loginUsername").addEventListener('keydown', e => {
+                if (e.key === 'Enter') submitLogin();
+            });
+        });
 
         async function apiFetch(url, options = {}) {
             options.headers = {
                 ...options.headers,
-                'Authorization': getAuth()
+                'Authorization': authCredentials
             };
             const res = await fetch(url, options);
             if (res.status === 401) {
                 authCredentials = "";
-                alert("Invalid credentials. Please refresh and try again.");
+                document.getElementById("loginOverlay").classList.remove('hidden');
                 return null;
             }
             return res;
@@ -767,8 +816,11 @@ def dashboard():
             document.getElementById("results").innerHTML = html;
         }
 
-        loadAll();
-        setInterval(loadAll, 5000);
+        // replace the setInterval line with:
+        setInterval(() => {
+            loadAgents();
+            loadJobs();
+        }, 5000);
         </script>
     </body>
     </html>
