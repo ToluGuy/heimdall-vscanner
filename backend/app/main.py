@@ -619,6 +619,8 @@ def dashboard():
             let res = await apiFetch('/agents');
             if (!res) return;
             let data = await res.json();
+            
+            data.sort((a, b) => a.id - b.id);
 
             let html = `<table class="w-full text-sm">
                 <thead><tr class="text-left text-gray-400 border-b border-gray-800">
