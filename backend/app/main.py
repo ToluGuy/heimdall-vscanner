@@ -780,13 +780,17 @@ def dashboard():
                 const out = r.output;
                 const nmapCount = out.nmap ? out.nmap.reduce((acc, h) => acc + (h.ports ? h.ports.length : 0), 0) : 0;
                 const niktoCount = out.nikto ? Object.values(out.nikto).reduce((acc, v) => {
-                    if (v.raw || v.error) return acc;
+                    if (v.error) return acc;
+                    if (v.raw) {
+                        const matches = (v.raw.match(/^\+ \[/gm) || []).length;
+                        return acc + matches;
+                    }
                     return acc + (v[0]?.vulnerabilities?.length || 0);
                 }, 0) : 0;
 
                 const summary = [
-                    out.nmap ? `${nmapCount} port(s)` : null,
-                    out.nikto ? `${niktoCount} nikto finding(s)` : null
+                    out.nmap ? `${nmapCount} open port(s)` : null,
+                    out.nikto ? `${niktoCount} web finding(s)` : null
                 ].filter(Boolean).join(' · ') || 'No data';
 
                 return `<div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
