@@ -518,13 +518,11 @@ def dashboard():
         }
 
         // allow pressing Enter in password field
-        document.addEventListener('DOMContentLoaded', () => {
-            document.getElementById("loginPassword").addEventListener('keydown', e => {
-                if (e.key === 'Enter') submitLogin();
-            });
-            document.getElementById("loginUsername").addEventListener('keydown', e => {
-                if (e.key === 'Enter') submitLogin();
-            });
+        document.getElementById("loginPassword").addEventListener('keydown', e => {
+            if (e.key === 'Enter') submitLogin();
+        });
+        document.getElementById("loginUsername").addEventListener('keydown', e => {
+            if (e.key === 'Enter') submitLogin();
         });
 
         async function apiFetch(url, options = {}) {
@@ -749,8 +747,8 @@ def dashboard():
                 
                 if (result.raw) {
                     // extract only finding lines — they start with + [
-                    const lines = result.raw.split('\n');
-                    const findings = lines.filter(l => l.match(/^\+ \[/));
+                    const lines = result.raw.split('\\n');
+                    const findings = lines.filter(l => l.match(/^\\+ \\[/));
     
                     if (!findings.length) {
                         return `<div class="mt-2">
@@ -762,7 +760,7 @@ def dashboard():
                         <p class="text-xs text-gray-400 mb-2">Nikto port ${port} — ${findings.length} finding(s):</p>
                         <div class="space-y-1">
                             ${findings.map(line => {
-                                const match = line.match(/^\+ \[(\w+)\] (.+?):\s*(.+)$/);
+                                const match = line.match(/^\\+ \\[(\\w+)\\] (.+?):\\s*(.+)$/);
                                 if (match) {
                                     const [, id, url, msg] = match;
                                     return `<div class="bg-gray-950 rounded p-2 text-xs">
