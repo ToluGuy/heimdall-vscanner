@@ -746,12 +746,38 @@ def dashboard():
                         <p class="text-xs text-red-400">${result.error}</p>
                     </div>`;
                 }
+                
                 if (result.raw) {
+                    // extract only finding lines — they start with + [
+                    const lines = result.raw.split('\n');
+                    const findings = lines.filter(l => l.match(/^\+ \[/));
+    
+                    if (!findings.length) {
+                        return `<div class="mt-2">
+                            <p class="text-xs text-gray-500">Nikto port ${port}: no findings extracted.</p>
+                        </div>`;
+                    }
+
                     return `<div class="mt-2">
-                        <p class="text-xs text-gray-400 mb-1">Nikto port ${port} (raw output):</p>
-                        <pre class="text-xs text-gray-300 bg-gray-950 p-3 rounded-lg overflow-x-auto whitespace-pre-wrap">${result.raw}</pre>
+                        <p class="text-xs text-gray-400 mb-2">Nikto port ${port} — ${findings.length} finding(s):</p>
+                        <div class="space-y-1">
+                            ${findings.map(line => {
+                                const match = line.match(/^\+ \[(\w+)\] (.+?):\s*(.+)$/);
+                                if (match) {
+                                    const [, id, url, msg] = match;
+                                    return `<div class="bg-gray-950 rounded p-2 text-xs">
+                                        <span class="text-yellow-400 font-mono">[${id}]</span>
+                                        <span class="text-gray-400 font-mono ml-2">${url}:</span>
+                                        <span class="text-gray-200 ml-1">${msg}</span>
+                                    </div>`;
+                                }
+                                // fallback for lines that don't match the pattern
+                                return `<div class="bg-gray-950 rounded p-2 text-xs text-gray-300">${line.replace(/^\+ /, '')}</div>`;
+                            }).join('')}
+                        </div>
                     </div>`;
                 }
+                
                 const vulns = result[0]?.vulnerabilities || [];
                 if (!vulns.length) return `<p class="text-xs text-gray-500 mt-2">Nikto port ${port}: no vulnerabilities found.</p>`;
                 return `<div class="mt-2">
