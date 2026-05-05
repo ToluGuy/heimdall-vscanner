@@ -50,3 +50,4 @@ class Result(Base):
     job_id = Column(Integer, nullable=False)
     output = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    cleared = Column(Boolean, default=False) #false = active, true = archived

@@ -34,6 +34,8 @@ class ResultResponse(BaseModel):
     id: int
     job_id: int
     output: Any
+    cleared: bool = False
+    job_info: Optional[Any] = None
 
     class Config:
         from_attributes = True

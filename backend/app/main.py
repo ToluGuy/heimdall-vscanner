@@ -49,26 +49,24 @@ def require_auth(credentials: HTTPBasicCredentials = Depends(security)):
         )
     return credentials.username
 
+
 @app.get("/")
 def root():
     return {"message": "VAPT system running"}
 
-    
+
 @app.post("/agents/register", response_model=AgentResponse)
 def register_agent(agent: AgentCreate, db: Session = Depends(get_db)):
     new_agent = Agent(
         name=agent.name,
         capabilities=agent.capabilities or "nmap_scan"
     )
-
     db.add(new_agent)
     db.commit()
     db.refresh(new_agent)
-
     return {"api_key": new_agent.api_key}
 
 
-# 🔐 helper
 def get_agent_by_api_key(api_key: str, db: Session):
     agent = db.query(Agent).filter(Agent.api_key == api_key).first()
     if not agent:
@@ -88,41 +86,130 @@ def submit_result(
         job_id=result.job_id,
         output=result.output,
     )
-
     db.add(new_result)
 
-    # mark job as done
     job = db.query(Job).filter(Job.id == result.job_id).first()
     if job:
         job.status = "done"
         job.completed_at = datetime.utcnow()
 
     db.commit()
-
     return {"message": "Result stored"}
-    
-  
+
+
+# --- RESULTS ---
+
 @app.get("/results", response_model=List[ResultResponse])
-def get_results(db: Session = Depends(get_db), username: str = Depends(require_auth)):
-    results = db.query(Result).all()
+def get_results(
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+    show_history: bool = False
+):
+    if show_history:
+        results = db.query(Result).filter(Result.cleared == True).all()
+    else:
+        results = db.query(Result).filter(Result.cleared == False).all()
 
     response = []
 
     for r in results:
         parsed_output = json.loads(r.output)
 
+        job_info = None
+        job = db.query(Job).filter(Job.id == r.job_id).first()
+        if job:
+            job_info = {
+                "id": job.id,
+                "type": job.type,
+                "target": job.target,
+                "mode": job.mode,
+                "profile": job.profile,
+                "priority": job.priority,
+                "status": job.status,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            }
+
         response.append({
             "id": r.id,
             "job_id": r.job_id,
-            "output": parsed_output
+            "output": parsed_output,
+            "cleared": r.cleared,
+            "job_info": job_info
         })
 
     return response
 
 
+@app.post("/results/{result_id}/clear")
+def clear_result(
+    result_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth)
+):
+    result = db.query(Result).filter(Result.id == result_id).first()
+    if not result:
+        raise HTTPException(status_code=404, detail="Result not found")
+
+    result.cleared = True
+
+    # archive the associated job too
+    job = db.query(Job).filter(Job.id == result.job_id).first()
+    if job:
+        job.cleared = True
+
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/results/{result_id}")
+def delete_result(
+    result_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth)
+):
+    result = db.query(Result).filter(Result.id == result_id).first()
+    if not result:
+        raise HTTPException(status_code=404, detail="Result not found")
+
+    job = db.query(Job).filter(Job.id == result.job_id).first()
+
+    db.delete(result)
+    if job:
+        db.delete(job)
+
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/results/bulk")
+def delete_results_bulk(
+    data: dict,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth)
+):
+    ids = data.get("ids", [])
+    if not ids:
+        raise HTTPException(status_code=400, detail="No IDs provided")
+
+    results = db.query(Result).filter(Result.id.in_(ids)).all()
+    job_ids = [r.job_id for r in results]
+
+    for r in results:
+        db.delete(r)
+
+    if job_ids:
+        jobs = db.query(Job).filter(Job.id.in_(job_ids)).all()
+        for j in jobs:
+            db.delete(j)
+
+    db.commit()
+    return {"ok": True, "deleted": len(results)}
+
+
+# --- JOBS ---
+
 @app.post("/jobs/create")
 def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = Depends(require_auth)):
-
     new_job = Job(
         type=job.type,
         target=job.target,
@@ -132,11 +219,9 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
         mode=job.mode if job.mode else "remote",
         profile=job.profile if job.profile else "standard"
     )
-
     db.add(new_job)
     db.commit()
     db.refresh(new_job)
-
     return new_job
 
 
@@ -145,10 +230,8 @@ def get_agents(db: Session = Depends(get_db), username: str = Depends(require_au
     agents = db.query(Agent).all()
 
     response = []
-
     for a in agents:
         status = "offline"
-
         if a.last_seen and (datetime.utcnow() - a.last_seen) < timedelta(seconds=30):
             status = "online"
 
@@ -162,7 +245,7 @@ def get_agents(db: Session = Depends(get_db), username: str = Depends(require_au
 
     return response
 
-#Updated Job Line
+
 @app.get("/jobs")
 def get_jobs(
     db: Session = Depends(get_db),
@@ -172,12 +255,10 @@ def get_jobs(
         jobs = db.query(Job).all()
     else:
         jobs = db.query(Job).filter(Job.cleared == False).all()
-        
-    result = []
 
+    result = []
     for j in jobs:
         agent_name = None
-
         if j.agent_id:
             agent = db.query(Agent).filter(Agent.id == j.agent_id).first()
             if agent:
@@ -215,7 +296,6 @@ def get_next_job(
     now = datetime.utcnow()
 
     agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
-
     if not agent:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -227,10 +307,9 @@ def get_next_job(
 
     if not jobs:
         return None
-        
+
     agent_caps = agent.capabilities.split(",")
 
-    # prioritize jobs assigned to this agent OR unassigned
     eligible_jobs = [
         j for j in jobs
         if (j.agent_id is None or j.agent_id == agent.id)
@@ -240,23 +319,16 @@ def get_next_job(
     if not eligible_jobs:
         return None
 
-    # sort jobs: assigned first, then unassigned
     eligible_jobs.sort(key=lambda j: j.agent_id is None)
 
-    # simple load check (optional but useful)
     current_load = get_agent_load(db, agent.id)
-
-    # limit: max 2 running jobs per agent (tweakable)
     if current_load >= 2:
         return None
 
     job = eligible_jobs[0]
-
-    # assign job to this agent
     job.agent_id = agent.id
     job.status = "running"
     job.started_at = datetime.utcnow()
-
     db.commit()
 
     return {
@@ -274,10 +346,8 @@ def heartbeat(
     db: Session = Depends(get_db),
 ):
     agent = get_agent_by_api_key(x_api_key, db)
-
     agent.last_seen = datetime.utcnow()
     db.commit()
-
     return {"status": "alive"}
 
 
@@ -290,7 +360,6 @@ def update_job_status(
     agent = get_agent_by_api_key(x_api_key, db)
 
     job = db.query(Job).filter(Job.id == data["job_id"]).first()
-
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -298,21 +367,17 @@ def update_job_status(
         raise HTTPException(status_code=403, detail="This job does not belong to you")
 
     job.status = data["status"]
-
     if data["status"] == "running":
         job.started_at = datetime.utcnow()
 
     db.commit()
-
     return {"ok": True}
 
 
 @app.get("/jobs/recover-stuck")
 def recover_stuck_jobs(db: Session = Depends(get_db)):
     now = datetime.utcnow()
-
     stuck_jobs = db.query(Job).filter(Job.status == "running").all()
-
     recovered = 0
 
     for job in stuck_jobs:
@@ -323,10 +388,10 @@ def recover_stuck_jobs(db: Session = Depends(get_db)):
 
         if elapsed > timedelta(seconds=JOB_TIMEOUT_SECONDS):
             logger.warning(f"Job {job.id} stuck for {elapsed}, resetting")
-            
+
             if job.retries < job.max_retries:
                 job.retries += 1
-                delay = job.retries * 30 # seconds
+                delay = job.retries * 30
                 job.next_run_at = datetime.utcnow() + timedelta(seconds=delay)
                 job.status = "pending"
                 job.started_at = None
@@ -339,27 +404,21 @@ def recover_stuck_jobs(db: Session = Depends(get_db)):
                 logger.error(f"Job {job.id} exceeded max retries, marking failed")
 
     db.commit()
-
-    return {
-        "checked": len(stuck_jobs),
-        "recovered": recovered
-    }
+    return {"checked": len(stuck_jobs), "recovered": recovered}
 
 
 @app.post("/jobs/{job_id}/clear")
 def clear_job(job_id: int, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id == job_id).first()
-
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
     job.cleared = True
     db.commit()
-
     return {"ok": True}
 
 
-# New Dashboard
+# --- DASHBOARD ---
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return """
@@ -372,7 +431,21 @@ def dashboard():
         <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-gray-950 text-gray-100 min-h-screen">
-    
+
+        <!-- Confirm Dialog -->
+        <div id="confirmDialog" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 hidden">
+            <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-sm">
+                <h3 class="text-sm font-semibold text-white mb-2">Confirm Permanent Delete</h3>
+                <p id="confirmMsg" class="text-xs text-gray-400 mb-5">This action cannot be undone.</p>
+                <div class="flex gap-3 justify-end">
+                    <button onclick="cancelConfirm()"
+                        class="text-xs px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 transition">Cancel</button>
+                    <button id="confirmOkBtn"
+                        class="text-xs px-4 py-2 rounded-lg bg-red-700 hover:bg-red-600 text-white font-semibold transition">Delete</button>
+                </div>
+            </div>
+        </div>
+
         <!-- Login Overlay -->
         <div id="loginOverlay" class="fixed inset-0 bg-gray-950 bg-opacity-95 flex items-center justify-center z-50">
             <div class="bg-gray-900 border border-gray-700 rounded-xl p-8 w-full max-w-sm">
@@ -478,7 +551,7 @@ def dashboard():
                             class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-green-500 transition">Done</button>
                         <button onclick="setJobFilter('failed')" id="filter-failed"
                             class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-red-500 transition">Failed</button>
-                        <button onclick="toggleHistory()" id="historyBtn"
+                        <button onclick="toggleJobHistory()" id="jobHistoryBtn"
                             class="text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-purple-500 transition">Show History</button>
                     </div>
                 </div>
@@ -487,7 +560,33 @@ def dashboard():
 
             <!-- Results -->
             <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
-                <h2 class="text-lg font-semibold text-green-400 mb-4">Scan Results</h2>
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-semibold text-green-400">Scan Results</h2>
+                    <!-- Tab switcher -->
+                    <div class="flex gap-1 bg-gray-800 rounded-lg p-1">
+                        <button onclick="setResultTab('active')" id="tab-active"
+                            class="result-tab text-xs px-4 py-1.5 rounded-md transition font-medium bg-gray-700 text-white">
+                            Active
+                        </button>
+                        <button onclick="setResultTab('history')" id="tab-history"
+                            class="result-tab text-xs px-4 py-1.5 rounded-md transition font-medium text-gray-400 hover:text-gray-200">
+                            History
+                        </button>
+                    </div>
+                </div>
+
+                <!-- History toolbar (hidden when on active tab) -->
+                <div id="historyToolbar" class="hidden mb-4 flex items-center gap-3">
+                    <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
+                        <input type="checkbox" id="selectAllCheckbox" onchange="toggleSelectAll()" class="accent-red-500">
+                        Select all
+                    </label>
+                    <button onclick="deleteSelected()"
+                        class="text-xs px-3 py-1.5 rounded-lg bg-red-900 hover:bg-red-800 text-red-200 border border-red-700 transition font-medium">
+                        Delete Selected
+                    </button>
+                </div>
+
                 <div id="results" class="space-y-4"></div>
             </div>
 
@@ -495,15 +594,18 @@ def dashboard():
 
         <script>
         let jobFilter = "all";
-        let showHistory = false;
+        let showJobHistory = false;
+        let resultTab = "active";
         let authCredentials = "";
+        let confirmCallback = null;
+
+        // --- AUTH ---
 
         function submitLogin() {
             const username = document.getElementById("loginUsername").value;
             const password = document.getElementById("loginPassword").value;
             if (!username || !password) return;
             authCredentials = 'Basic ' + btoa(username + ':' + password);
-            // test credentials before hiding overlay
             fetch('/agents', {
                 headers: { 'Authorization': authCredentials }
             }).then(res => {
@@ -517,7 +619,6 @@ def dashboard():
             });
         }
 
-        // allow pressing Enter in password field
         document.getElementById("loginPassword").addEventListener('keydown', e => {
             if (e.key === 'Enter') submitLogin();
         });
@@ -539,11 +640,32 @@ def dashboard():
             return res;
         }
 
+        // --- CONFIRM DIALOG ---
+
+        function showConfirm(message, onConfirm) {
+            document.getElementById("confirmMsg").textContent = message;
+            document.getElementById("confirmDialog").classList.remove('hidden');
+            confirmCallback = onConfirm;
+            document.getElementById("confirmOkBtn").onclick = () => {
+                document.getElementById("confirmDialog").classList.add('hidden');
+                if (confirmCallback) confirmCallback();
+            };
+        }
+
+        function cancelConfirm() {
+            document.getElementById("confirmDialog").classList.add('hidden');
+            confirmCallback = null;
+        }
+
+        // --- LOAD ALL ---
+
         async function loadAll() {
             loadAgents();
             loadJobs();
             loadResults();
         }
+
+        // --- JOB FILTERS ---
 
         function setJobFilter(filter) {
             jobFilter = filter;
@@ -553,13 +675,71 @@ def dashboard():
             loadJobs();
         }
 
-        function toggleHistory() {
-            showHistory = !showHistory;
-            document.getElementById("historyBtn").innerText = showHistory ? "Hide History" : "Show History";
-            document.getElementById("historyBtn").classList.toggle('border-purple-500');
-            document.getElementById("historyBtn").classList.toggle('text-purple-400');
+        function toggleJobHistory() {
+            showJobHistory = !showJobHistory;
+            document.getElementById("jobHistoryBtn").innerText = showJobHistory ? "Hide History" : "Show History";
+            document.getElementById("jobHistoryBtn").classList.toggle('border-purple-500');
+            document.getElementById("jobHistoryBtn").classList.toggle('text-purple-400');
             loadJobs();
         }
+
+        // --- RESULT TABS ---
+
+        function setResultTab(tab) {
+            resultTab = tab;
+            document.querySelectorAll('.result-tab').forEach(b => {
+                b.classList.remove('bg-gray-700', 'text-white');
+                b.classList.add('text-gray-400');
+            });
+            const active = document.getElementById('tab-' + tab);
+            active.classList.add('bg-gray-700', 'text-white');
+            active.classList.remove('text-gray-400');
+
+            const toolbar = document.getElementById('historyToolbar');
+            if (tab === 'history') {
+                toolbar.classList.remove('hidden');
+            } else {
+                toolbar.classList.add('hidden');
+            }
+
+            // reset select all
+            document.getElementById('selectAllCheckbox').checked = false;
+
+            loadResults();
+        }
+
+        function toggleSelectAll() {
+            const checked = document.getElementById('selectAllCheckbox').checked;
+            document.querySelectorAll('.result-checkbox').forEach(cb => cb.checked = checked);
+        }
+
+        function getSelectedIds() {
+            return Array.from(document.querySelectorAll('.result-checkbox:checked'))
+                .map(cb => parseInt(cb.dataset.id));
+        }
+
+        async function deleteSelected() {
+            const ids = getSelectedIds();
+            if (!ids.length) {
+                alert("No results selected.");
+                return;
+            }
+            showConfirm(
+                `Permanently delete ${ids.length} result(s) and their associated jobs? This cannot be undone.`,
+                async () => {
+                    await apiFetch('/results/bulk', {
+                        method: 'DELETE',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ids })
+                    });
+                    document.getElementById('selectAllCheckbox').checked = false;
+                    loadResults();
+                    loadJobs();
+                }
+            );
+        }
+
+        // --- CREATE JOB ---
 
         async function createJob() {
             let target = document.getElementById("target").value;
@@ -578,7 +758,7 @@ def dashboard():
 
             await apiFetch('/jobs/create', {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)
             });
 
@@ -586,12 +766,14 @@ def dashboard():
             setTimeout(loadAll, 300);
         }
 
+        // --- BADGES ---
+
         function statusBadge(status) {
             const map = {
-                pending:  'bg-yellow-900 text-yellow-300 border border-yellow-700',
-                running:  'bg-blue-900 text-blue-300 border border-blue-700',
-                done:     'bg-green-900 text-green-300 border border-green-700',
-                failed:   'bg-red-900 text-red-300 border border-red-700',
+                pending: 'bg-yellow-900 text-yellow-300 border border-yellow-700',
+                running: 'bg-blue-900 text-blue-300 border border-blue-700',
+                done:    'bg-green-900 text-green-300 border border-green-700',
+                failed:  'bg-red-900 text-red-300 border border-red-700',
             };
             return `<span class="text-xs px-2 py-0.5 rounded-full font-medium ${map[status] || 'bg-gray-700 text-gray-300'}">${status}</span>`;
         }
@@ -604,7 +786,7 @@ def dashboard():
             };
             return `<span class="text-xs font-medium ${map[priority] || 'text-gray-400'}">${priority}</span>`;
         }
-        
+
         function formatTimestamp(ts) {
             if (!ts) return '—';
             const d = new Date(ts);
@@ -613,11 +795,12 @@ def dashboard():
             return `${date} at ${time}`;
         }
 
+        // --- AGENTS ---
+
         async function loadAgents() {
             let res = await apiFetch('/agents');
             if (!res) return;
             let data = await res.json();
-            
             data.sort((a, b) => a.id - b.id);
 
             let html = `<table class="w-full text-sm">
@@ -644,8 +827,10 @@ def dashboard():
             document.getElementById("agents").innerHTML = html;
         }
 
+        // --- JOBS ---
+
         async function loadJobs() {
-            let url = showHistory ? '/jobs?show_history=true' : '/jobs';
+            let url = showJobHistory ? '/jobs?show_history=true' : '/jobs';
             let res = await apiFetch(url);
             if (!res) return;
             let data = await res.json();
@@ -700,7 +885,9 @@ def dashboard():
             await apiFetch(`/jobs/${job_id}/clear`, { method: 'POST' });
             loadJobs();
         }
-        
+
+        // --- RESULTS ---
+
         function toggleResult(id) {
             const body = document.getElementById(`result-body-${id}`);
             const arrow = document.getElementById(`result-arrow-${id}`);
@@ -744,12 +931,11 @@ def dashboard():
                         <p class="text-xs text-red-400">${result.error}</p>
                     </div>`;
                 }
-                
+
                 if (result.raw) {
-                    // extract only finding lines — they start with + [
                     const lines = result.raw.split('\\n');
                     const findings = lines.filter(l => l.match(/^\\+ \\[/));
-    
+
                     if (!findings.length) {
                         return `<div class="mt-2">
                             <p class="text-xs text-gray-500">Nikto port ${port}: no findings extracted.</p>
@@ -769,13 +955,12 @@ def dashboard():
                                         <span class="text-gray-200 ml-1">${msg}</span>
                                     </div>`;
                                 }
-                                // fallback for lines that don't match the pattern
-                                return `<div class="bg-gray-950 rounded p-2 text-xs text-gray-300">${line.replace(/^\+ /, '')}</div>`;
+                                return `<div class="bg-gray-950 rounded p-2 text-xs text-gray-300">${line.replace(/^\\+ /, '')}</div>`;
                             }).join('')}
                         </div>
                     </div>`;
                 }
-                
+
                 const vulns = result[0]?.vulnerabilities || [];
                 if (!vulns.length) return `<p class="text-xs text-gray-500 mt-2">Nikto port ${port}: no vulnerabilities found.</p>`;
                 return `<div class="mt-2">
@@ -785,39 +970,85 @@ def dashboard():
                             <div class="bg-gray-950 rounded p-2 text-xs">
                                 <span class="text-yellow-400 font-mono">[${v.id}]</span>
                                 <span class="text-gray-200 ml-2">${v.msg}</span>
-                                ${v.url ? `<span class="text-gray-500 ml-2">${v.url}</span>` : ''}
+                                ${v.url ? `<span class="text-gray-500 ml-2"><a href="${v.url}" target="_blank" class="hover:text-blue-400 transition">${v.url}</a></span>` : ''}
                             </div>`).join('')}
                     </div>
                 </div>`;
             }).join('');
         }
 
+        function renderJobInfo(job_info) {
+            if (!job_info) return '';
+            return `<div class="mb-4 bg-gray-900 rounded-lg p-3 border border-gray-700">
+                <p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">Associated Job</p>
+                <div class="grid grid-cols-2 gap-x-6 gap-y-1 text-xs">
+                    <div><span class="text-gray-500">Job ID:</span> <span class="text-gray-200 font-mono">#${job_info.id}</span></div>
+                    <div><span class="text-gray-500">Target:</span> <span class="text-gray-200 font-mono">${job_info.target}</span></div>
+                    <div><span class="text-gray-500">Type:</span> <span class="text-gray-200">${job_info.type}</span></div>
+                    <div><span class="text-gray-500">Mode:</span> <span class="text-gray-200">${job_info.mode}</span></div>
+                    <div><span class="text-gray-500">Profile:</span> <span class="text-gray-200">${job_info.profile}</span></div>
+                    <div><span class="text-gray-500">Priority:</span> <span class="text-gray-200">${job_info.priority}</span></div>
+                    <div class="col-span-2"><span class="text-gray-500">Completed:</span> <span class="text-gray-200">${formatTimestamp(job_info.completed_at)}</span></div>
+                </div>
+            </div>`;
+        }
+
+        async function clearResult(result_id) {
+            await apiFetch(`/results/${result_id}/clear`, { method: 'POST' });
+            loadResults();
+            loadJobs();
+        }
+
+        async function deleteResult(result_id) {
+            showConfirm(
+                `Permanently delete Result #${result_id} and its associated job? This cannot be undone.`,
+                async () => {
+                    await apiFetch(`/results/${result_id}`, { method: 'DELETE' });
+                    loadResults();
+                    loadJobs();
+                }
+            );
+        }
+
         async function loadResults() {
-            let res = await apiFetch('/results');
+            const isHistory = resultTab === 'history';
+            const url = isHistory ? '/results?show_history=true' : '/results';
+            let res = await apiFetch(url);
             if (!res) return;
             let data = await res.json();
 
             if (data.length === 0) {
-                document.getElementById("results").innerHTML = '<p class="text-gray-500 text-sm">No results yet.</p>';
+                document.getElementById("results").innerHTML =
+                    `<p class="text-gray-500 text-sm">${isHistory ? 'No archived results.' : 'No results yet.'}</p>`;
                 return;
             }
 
             const html = data.slice().reverse().map(r => {
                 const out = r.output;
-                const nmapCount = out.nmap ? out.nmap.reduce((acc, h) => acc + (h.ports ? h.ports.length : 0), 0) : 0;
-                const niktoCount = out.nikto ? Object.values(out.nikto).reduce((acc, v) => {
-                    if (v.error) return acc;
-                    if (v.raw) {
-                        const matches = (v.raw.match(/^\+ \[/gm) || []).length;
-                        return acc + matches;
-                    }
-                    return acc + (v[0]?.vulnerabilities?.length || 0);
-                }, 0) : 0;
+                const nmapCount = out.nmap
+                    ? out.nmap.reduce((acc, h) => acc + (h.ports ? h.ports.filter(p => p.state === 'open').length : 0), 0)
+                    : 0;
+                const niktoCount = out.nikto
+                    ? Object.values(out.nikto).reduce((acc, v) => {
+                        if (v.error) return acc;
+                        if (v.raw) return acc + (v.raw.match(/^\\+ \\[/gm) || []).length;
+                        return acc + (v[0]?.vulnerabilities?.length || 0);
+                    }, 0)
+                    : 0;
 
                 const summary = [
                     out.nmap ? `${nmapCount} open port(s)` : null,
                     out.nikto ? `${niktoCount} web finding(s)` : null
                 ].filter(Boolean).join(' · ') || 'No data';
+
+                const actions = isHistory
+                    ? `<div class="flex items-center gap-3">
+                        <input type="checkbox" class="result-checkbox accent-red-500" data-id="${r.id}">
+                        <button onclick="deleteResult(${r.id})"
+                            class="text-xs text-red-400 hover:text-red-300 transition">Delete</button>
+                       </div>`
+                    : `<button onclick="clearResult(${r.id})"
+                        class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button>`;
 
                 return `<div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
                     <div class="flex items-center justify-between px-5 py-4 cursor-pointer hover:bg-gray-750 transition"
@@ -827,9 +1058,13 @@ def dashboard():
                             <span class="text-xs text-gray-400">Job #${r.job_id}</span>
                             <span class="text-xs text-gray-500">${summary}</span>
                         </div>
-                        <span id="result-arrow-${r.id}" class="text-gray-400 text-xs">▼</span>
+                        <div class="flex items-center gap-4" onclick="event.stopPropagation()">
+                            ${actions}
+                            <span id="result-arrow-${r.id}" class="text-gray-400 text-xs pointer-events-none">▼</span>
+                        </div>
                     </div>
                     <div id="result-body-${r.id}" class="hidden px-5 pb-5 border-t border-gray-700 pt-4">
+                        ${isHistory ? renderJobInfo(r.job_info) : ''}
                         ${out.nmap ? `<div class="mb-3">
                             <p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Nmap</p>
                             ${renderNmapResult(out.nmap)}
@@ -846,7 +1081,6 @@ def dashboard():
             document.getElementById("results").innerHTML = html;
         }
 
-        // replace the setInterval line with:
         setInterval(() => {
             loadAgents();
             loadJobs();
