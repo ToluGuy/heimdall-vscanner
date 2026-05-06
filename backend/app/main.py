@@ -211,8 +211,20 @@ def delete_results_bulk(
 
 # --- JOBS ---
 
+WEB_PORTS = {80, 443, 8080, 8443, 8000, 8888}
+
 @app.post("/jobs/create")
 def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = Depends(require_auth)):
+
+    # validate port for nikto jobs
+    if job.type == "nikto_scan" and job.port is not None:
+        if job.port not in WEB_PORTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Port {job.port} is not a recognised web port. "
+                       f"Nikto only scans web services. Valid ports: {sorted(WEB_PORTS)}"
+            )
+
     new_job = Job(
         type=job.type,
         target=job.target,
@@ -368,13 +380,23 @@ def update_job_status(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job.agent_id != agent.id:
-        raise HTTPException(status_code=403, detail="This job does not belong to you")
+    new_status = data["status"]
 
-    job.status = data["status"]
-    if data["status"] == "running":
+    # When transitioning to running, assign the job to this agent if not yet assigned.
+    # This handles the race where the scanner sends running status before get_next_job
+    # has fully committed the agent assignment.
+    if new_status == "running":
+        if job.agent_id is None:
+            job.agent_id = agent.id
+        elif job.agent_id != agent.id:
+            raise HTTPException(status_code=403, detail="This job does not belong to you")
         job.started_at = datetime.utcnow()
+    else:
+        # For done/failed, only the assigned agent can update
+        if job.agent_id != agent.id:
+            raise HTTPException(status_code=403, detail="This job does not belong to you")
 
+    job.status = new_status
     db.commit()
     return {"ok": True}
 
@@ -417,9 +439,17 @@ def clear_job(job_id: int, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # pending and failed jobs have no results worth keeping — delete permanently
+    if job.status in ("pending", "failed"):
+        db.delete(job)
+        db.commit()
+        return {"ok": True, "action": "deleted"}
+
+    # done jobs soft-archive so their results remain accessible in history
     job.cleared = True
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "action": "archived"}
 
 
 # --- DISCOVERY ---
@@ -738,9 +768,9 @@ def dashboard():
 
             <!-- Jobs -->
             <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
-                <div class="flex items-center justify-between mb-4">
+                <div class="flex items-center justify-between mb-3">
                     <h2 class="text-lg font-semibold text-green-400">Jobs</h2>
-                    <div class="flex gap-2">
+                    <div class="flex gap-2 flex-wrap justify-end">
                         <button onclick="setJobFilter('all')" id="filter-all"
                             class="filter-btn active-filter text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-green-500 transition">All</button>
                         <button onclick="setJobFilter('pending')" id="filter-pending"
@@ -754,6 +784,17 @@ def dashboard():
                         <button onclick="toggleJobHistory()" id="jobHistoryBtn"
                             class="text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-purple-500 transition">Show History</button>
                     </div>
+                </div>
+                <!-- Bulk actions -->
+                <div class="flex gap-2 mb-3">
+                    <button onclick="clearAllByStatus('pending')"
+                        class="text-xs px-3 py-1 rounded-lg bg-yellow-950 hover:bg-yellow-900 text-yellow-300 border border-yellow-800 transition">
+                        Delete all pending
+                    </button>
+                    <button onclick="clearAllByStatus('failed')"
+                        class="text-xs px-3 py-1 rounded-lg bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 transition">
+                        Delete all failed
+                    </button>
                 </div>
                 <div id="jobs" class="overflow-x-auto"></div>
             </div>
@@ -964,11 +1005,17 @@ def dashboard():
             if (agent_id) payload.agent_id = parseInt(agent_id);
             if (type === "nikto_scan" && port) payload.port = parseInt(port);
 
-            await apiFetch('/jobs/create', {
+            const res = await apiFetch('/jobs/create', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)
             });
+
+            if (res && res.status === 400) {
+                const err = await res.json();
+                alert(`Job creation failed: ${err.detail}`);
+                return;
+            }
 
             document.getElementById("target").value = "";
             document.getElementById("port").value = "";
@@ -1055,7 +1102,8 @@ def dashboard():
 
             let html = `<table class="w-full text-sm">
                 <thead><tr class="text-left text-gray-400 border-b border-gray-800">
-                    <th class="pb-2 pr-3">ID</th>
+                    <th class="pb-2 pr-3">#</th>
+                    <th class="pb-2 pr-3">DB ID</th>
                     <th class="pb-2 pr-3">Type</th>
                     <th class="pb-2 pr-3">Target</th>
                     <th class="pb-2 pr-3">Status</th>
@@ -1067,13 +1115,20 @@ def dashboard():
                     <th class="pb-2">Action</th>
                 </tr></thead><tbody>`;
 
-            data.forEach(j => {
-                const action = j.cleared
-                    ? '<span class="text-xs text-gray-500 italic">archived</span>'
-                    : `<button onclick="clearJob(${j.id})" class="text-xs text-red-400 hover:text-red-300 transition">Clear</button>`;
+            data.forEach((j, idx) => {
+                const displayNum = idx + 1;
+                let action;
+                if (j.cleared) {
+                    action = '<span class="text-xs text-gray-500 italic">archived</span>';
+                } else if (j.status === 'pending' || j.status === 'failed') {
+                    action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-red-500 hover:text-red-400 transition font-medium">Delete</button>`;
+                } else {
+                    action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button>`;
+                }
 
                 html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition">
-                    <td class="py-2 pr-3 text-gray-400">#${j.id}</td>
+                    <td class="py-2 pr-3 text-gray-500 text-xs">${displayNum}</td>
+                    <td class="py-2 pr-3 text-gray-500 text-xs font-mono">${j.id}</td>
                     <td class="py-2 pr-3 font-mono text-xs text-blue-300">${j.type}</td>
                     <td class="py-2 pr-3 font-mono text-xs">${j.target}</td>
                     <td class="py-2 pr-3">${statusBadge(j.status)}</td>
@@ -1090,9 +1145,36 @@ def dashboard():
             document.getElementById("jobs").innerHTML = html;
         }
 
-        async function clearJob(job_id) {
-            await apiFetch(`/jobs/${job_id}/clear`, { method: 'POST' });
-            loadJobs();
+        async function clearJob(job_id, status) {
+            // pending and failed = permanent delete, confirm first
+            if (status === 'pending' || status === 'failed') {
+                showConfirm(
+                    `Permanently delete this ${status} job? This cannot be undone.`,
+                    async () => {
+                        await apiFetch(`/jobs/${job_id}/clear`, { method: 'POST' });
+                        loadJobs();
+                    }
+                );
+            } else {
+                await apiFetch(`/jobs/${job_id}/clear`, { method: 'POST' });
+                loadJobs();
+            }
+        }
+
+        async function clearAllByStatus(status) {
+            showConfirm(
+                `Permanently delete ALL ${status} jobs? This cannot be undone.`,
+                async () => {
+                    const res = await apiFetch('/jobs');
+                    if (!res) return;
+                    const jobs = await res.json();
+                    const targets = jobs.filter(j => j.status === status && !j.cleared);
+                    await Promise.all(
+                        targets.map(j => apiFetch(`/jobs/${j.id}/clear`, { method: 'POST' }))
+                    );
+                    loadJobs();
+                }
+            );
         }
 
         // --- RESULTS ---
