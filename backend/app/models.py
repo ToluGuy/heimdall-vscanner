@@ -40,6 +40,7 @@ class Job(Base):
     max_retries = Column(Integer, default=3)
     mode = Column(String, default="remote")
     profile = Column(String, default="standard")
+    port = Column(Integer, nullable=True)
     cleared = Column(Boolean, default=False)              # False = visible, True = archived
 
 

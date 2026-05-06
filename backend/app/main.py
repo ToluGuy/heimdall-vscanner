@@ -217,7 +217,8 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
         status="pending",
         priority=job.priority if job.priority else "medium",
         mode=job.mode if job.mode else "remote",
-        profile=job.profile if job.profile else "standard"
+        profile=job.profile if job.profile else "standard",
+        port=job.port if job.port else None
     )
     db.add(new_job)
     db.commit()
@@ -336,7 +337,8 @@ def get_next_job(
         "type": job.type,
         "target": job.target,
         "mode": job.mode,
-        "profile": job.profile
+        "profile": job.profile,
+        "port": job.port
     }
 
 
@@ -503,10 +505,16 @@ def dashboard():
                     </div>
                     <div class="flex flex-col gap-1">
                         <label class="text-xs text-gray-400">Scan Type</label>
-                        <select id="job_type" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                        <select id="job_type" onchange="togglePortField()"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
                             <option value="nmap_scan">Nmap Scan</option>
                             <option value="nikto_scan">Nikto Scan</option>
                         </select>
+                    </div>
+                    <div class="flex flex-col gap-1" id="portField" style="display:none">
+                        <label class="text-xs text-gray-400">Port</label>
+                        <input id="port" placeholder="80"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-24">
                     </div>
                     <div class="flex flex-col gap-1">
                         <label class="text-xs text-gray-400">Mode</label>
@@ -741,12 +749,19 @@ def dashboard():
 
         // --- CREATE JOB ---
 
+        function togglePortField() {
+            const type = document.getElementById("job_type").value;
+            const portField = document.getElementById("portField");
+            portField.style.display = type === "nikto_scan" ? "flex" : "none";
+        }
+
         async function createJob() {
             let target = document.getElementById("target").value;
             let agent_id = document.getElementById("agent_id").value;
             let type = document.getElementById("job_type").value;
             let mode = document.getElementById("mode").value;
             let profile = document.getElementById("profile").value;
+            let port = document.getElementById("port").value;
 
             if (!target) {
                 alert("Please enter a target IP.");
@@ -755,6 +770,7 @@ def dashboard():
 
             let payload = { type, target, mode, profile };
             if (agent_id) payload.agent_id = parseInt(agent_id);
+            if (type === "nikto_scan" && port) payload.port = parseInt(port);
 
             await apiFetch('/jobs/create', {
                 method: 'POST',
@@ -763,6 +779,7 @@ def dashboard():
             });
 
             document.getElementById("target").value = "";
+            document.getElementById("port").value = "";
             setTimeout(loadAll, 300);
         }
 

@@ -1,5 +1,5 @@
 # scanner.py
-# Agentless remote scanner — runs on endpoint server
+# Agentless remote scanner — runs on central server
 # Picks up remote jobs and scans targets from the outside
 
 import time
@@ -134,13 +134,12 @@ def send_heartbeat(api_key):
 # --- SCANNERS ---
 
 def get_nmap_flags(profile: str) -> list:
-    """Return nmap flags based on scan profile."""
     if profile == "light":
-        return ["-F"]                    # top 100 ports, fast
+        return ["-F"]
     elif profile == "full":
-        return ["-sV", "-O", "-p-"]     # all ports, service + OS detection
-    else:                                # standard
-        return ["-sV"]                   # top 1000 ports, service detection
+        return ["-sV", "-O", "-p-"]
+    else:
+        return ["-sV"]
 
 
 def parse_nmap_xml(xml_data):
@@ -193,13 +192,12 @@ def run_nmap(target: str, profile: str = "standard"):
 
 
 def get_nikto_flags(profile: str) -> list:
-    """Return nikto flags based on scan profile."""
     if profile == "light":
-        return ["-Tuning", "1"]          # basic info gathering only
+        return ["-Tuning", "1"]
     elif profile == "full":
-        return ["-Tuning", "x6"]         # all checks except DoS
-    else:                                 # standard
-        return []                         # default nikto checks
+        return ["-Tuning", "x6"]
+    else:
+        return []
 
 
 def run_nikto(target: str, port: int, profile: str = "standard"):
@@ -213,8 +211,8 @@ def run_nikto(target: str, port: int, profile: str = "standard"):
     try:
         result = subprocess.run(
             ["timeout", "90", "nikto", "-h", target, "-p", str(port),
-            "-Format", "json", "-output", tmp_path,
-            "-nolookup", *flags],
+             "-Format", "json", "-output", tmp_path,
+             "-nolookup", *flags],
             input="n\n",
             capture_output=True,
             text=True,
@@ -250,8 +248,8 @@ def execute_job(job: dict, api_key: str):
     job_id = job.get("id")
     mode = job.get("mode")
     profile = job.get("profile", "standard")
+    port = job.get("port")  # optional — used for standalone nikto jobs
 
-    # this scanner only handles remote jobs
     if mode != "remote":
         logger.info(f"Job {job_id} is mode='{mode}', not for this scanner")
         return
@@ -264,7 +262,6 @@ def execute_job(job: dict, api_key: str):
         if job_type == "nmap_scan":
             nmap_output = run_nmap(target, profile)
 
-            # check if any web ports are open and auto-run Nikto
             web_ports = []
             for host in nmap_output:
                 for port_info in host.get("ports", []):
@@ -276,18 +273,22 @@ def execute_job(job: dict, api_key: str):
             if web_ports:
                 logger.info(f"Web ports found: {web_ports} — running Nikto")
                 nikto_results = {}
-                for port in web_ports:
+                for wp in web_ports:
                     try:
-                        nikto_results[str(port)] = run_nikto(target, port, profile)
+                        nikto_results[str(wp)] = run_nikto(target, wp, profile)
                     except Exception as e:
-                        nikto_results[str(port)] = {"error": str(e)}
+                        nikto_results[str(wp)] = {"error": str(e)}
                 output["nikto"] = nikto_results
             else:
                 logger.debug(f"No web ports found on {target}, skipping Nikto")
 
         elif job_type == "nikto_scan":
-            # standalone Nikto job — assumes port 80 unless target includes port
-            output = {"nikto": run_nikto(target, 80, profile)}
+            # use job-specified port, fall back to 80
+            scan_port = int(port) if port else 80
+            logger.info(f"Standalone Nikto scan on {target}:{scan_port}")
+            nikto_result = run_nikto(target, scan_port, profile)
+            # wrap in port-keyed structure — matches nmap auto-nikto output format
+            output = {"nikto": {str(scan_port): nikto_result}}
 
         else:
             output = {"error": f"Unsupported job type: {job_type}"}
@@ -323,7 +324,7 @@ def main():
                 logger.info(f"Received job: {job}")
                 execute_job(job, api_key)
             else:
-                logger.info(f"No remote jobs available")
+                logger.info("No remote jobs available")
 
         except Exception as e:
             logger.error(f"Main loop error: {e}")

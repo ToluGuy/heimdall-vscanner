@@ -182,13 +182,12 @@ def run_nmap(target, profile: str = "standard"):
 
 
 def get_nikto_flags(profile: str) -> list:
-    """Return nikto flags based on scan profile."""
     if profile == "light":
-        return ["-Tuning", "1"]          # basic info gathering only
+        return ["-Tuning", "1"]
     elif profile == "full":
-        return ["-Tuning", "x6"]         # all checks except DoS
-    else:                                 # standard
-        return []                         # default nikto checks
+        return ["-Tuning", "x6"]
+    else:
+        return []
 
 
 def run_nikto(target: str, port: int, profile: str = "standard"):
@@ -202,8 +201,8 @@ def run_nikto(target: str, port: int, profile: str = "standard"):
     try:
         result = subprocess.run(
             ["timeout", "90", "nikto", "-h", target, "-p", str(port),
-            "-Format", "json", "-output", tmp_path,
-            "-nolookup", *flags],
+             "-Format", "json", "-output", tmp_path,
+             "-nolookup", *flags],
             input="n\n",
             capture_output=True,
             text=True,
@@ -229,13 +228,14 @@ def run_nikto(target: str, port: int, profile: str = "standard"):
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-                   
+
 
 def execute_job(job: dict, api_key: str):
     job_type = job.get("type")
     target = job.get("target")
     job_id = job.get("id")
     profile = job.get("profile", "standard")
+    port = job.get("port")  # optional — used for standalone nikto jobs
 
     try:
         logger.info(f"Job {job_id} starting — type={job_type} target={target} profile={profile}")
@@ -256,17 +256,22 @@ def execute_job(job: dict, api_key: str):
             if web_ports:
                 logger.info(f"Web ports found: {web_ports} — running Nikto")
                 nikto_results = {}
-                for port in web_ports:
+                for wp in web_ports:
                     try:
-                        nikto_results[str(port)] = run_nikto(target, port, profile)
+                        nikto_results[str(wp)] = run_nikto(target, wp, profile)
                     except Exception as e:
-                        nikto_results[str(port)] = {"error": str(e)}
+                        nikto_results[str(wp)] = {"error": str(e)}
                 output["nikto"] = nikto_results
             else:
                 logger.debug(f"No web ports found on {target}, skipping Nikto")
 
         elif job_type == "nikto_scan":
-            output = {"nikto": run_nikto(target, 80, profile)}
+            # use job-specified port, fall back to 80
+            scan_port = int(port) if port else 80
+            logger.info(f"Standalone Nikto scan on {target}:{scan_port}")
+            nikto_result = run_nikto(target, scan_port, profile)
+            # wrap in port-keyed structure — matches nmap auto-nikto output format
+            output = {"nikto": {str(scan_port): nikto_result}}
 
         else:
             output = {"error": f"Unknown job type: {job_type}"}

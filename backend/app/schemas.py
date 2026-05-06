@@ -48,3 +48,4 @@ class JobCreate(BaseModel):
     priority: str | None = "medium"
     mode: str | None = "remote"
     profile: str | None = "standard"
+    port: Optional[int] = None
