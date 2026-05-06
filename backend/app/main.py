@@ -209,6 +209,54 @@ def delete_results_bulk(
     return {"ok": True, "deleted": len(results)}
 
 
+# --- EXPORT ---
+
+@app.get("/export/results")
+def export_results(
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+    show_history: bool = False
+):
+    """
+    Returns a clean structured JSON export of all results.
+    Used by the dashboard download button and available for direct API access.
+    """
+    if show_history:
+        results = db.query(Result).filter(Result.cleared == True).all()
+    else:
+        results = db.query(Result).filter(Result.cleared == False).all()
+
+    export = []
+    for r in results:
+        parsed_output = json.loads(r.output)
+        job = db.query(Job).filter(Job.id == r.job_id).first()
+
+        job_info = None
+        if job:
+            job_info = {
+                "target": job.target,
+                "type": job.type,
+                "mode": job.mode,
+                "profile": job.profile,
+                "priority": job.priority,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            }
+
+        export.append({
+            "result_id": r.id,
+            "job": job_info or {"job_id": r.job_id},
+            "nmap": parsed_output.get("nmap"),
+            "nikto": parsed_output.get("nikto"),
+        })
+
+    return {
+        "exported_at": datetime.utcnow().isoformat(),
+        "source": "VAPT Scanner",
+        "total": len(export),
+        "results": export
+    }
+
+
 # --- JOBS ---
 
 WEB_PORTS = {80, 443, 8080, 8443, 8000, 8888}
@@ -816,6 +864,22 @@ def dashboard():
                     </div>
                 </div>
 
+                <!-- Active toolbar -->
+                <div id="activeToolbar" class="mb-4 flex items-center gap-3">
+                    <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
+                        <input type="checkbox" id="selectAllActiveCheckbox" onchange="toggleSelectAllActive()" class="accent-yellow-500">
+                        Select all
+                    </label>
+                    <button onclick="clearSelected()"
+                        class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-600 transition font-medium">
+                        Clear Selected
+                    </button>
+                    <button onclick="exportResults()"
+                        class="text-xs px-3 py-1.5 rounded-lg bg-cyan-900 hover:bg-cyan-800 text-cyan-200 border border-cyan-700 transition font-medium">
+                        ↓ Export JSON
+                    </button>
+                </div>
+
                 <!-- History toolbar (hidden when on active tab) -->
                 <div id="historyToolbar" class="hidden mb-4 flex items-center gap-3">
                     <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
@@ -825,6 +889,10 @@ def dashboard():
                     <button onclick="deleteSelected()"
                         class="text-xs px-3 py-1.5 rounded-lg bg-red-900 hover:bg-red-800 text-red-200 border border-red-700 transition font-medium">
                         Delete Selected
+                    </button>
+                    <button onclick="exportResults()"
+                        class="text-xs px-3 py-1.5 rounded-lg bg-cyan-900 hover:bg-cyan-800 text-cyan-200 border border-cyan-700 transition font-medium">
+                        ↓ Export JSON
                     </button>
                 </div>
 
@@ -936,27 +1004,55 @@ def dashboard():
             active.classList.add('bg-gray-700', 'text-white');
             active.classList.remove('text-gray-400');
 
-            const toolbar = document.getElementById('historyToolbar');
             if (tab === 'history') {
-                toolbar.classList.remove('hidden');
+                document.getElementById('historyToolbar').classList.remove('hidden');
+                document.getElementById('activeToolbar').classList.add('hidden');
             } else {
-                toolbar.classList.add('hidden');
+                document.getElementById('historyToolbar').classList.add('hidden');
+                document.getElementById('activeToolbar').classList.remove('hidden');
             }
 
-            // reset select all
+            // reset checkboxes
             document.getElementById('selectAllCheckbox').checked = false;
+            document.getElementById('selectAllActiveCheckbox').checked = false;
 
             loadResults();
         }
 
+        // history tab — select all
         function toggleSelectAll() {
             const checked = document.getElementById('selectAllCheckbox').checked;
+            document.querySelectorAll('.result-checkbox').forEach(cb => cb.checked = checked);
+        }
+
+        // active tab — select all
+        function toggleSelectAllActive() {
+            const checked = document.getElementById('selectAllActiveCheckbox').checked;
             document.querySelectorAll('.result-checkbox').forEach(cb => cb.checked = checked);
         }
 
         function getSelectedIds() {
             return Array.from(document.querySelectorAll('.result-checkbox:checked'))
                 .map(cb => parseInt(cb.dataset.id));
+        }
+
+        async function clearSelected() {
+            const ids = getSelectedIds();
+            if (!ids.length) {
+                alert("No results selected.");
+                return;
+            }
+            showConfirm(
+                `Clear ${ids.length} result(s)? They will move to History and can be permanently deleted from there.`,
+                async () => {
+                    await Promise.all(
+                        ids.map(id => apiFetch(`/results/${id}/clear`, { method: 'POST' }))
+                    );
+                    document.getElementById('selectAllActiveCheckbox').checked = false;
+                    loadResults();
+                    loadJobs();
+                }
+            );
         }
 
         async function deleteSelected() {
@@ -978,6 +1074,81 @@ def dashboard():
                     loadJobs();
                 }
             );
+        }
+
+        async function exportResults() {
+            // collect selected IDs from whichever tab is active
+            const selectedIds = getSelectedIds();
+
+            // fetch the current tab's results
+            const isHistory = resultTab === 'history';
+            const url = isHistory ? '/results?show_history=true' : '/results';
+            const res = await apiFetch(url);
+            if (!res) return;
+            const data = await res.json();
+
+            // filter to selection if any checkboxes ticked, else export all visible
+            const toExport = selectedIds.length
+                ? data.filter(r => selectedIds.includes(r.id))
+                : data;
+
+            if (!toExport.length) {
+                alert("No results to export.");
+                return;
+            }
+
+            // build clean export document
+            const exportDoc = {
+                exported_at: new Date().toISOString(),
+                source: "VAPT Scanner",
+                tab: resultTab,
+                total: toExport.length,
+                results: toExport.map(r => {
+                    const out = r.output;
+                    return {
+                        result_id: r.id,
+                        job: r.job_info ? {
+                            target: r.job_info.target,
+                            type: r.job_info.type,
+                            mode: r.job_info.mode,
+                            profile: r.job_info.profile,
+                            priority: r.job_info.priority,
+                            completed_at: r.job_info.completed_at
+                        } : { job_id: r.job_id },
+                        nmap: out.nmap || null,
+                        nikto: out.nikto ? Object.entries(out.nikto).reduce((acc, [port, result]) => {
+                            // parse raw nikto output into structured findings for export
+                            if (result.raw) {
+                                const findings = result.raw.split('\n')
+                                    .filter(l => l.match(/^\+ \[/))
+                                    .map(line => {
+                                        const match = line.match(/^\+ \[(\w+)\] (.+?):\s*(.+)$/);
+                                        return match
+                                            ? { id: match[1], url: match[2], message: match[3] }
+                                            : { raw_line: line.replace(/^\+ /, '') };
+                                    });
+                                acc[port] = { findings };
+                            } else if (result.error) {
+                                acc[port] = { error: result.error };
+                            } else {
+                                acc[port] = { vulnerabilities: result[0]?.vulnerabilities || [] };
+                            }
+                            return acc;
+                        }, {}) : null
+                    };
+                })
+            };
+
+            // trigger download
+            const blob = new Blob([JSON.stringify(exportDoc, null, 2)], { type: 'application/json' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            a.download = `vapt-export-${ts}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(a.href);
         }
 
         // --- CREATE JOB ---
@@ -1338,8 +1509,11 @@ def dashboard():
                         <button onclick="deleteResult(${r.id})"
                             class="text-xs text-red-400 hover:text-red-300 transition">Delete</button>
                        </div>`
-                    : `<button onclick="clearResult(${r.id})"
-                        class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button>`;
+                    : `<div class="flex items-center gap-3">
+                        <input type="checkbox" class="result-checkbox accent-yellow-500" data-id="${r.id}">
+                        <button onclick="clearResult(${r.id})"
+                            class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button>
+                       </div>`;
 
                 return `<div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
                     <div class="flex items-center justify-between px-5 py-4 cursor-pointer hover:bg-gray-750 transition"
