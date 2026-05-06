@@ -1,0 +1,21 @@
+[Unit]
+Description=VAPT Remote Scanner
+After=network.target vapt-server.service
+Wants=vapt-server.service
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/opt/vapt-scanner-project
+EnvironmentFile=/opt/vapt-scanner-project/.env
+Environment=VAPT_AGENT_NAME=scanner-1
+Environment=VAPT_SERVER_URL=http://127.0.0.1:8000
+Environment=VAPT_CAPABILITIES=nmap_scan,nikto_scan
+ExecStart=/opt/vapt-scanner-project/venv/bin/python /opt/vapt-scanner-project/scanner.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
