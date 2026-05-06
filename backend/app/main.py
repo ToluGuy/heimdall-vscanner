@@ -3,6 +3,9 @@
 import secrets
 import os
 import json
+import subprocess
+import threading
+import xml.etree.ElementTree as ET
 from fastapi import FastAPI, Depends, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -10,8 +13,8 @@ from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 
 from typing import List
-from .db import Base, engine, get_db
-from .models import Agent, Job, Result
+from .db import Base, engine, get_db, SessionLocal
+from .models import Agent, Job, Result, DiscoverySweep
 from .schemas import AgentCreate, AgentResponse, JobResponse, ResultCreate, ResultResponse, JobCreate
 from dotenv import load_dotenv
 from .logger import get_logger
@@ -419,6 +422,155 @@ def clear_job(job_id: int, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
+# --- DISCOVERY ---
+
+def run_ping_sweep(sweep_id: int, subnet: str, mode: str, profile: str):
+    """
+    Runs in a background thread. Performs an Nmap ping sweep,
+    then creates nmap_scan jobs for each live host found.
+    """
+    db = SessionLocal()
+    try:
+        result = subprocess.run(
+            ["nmap", "-sn", "-oX", "-", subnet],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        hosts = []
+        if result.returncode == 0:
+            try:
+                root = ET.fromstring(result.stdout)
+                for host in root.findall("host"):
+                    # only include hosts that are up
+                    status = host.find("status")
+                    if status is not None and status.get("state") == "up":
+                        addr = host.find("address")
+                        if addr is not None:
+                            hosts.append(addr.get("addr"))
+            except ET.ParseError as e:
+                logger.error(f"Sweep {sweep_id} XML parse error: {e}")
+
+        # create a job for each discovered host
+        jobs_created = 0
+        for host_ip in hosts:
+            new_job = Job(
+                type="nmap_scan",
+                target=host_ip,
+                status="pending",
+                mode=mode,
+                profile=profile,
+                priority="medium"
+            )
+            db.add(new_job)
+            jobs_created += 1
+
+        sweep = db.query(DiscoverySweep).filter(DiscoverySweep.id == sweep_id).first()
+        if sweep:
+            sweep.status = "done"
+            sweep.hosts_found = len(hosts)
+            sweep.jobs_created = jobs_created
+            sweep.result = json.dumps(hosts)
+            sweep.completed_at = datetime.utcnow()
+
+        db.commit()
+        logger.info(f"Sweep {sweep_id} complete: {len(hosts)} hosts found, {jobs_created} jobs created")
+
+    except subprocess.TimeoutExpired:
+        sweep = db.query(DiscoverySweep).filter(DiscoverySweep.id == sweep_id).first()
+        if sweep:
+            sweep.status = "failed"
+            sweep.completed_at = datetime.utcnow()
+        db.commit()
+        logger.error(f"Sweep {sweep_id} timed out")
+
+    except Exception as e:
+        sweep = db.query(DiscoverySweep).filter(DiscoverySweep.id == sweep_id).first()
+        if sweep:
+            sweep.status = "failed"
+            sweep.completed_at = datetime.utcnow()
+        db.commit()
+        logger.error(f"Sweep {sweep_id} failed: {e}")
+
+    finally:
+        db.close()
+
+
+@app.post("/discover")
+def start_discovery(
+    data: dict,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth)
+):
+    subnet = data.get("subnet", "").strip()
+    mode = data.get("mode", "remote")
+    profile = data.get("profile", "standard")
+
+    if not subnet:
+        raise HTTPException(status_code=400, detail="subnet is required")
+
+    sweep = DiscoverySweep(
+        subnet=subnet,
+        status="running"
+    )
+    db.add(sweep)
+    db.commit()
+    db.refresh(sweep)
+
+    thread = threading.Thread(
+        target=run_ping_sweep,
+        args=(sweep.id, subnet, mode, profile),
+        daemon=True
+    )
+    thread.start()
+
+    logger.info(f"Discovery sweep {sweep.id} started for subnet {subnet}")
+    return {"sweep_id": sweep.id, "status": "running"}
+
+
+@app.get("/discover/{sweep_id}")
+def get_sweep_status(
+    sweep_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth)
+):
+    sweep = db.query(DiscoverySweep).filter(DiscoverySweep.id == sweep_id).first()
+    if not sweep:
+        raise HTTPException(status_code=404, detail="Sweep not found")
+
+    return {
+        "id": sweep.id,
+        "subnet": sweep.subnet,
+        "status": sweep.status,
+        "hosts_found": sweep.hosts_found,
+        "jobs_created": sweep.jobs_created,
+        "hosts": json.loads(sweep.result) if sweep.result else [],
+        "started_at": sweep.started_at.isoformat() if sweep.started_at else None,
+        "completed_at": sweep.completed_at.isoformat() if sweep.completed_at else None,
+    }
+
+
+@app.get("/discover")
+def get_sweep_history(
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth)
+):
+    sweeps = db.query(DiscoverySweep).order_by(DiscoverySweep.id.desc()).limit(20).all()
+    return [
+        {
+            "id": s.id,
+            "subnet": s.subnet,
+            "status": s.status,
+            "hosts_found": s.hosts_found,
+            "jobs_created": s.jobs_created,
+            "started_at": s.started_at.isoformat() if s.started_at else None,
+            "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+        }
+        for s in sweeps
+    ]
+
+
 # --- DASHBOARD ---
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -488,6 +640,46 @@ def dashboard():
         </div>
 
         <div class="max-w-screen-xl mx-auto px-6 py-8 space-y-10">
+
+            <!-- Network Discovery -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <h2 class="text-lg font-semibold text-green-400 mb-4">Network Discovery</h2>
+                <div class="flex flex-wrap gap-3 items-end mb-5">
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Subnet (CIDR)</label>
+                        <input id="discoverSubnet" placeholder="192.168.1.0/24"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-52">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Mode</label>
+                        <select id="discoverMode" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="remote">Remote</option>
+                            <option value="agent">Agent</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Profile</label>
+                        <select id="discoverProfile" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="standard">Standard</option>
+                            <option value="light">Light</option>
+                            <option value="full">Full</option>
+                        </select>
+                    </div>
+                    <button onclick="startDiscovery()"
+                        class="bg-cyan-700 hover:bg-cyan-600 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">
+                        ⌖ Sweep
+                    </button>
+                </div>
+
+                <!-- Sweep status area -->
+                <div id="sweepStatus" class="hidden mb-4 p-3 bg-gray-800 rounded-lg border border-gray-700 text-xs text-gray-300 flex items-center gap-3">
+                    <div id="sweepSpinner" class="w-3 h-3 rounded-full bg-cyan-400 animate-pulse"></div>
+                    <span id="sweepStatusText">Sweeping...</span>
+                </div>
+
+                <!-- Sweep history -->
+                <div id="sweepHistory"></div>
+            </div>
 
             <!-- Create Job -->
             <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
@@ -1098,10 +1290,120 @@ def dashboard():
             document.getElementById("results").innerHTML = html;
         }
 
+        // --- DISCOVERY ---
+
+        let activeSweepId = null;
+        let sweepPollInterval = null;
+
+        async function startDiscovery() {
+            const subnet = document.getElementById("discoverSubnet").value.trim();
+            const mode = document.getElementById("discoverMode").value;
+            const profile = document.getElementById("discoverProfile").value;
+
+            if (!subnet) {
+                alert("Please enter a subnet in CIDR format (e.g. 192.168.1.0/24)");
+                return;
+            }
+
+            const res = await apiFetch('/discover', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ subnet, mode, profile })
+            });
+            if (!res) return;
+
+            const data = await res.json();
+            activeSweepId = data.sweep_id;
+
+            document.getElementById("sweepStatus").classList.remove('hidden');
+            document.getElementById("sweepSpinner").classList.add('animate-pulse');
+            document.getElementById("sweepStatusText").textContent = `Sweeping ${subnet}...`;
+
+            // poll every 3 seconds until done
+            sweepPollInterval = setInterval(() => pollSweep(activeSweepId), 3000);
+        }
+
+        async function pollSweep(sweepId) {
+            const res = await apiFetch(`/discover/${sweepId}`);
+            if (!res) return;
+            const data = await res.json();
+
+            if (data.status === 'done') {
+                clearInterval(sweepPollInterval);
+                sweepPollInterval = null;
+
+                document.getElementById("sweepSpinner").classList.remove('animate-pulse');
+                document.getElementById("sweepSpinner").classList.remove('bg-cyan-400');
+                document.getElementById("sweepSpinner").classList.add('bg-green-400');
+                document.getElementById("sweepStatusText").textContent =
+                    `Sweep complete — ${data.hosts_found} host(s) found, ${data.jobs_created} job(s) created`;
+
+                loadSweepHistory();
+                loadJobs();
+
+            } else if (data.status === 'failed') {
+                clearInterval(sweepPollInterval);
+                sweepPollInterval = null;
+
+                document.getElementById("sweepSpinner").classList.remove('bg-cyan-400');
+                document.getElementById("sweepSpinner").classList.add('bg-red-500');
+                document.getElementById("sweepStatusText").textContent = 'Sweep failed. Check server logs.';
+                loadSweepHistory();
+            }
+        }
+
+        async function loadSweepHistory() {
+            const res = await apiFetch('/discover');
+            if (!res) return;
+            const sweeps = await res.json();
+
+            if (!sweeps.length) {
+                document.getElementById("sweepHistory").innerHTML =
+                    '<p class="text-gray-600 text-xs">No sweeps yet.</p>';
+                return;
+            }
+
+            const statusColor = {
+                running: 'text-blue-400',
+                done:    'text-green-400',
+                failed:  'text-red-400',
+            };
+
+            const rows = sweeps.map(s => `
+                <tr class="border-b border-gray-800 hover:bg-gray-800 transition text-xs">
+                    <td class="py-2 pr-4 text-gray-400">#${s.id}</td>
+                    <td class="py-2 pr-4 font-mono">${s.subnet}</td>
+                    <td class="py-2 pr-4 ${statusColor[s.status] || 'text-gray-400'}">${s.status}</td>
+                    <td class="py-2 pr-4 text-gray-300">${s.hosts_found} host(s)</td>
+                    <td class="py-2 pr-4 text-gray-300">${s.jobs_created} job(s)</td>
+                    <td class="py-2 text-gray-500">${formatTimestamp(s.started_at)}</td>
+                </tr>`).join('');
+
+            document.getElementById("sweepHistory").innerHTML = `
+                <table class="w-full text-sm mt-2">
+                    <thead><tr class="text-left text-gray-500 border-b border-gray-800">
+                        <th class="pb-2 pr-4">ID</th>
+                        <th class="pb-2 pr-4">Subnet</th>
+                        <th class="pb-2 pr-4">Status</th>
+                        <th class="pb-2 pr-4">Hosts</th>
+                        <th class="pb-2 pr-4">Jobs</th>
+                        <th class="pb-2">Started</th>
+                    </tr></thead>
+                    <tbody>${rows}</tbody>
+                </table>`;
+        }
+
         setInterval(() => {
             loadAgents();
             loadJobs();
         }, 5000);
+
+        // load sweep history on first login
+        const _origLoadAll = loadAll;
+        loadAll = async function() {
+            await _origLoadAll();
+            loadSweepHistory();
+        };
         </script>
     </body>
     </html>

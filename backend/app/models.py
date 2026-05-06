@@ -1,6 +1,6 @@
 # backend/app/models.py
 
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Text
 from datetime import datetime
 import uuid
 
@@ -32,7 +32,7 @@ class Job(Base):
     agent_id = Column(Integer, ForeignKey("agents.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)        # set when job finishes
+    completed_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     next_run_at = Column(DateTime, nullable=True)
     priority = Column(String, default="medium")
@@ -41,7 +41,7 @@ class Job(Base):
     mode = Column(String, default="remote")
     profile = Column(String, default="standard")
     port = Column(Integer, nullable=True)
-    cleared = Column(Boolean, default=False)              # False = visible, True = archived
+    cleared = Column(Boolean, default=False)
 
 
 class Result(Base):
@@ -51,4 +51,17 @@ class Result(Base):
     job_id = Column(Integer, nullable=False)
     output = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
-    cleared = Column(Boolean, default=False) #false = active, true = archived
+    cleared = Column(Boolean, default=False)
+
+
+class DiscoverySweep(Base):
+    __tablename__ = "discovery_sweeps"
+
+    id = Column(Integer, primary_key=True, index=True)
+    subnet = Column(String, nullable=False)           # e.g. 192.168.1.0/24
+    status = Column(String, default="running")        # running, done, failed
+    hosts_found = Column(Integer, default=0)
+    jobs_created = Column(Integer, default=0)
+    result = Column(Text, nullable=True)              # JSON list of discovered hosts
+    started_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)

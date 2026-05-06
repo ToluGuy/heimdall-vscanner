@@ -276,6 +276,15 @@ BEGIN
         ALTER TABLE jobs ADD COLUMN next_run_at TIMESTAMP;
         RAISE NOTICE 'Added jobs.next_run_at';
     END IF;
+
+    -- jobs.port
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='jobs' AND column_name='port'
+    ) THEN
+        ALTER TABLE jobs ADD COLUMN port INTEGER;
+        RAISE NOTICE 'Added jobs.port';
+    END IF;
 END
 \$\$;
 EOF
