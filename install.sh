@@ -293,6 +293,14 @@ BEGIN
         ALTER TABLE jobs ADD COLUMN ports VARCHAR;
         RAISE NOTICE 'Added jobs.ports';
     END IF;
+    
+     IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='agents' AND column_name='is_stale'
+    ) THEN
+        ALTER TABLE agents ADD COLUMN is_stale BOOLEAN DEFAULT FALSE;
+        RAISE NOTICE 'Added agents.is_stale';
+    END IF;
 END
 \$\$;
 EOF
