@@ -49,3 +49,4 @@ class JobCreate(BaseModel):
     mode: str | None = "remote"
     profile: str | None = "standard"
     port: Optional[int] = None
+    ports: Optional[str] = None

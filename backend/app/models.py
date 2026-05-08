@@ -40,7 +40,8 @@ class Job(Base):
     max_retries = Column(Integer, default=3)
     mode = Column(String, default="remote")
     profile = Column(String, default="standard")
-    port = Column(Integer, nullable=True)
+    port = Column(Integer, nullable=True)       # single port — used by nikto_scan
+    ports = Column(String, nullable=True)       # comma-separated — used by nse_scan and multi-port nikto
     cleared = Column(Boolean, default=False)
 
 

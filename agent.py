@@ -29,8 +29,11 @@ logging.getLogger("requests").setLevel(logging.WARNING)
 # --- CONFIG ---
 SERVER_URL = os.environ.get("VAPT_SERVER_URL", "http://127.0.0.1:8000")
 AGENT_NAME = os.environ.get("VAPT_AGENT_NAME", "agent-default")
-CAPABILITIES = os.environ.get("VAPT_CAPABILITIES", "nmap_scan,nikto_scan")
+CAPABILITIES = os.environ.get("VAPT_CAPABILITIES", "nmap_scan,nikto_scan,nse_scan")
 API_KEY_FILE = os.environ.get("VAPT_KEY_FILE", f"{AGENT_NAME}_key.txt")
+
+# Web ports are Nikto's domain — NSE skips these automatically
+WEB_PORTS = {80, 443, 8080, 8443, 8000, 8888}
 
 
 def register():
@@ -123,6 +126,8 @@ def send_heartbeat(api_key):
         pass
 
 
+# --- NMAP ---
+
 def parse_nmap_xml(xml_data):
     root = ET.fromstring(xml_data)
 
@@ -181,6 +186,143 @@ def run_nmap(target, profile: str = "standard"):
     return parsed
 
 
+# --- NSE ---
+
+def get_nse_flags(profile: str) -> list:
+    """
+    Maps scan profile to NSE script intensity.
+      light    -> --script safe      (non-intrusive, safe to run anywhere)
+      standard -> --script vuln      (vulnerability checks, low disruption risk)
+      full     -> --script vuln,exploit  (intrusive — may affect services)
+    """
+    if profile == "light":
+        return ["--script", "safe"]
+    elif profile == "full":
+        return ["--script", "vuln,exploit"]
+    else:
+        return ["--script", "vuln"]
+
+
+def parse_nse_from_xml(xml_data: str) -> list:
+    """
+    Parses Nmap XML output and extracts NSE script results from <script> elements.
+    Returns a list of findings, each tied to the host/port they came from.
+    """
+    root = ET.fromstring(xml_data)
+    findings = []
+
+    for host in root.findall("host"):
+        addr_el = host.find("address")
+        if addr_el is None:
+            continue
+        addr = addr_el.get("addr")
+
+        # host-level scripts (e.g. smb-vuln-*)
+        hostscript = host.find("hostscript")
+        if hostscript is not None:
+            for script in hostscript.findall("script"):
+                findings.append({
+                    "host": addr,
+                    "port": None,
+                    "service": None,
+                    "script_id": script.get("id"),
+                    "output": script.get("output", "").strip(),
+                })
+
+        # port-level scripts
+        ports_el = host.find("ports")
+        if ports_el is None:
+            continue
+
+        for port_el in ports_el.findall("port"):
+            portid = int(port_el.get("portid"))
+            state_el = port_el.find("state")
+            if state_el is None or state_el.get("state") != "open":
+                continue
+
+            service_el = port_el.find("service")
+            service = service_el.get("name", "unknown") if service_el is not None else "unknown"
+
+            for script in port_el.findall("script"):
+                findings.append({
+                    "host": addr,
+                    "port": portid,
+                    "service": service,
+                    "script_id": script.get("id"),
+                    "output": script.get("output", "").strip(),
+                })
+
+    return findings
+
+
+def resolve_nse_ports(ports_str: str | None, profile: str) -> list[str]:
+    """
+    Resolves the -p flag list for an NSE scan.
+
+    - If ports_str is provided, parse and exclude web ports.
+    - If nothing remains after exclusion, return an empty list (caller handles warning).
+    - If ports_str is blank, return [] meaning "use Nmap profile defaults" (no -p flag).
+    """
+    if not ports_str:
+        return []
+
+    requested = []
+    for part in ports_str.split(","):
+        part = part.strip()
+        if part.isdigit():
+            requested.append(int(part))
+
+    non_web = [p for p in requested if p not in WEB_PORTS]
+    return [str(p) for p in non_web]
+
+
+def run_nse(target: str, profile: str = "standard", ports_str: str | None = None):
+    """
+    Runs an NSE scan against target.
+    Web ports are excluded — Nikto owns that surface.
+    Returns a dict with 'findings' (list) and optionally 'warning'.
+    """
+    logger.info(f"Running NSE ({profile}) on {target}")
+
+    nse_flags = get_nse_flags(profile)
+    port_list = resolve_nse_ports(ports_str, profile)
+
+    # If the user specified ports but all were web ports, warn and bail out
+    if ports_str and not port_list:
+        warning = (
+            "All specified ports are web ports (80, 443, 8080, 8443, 8000, 8888). "
+            "NSE skips these — use a Nikto scan for web surface testing."
+        )
+        logger.warning(f"NSE job on {target}: {warning}")
+        return {"findings": [], "warning": warning}
+
+    cmd = ["nmap", "-sV", *nse_flags]
+
+    if port_list:
+        cmd += ["-p", ",".join(port_list)]
+        logger.info(f"NSE port list (web ports excluded): {port_list}")
+    else:
+        logger.info("NSE using profile default port range")
+
+    cmd += ["-oX", "-", target]
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise Exception(f"NSE scan failed: {result.stderr}")
+
+    findings = parse_nse_from_xml(result.stdout)
+    logger.info(f"NSE complete — {len(findings)} finding(s) on {target}")
+
+    return {"findings": findings}
+
+
+# --- NIKTO ---
+
 def get_nikto_flags(profile: str) -> list:
     if profile == "light":
         return ["-Tuning", "1"]
@@ -230,12 +372,15 @@ def run_nikto(target: str, port: int, profile: str = "standard"):
             os.remove(tmp_path)
 
 
+# --- JOB EXECUTION ---
+
 def execute_job(job: dict, api_key: str):
     job_type = job.get("type")
     target = job.get("target")
     job_id = job.get("id")
     profile = job.get("profile", "standard")
-    port = job.get("port")  # optional — used for standalone nikto jobs
+    port = job.get("port")       # single port (nikto_scan)
+    ports = job.get("ports")     # comma-separated (nse_scan / multi-port nikto)
 
     try:
         logger.info(f"Job {job_id} starting — type={job_type} target={target} profile={profile}")
@@ -248,7 +393,7 @@ def execute_job(job: dict, api_key: str):
             web_ports = []
             for host in nmap_output:
                 for port_info in host.get("ports", []):
-                    if port_info["state"] == "open" and port_info["port"] in [80, 443, 8080, 8443]:
+                    if port_info["state"] == "open" and port_info["port"] in WEB_PORTS:
                         web_ports.append(port_info["port"])
 
             output = {"nmap": nmap_output}
@@ -266,12 +411,14 @@ def execute_job(job: dict, api_key: str):
                 logger.debug(f"No web ports found on {target}, skipping Nikto")
 
         elif job_type == "nikto_scan":
-            # use job-specified port, fall back to 80
             scan_port = int(port) if port else 80
             logger.info(f"Standalone Nikto scan on {target}:{scan_port}")
             nikto_result = run_nikto(target, scan_port, profile)
-            # wrap in port-keyed structure — matches nmap auto-nikto output format
             output = {"nikto": {str(scan_port): nikto_result}}
+
+        elif job_type == "nse_scan":
+            nse_result = run_nse(target, profile, ports)
+            output = {"nse": nse_result}
 
         else:
             output = {"error": f"Unknown job type: {job_type}"}

@@ -285,6 +285,14 @@ BEGIN
         ALTER TABLE jobs ADD COLUMN port INTEGER;
         RAISE NOTICE 'Added jobs.port';
     END IF;
+    
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='jobs' AND column_name='ports'
+    ) THEN
+        ALTER TABLE jobs ADD COLUMN ports VARCHAR;
+        RAISE NOTICE 'Added jobs.ports';
+    END IF;
 END
 \$\$;
 EOF

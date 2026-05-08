@@ -131,6 +131,7 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS started_at TIMESTAMP;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS next_run_at TIMESTAMP;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS port INTEGER;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ports VARCHAR;
 ```
 
 The `discovery_sweeps` table is created automatically by SQLAlchemy on startup.
