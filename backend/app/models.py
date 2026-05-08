@@ -20,6 +20,7 @@ class Agent(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_seen = Column(DateTime, default=datetime.utcnow)
     capabilities = Column(String, default="nmap_scan")
+    is_stale = Column(Boolean, default=False)
 
 
 class Job(Base):
@@ -41,7 +42,7 @@ class Job(Base):
     mode = Column(String, default="remote")
     profile = Column(String, default="standard")
     port = Column(Integer, nullable=True)       # single port — used by nikto_scan
-    ports = Column(String, nullable=True)       # comma-separated — used by nse_scan and multi-port nikto
+    ports = Column(String, nullable=True)       # comma-separated — used by nse_scan
     cleared = Column(Boolean, default=False)
 
 
