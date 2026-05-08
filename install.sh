@@ -301,6 +301,29 @@ BEGIN
         ALTER TABLE agents ADD COLUMN is_stale BOOLEAN DEFAULT FALSE;
         RAISE NOTICE 'Added agents.is_stale';
     END IF;
+    
+    -- schedules table (created by SQLAlchemy on fresh installs, manual migration for upgrades)
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_name='schedules'
+    ) THEN
+        CREATE TABLE schedules (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR NOT NULL,
+            type VARCHAR NOT NULL,
+            target VARCHAR NOT NULL,
+            mode VARCHAR DEFAULT 'remote',
+            profile VARCHAR DEFAULT 'standard',
+            priority VARCHAR DEFAULT 'medium',
+            ports VARCHAR,
+            interval_hours INTEGER NOT NULL,
+            paused BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            last_run_at TIMESTAMP,
+            next_run_at TIMESTAMP
+        );
+        RAISE NOTICE 'Created schedules table';
+    END IF;
 END
 \$\$;
 EOF

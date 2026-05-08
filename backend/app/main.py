@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 
 from typing import List
 from .db import Base, engine, get_db, SessionLocal
-from .models import Agent, Job, Result, DiscoverySweep
+from .models import Agent, Job, Result, DiscoverySweep, Schedule
 from .schemas import AgentCreate, AgentResponse, JobResponse, ResultCreate, ResultResponse, JobCreate
 from dotenv import load_dotenv
 from .logger import get_logger
@@ -25,6 +25,8 @@ logger = get_logger("vapt.server", "server.log")
 
 JOB_TIMEOUT_SECONDS = 120
 STALE_AGENT_HOURS = int(os.environ.get("STALE_AGENT_HOURS", "24"))
+
+SCHEDULE_TICK_SECONDS = 60   # how often the scheduler wakes up to check
 
 Base.metadata.create_all(bind=engine)
 
@@ -68,11 +70,56 @@ def run_stale_cleanup():
         _time.sleep(3600)  # re-check every hour
 
 
+def run_scheduler():
+    """Background thread: checks every SCHEDULE_TICK_SECONDS for schedules that are due."""
+    import time as _time
+    while True:
+        db = SessionLocal()
+        try:
+            now = datetime.utcnow()
+            due = db.query(Schedule).filter(
+                Schedule.paused == False,
+                (Schedule.next_run_at == None) | (Schedule.next_run_at <= now)
+            ).all()
+
+            for schedule in due:
+                new_job = Job(
+                    type=schedule.type,
+                    target=schedule.target,
+                    status="pending",
+                    mode=schedule.mode,
+                    profile=schedule.profile,
+                    priority=schedule.priority,
+                    ports=schedule.ports,
+                )
+                db.add(new_job)
+                schedule.last_run_at = now
+                schedule.next_run_at = now + timedelta(hours=schedule.interval_hours)
+                logger.info(
+                    f"Schedule '{schedule.name}' fired — created {schedule.type} job "
+                    f"for {schedule.target}, next run in {schedule.interval_hours}h"
+                )
+
+            if due:
+                db.commit()
+
+        except Exception as e:
+            logger.error(f"Scheduler error: {e}")
+        finally:
+            db.close()
+
+        _time.sleep(SCHEDULE_TICK_SECONDS)
+
+
 @app.on_event("startup")
 def startup_cleanup():
     thread = threading.Thread(target=run_stale_cleanup, daemon=True)
     thread.start()
     logger.info("Stale agent cleanup thread started")
+
+    sched_thread = threading.Thread(target=run_scheduler, daemon=True)
+    sched_thread.start()
+    logger.info("Job scheduler thread started")
 
 DASHBOARD_USERNAME = os.environ.get("DASHBOARD_USERNAME", "admin")
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "vapt-admin")
@@ -493,7 +540,12 @@ def get_next_job(
     if not eligible_jobs:
         return None
 
-    eligible_jobs.sort(key=lambda j: j.agent_id is None)
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    eligible_jobs.sort(key=lambda j: (
+        priority_order.get(j.priority, 1),  # high first
+        j.agent_id is None,                 # agent-specific before any-agent
+        j.id                                # oldest first as tiebreaker
+    ))
 
     current_load = get_agent_load(db, agent.id)
     if current_load >= 2:
@@ -603,6 +655,116 @@ def clear_job(job_id: int, db: Session = Depends(get_db)):
     job.cleared = True
     db.commit()
     return {"ok": True, "action": "archived"}
+
+
+# --- SCHEDULES ---
+
+@app.get("/schedules")
+def get_schedules(
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    schedules = db.query(Schedule).order_by(Schedule.id).all()
+    return [
+        {
+            "id": s.id,
+            "name": s.name,
+            "type": s.type,
+            "target": s.target,
+            "mode": s.mode,
+            "profile": s.profile,
+            "priority": s.priority,
+            "ports": s.ports,
+            "interval_hours": s.interval_hours,
+            "paused": s.paused,
+            "last_run_at": s.last_run_at.isoformat() if s.last_run_at else None,
+            "next_run_at": s.next_run_at.isoformat() if s.next_run_at else None,
+        }
+        for s in schedules
+    ]
+
+
+@app.post("/schedules")
+def create_schedule(
+    data: dict,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    name = data.get("name", "").strip()
+    scan_type = data.get("type", "").strip()
+    target = data.get("target", "").strip()
+    interval_hours = data.get("interval_hours")
+
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if scan_type not in VALID_JOB_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid type. Valid: {sorted(VALID_JOB_TYPES)}")
+    if not target:
+        raise HTTPException(status_code=400, detail="target is required")
+    if not interval_hours or int(interval_hours) < 1:
+        raise HTTPException(status_code=400, detail="interval_hours must be >= 1")
+
+    now = datetime.utcnow()
+    schedule = Schedule(
+        name=name,
+        type=scan_type,
+        target=target,
+        mode=data.get("mode", "remote"),
+        profile=data.get("profile", "standard"),
+        priority=data.get("priority", "medium"),
+        ports=data.get("ports") or None,
+        interval_hours=int(interval_hours),
+        next_run_at=now,   # fire immediately on first tick
+    )
+    db.add(schedule)
+    db.commit()
+    db.refresh(schedule)
+    logger.info(f"Schedule '{name}' created — {scan_type} on {target} every {interval_hours}h")
+    return {"id": schedule.id, "name": schedule.name}
+
+
+@app.post("/schedules/{schedule_id}/pause")
+def pause_schedule(
+    schedule_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    s = db.query(Schedule).filter(Schedule.id == schedule_id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    s.paused = True
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/schedules/{schedule_id}/resume")
+def resume_schedule(
+    schedule_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    s = db.query(Schedule).filter(Schedule.id == schedule_id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    s.paused = False
+    # Reset next_run_at so it fires on the next scheduler tick rather than immediately
+    s.next_run_at = datetime.utcnow() + timedelta(hours=s.interval_hours)
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/schedules/{schedule_id}")
+def delete_schedule(
+    schedule_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    s = db.query(Schedule).filter(Schedule.id == schedule_id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    db.delete(s)
+    db.commit()
+    return {"ok": True}
 
 
 # --- DISCOVERY ---
@@ -1174,6 +1336,69 @@ def dashboard():
                 </div>
 
                 <div id="sweepHistory"></div>
+            </div>
+
+            <!-- Schedules -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-semibold text-green-400">Schedules</h2>
+                </div>
+
+                <!-- Create schedule form -->
+                <div class="flex flex-wrap gap-3 items-end mb-5">
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Name</label>
+                        <input id="sched_name" placeholder="Daily firewall scan"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-48">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Target IP</label>
+                        <input id="sched_target" placeholder="192.168.1.1"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-36">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Scan Type</label>
+                        <select id="sched_type" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="nmap_scan">Nmap Scan</option>
+                            <option value="nikto_scan">Nikto Scan</option>
+                            <option value="nse_scan">NSE Scan</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Profile</label>
+                        <select id="sched_profile" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="standard">Standard</option>
+                            <option value="light">Light</option>
+                            <option value="full">Full</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Mode</label>
+                        <select id="sched_mode" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="remote">Remote</option>
+                            <option value="agent">Agent</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Priority</label>
+                        <select id="sched_priority" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="medium">Medium</option>
+                            <option value="high">High</option>
+                            <option value="low">Low</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Every (hours)</label>
+                        <input id="sched_interval" type="number" min="1" placeholder="24"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-24">
+                    </div>
+                    <button onclick="createSchedule()"
+                        class="bg-green-600 hover:bg-green-500 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">
+                        + Schedule
+                    </button>
+                </div>
+
+                <div id="schedules" class="overflow-x-auto"></div>
             </div>
 
             <!-- Create Job -->
@@ -2129,6 +2354,118 @@ def dashboard():
             document.getElementById("results").innerHTML = html;
         }
 
+        // --- SCHEDULES ---
+
+        async function loadSchedules() {
+            const res = await apiFetch('/schedules');
+            if (!res) return;
+            const data = await res.json();
+
+            if (!data.length) {
+                document.getElementById("schedules").innerHTML =
+                    '<p class="text-gray-500 text-sm">No schedules yet.</p>';
+                return;
+            }
+
+            let html = `<table class="w-full text-sm">
+                <thead><tr class="text-left text-gray-400 border-b border-gray-800">
+                    <th class="pb-2 pr-3">Name</th>
+                    <th class="pb-2 pr-3">Type</th>
+                    <th class="pb-2 pr-3">Target</th>
+                    <th class="pb-2 pr-3">Profile</th>
+                    <th class="pb-2 pr-3">Every</th>
+                    <th class="pb-2 pr-3">Status</th>
+                    <th class="pb-2 pr-3">Last Run</th>
+                    <th class="pb-2 pr-3">Next Run</th>
+                    <th class="pb-2">Actions</th>
+                </tr></thead><tbody>`;
+
+            data.forEach(s => {
+                const statusBadge = s.paused
+                    ? '<span class="text-xs px-2 py-0.5 rounded-full bg-yellow-900 text-yellow-300 border border-yellow-700">paused</span>'
+                    : '<span class="text-xs px-2 py-0.5 rounded-full bg-green-900 text-green-300 border border-green-700">active</span>';
+
+                const toggleBtn = s.paused
+                    ? `<button onclick="resumeSchedule(${s.id})" class="text-xs text-blue-400 hover:text-blue-300 transition">Resume</button>`
+                    : `<button onclick="pauseSchedule(${s.id})" class="text-xs text-yellow-400 hover:text-yellow-300 transition">Pause</button>`;
+
+                html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition">
+                    <td class="py-2 pr-3 font-medium text-sm">${s.name}</td>
+                    <td class="py-2 pr-3 font-mono text-xs text-blue-300">${s.type}</td>
+                    <td class="py-2 pr-3 font-mono text-xs">${s.target}</td>
+                    <td class="py-2 pr-3 text-xs text-gray-300">${s.profile}</td>
+                    <td class="py-2 pr-3 text-xs text-gray-300">${s.interval_hours}h</td>
+                    <td class="py-2 pr-3">${statusBadge}</td>
+                    <td class="py-2 pr-3 text-xs text-gray-400">${formatTimestamp(s.last_run_at)}</td>
+                    <td class="py-2 pr-3 text-xs text-gray-400">${s.paused ? '—' : formatTimestamp(s.next_run_at)}</td>
+                    <td class="py-2 flex gap-3">
+                        ${toggleBtn}
+                        <button onclick="deleteSchedule(${s.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button>
+                    </td>
+                </tr>`;
+            });
+
+            html += '</tbody></table>';
+            document.getElementById("schedules").innerHTML = html;
+        }
+
+        async function createSchedule() {
+            const name     = document.getElementById("sched_name").value.trim();
+            const target   = document.getElementById("sched_target").value.trim();
+            const type     = document.getElementById("sched_type").value;
+            const profile  = document.getElementById("sched_profile").value;
+            const mode     = document.getElementById("sched_mode").value;
+            const priority = document.getElementById("sched_priority").value;
+            const interval = document.getElementById("sched_interval").value.trim();
+
+            if (!name || !target || !interval) {
+                alert("Name, target, and interval are required.");
+                return;
+            }
+            if (parseInt(interval) < 1) {
+                alert("Interval must be at least 1 hour.");
+                return;
+            }
+
+            const res = await apiFetch('/schedules', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, target, type, profile, mode, priority, interval_hours: parseInt(interval) })
+            });
+            if (!res) return;
+
+            if (res.status === 400) {
+                const err = await res.json();
+                alert(`Failed: ${err.detail}`);
+                return;
+            }
+
+            document.getElementById("sched_name").value = "";
+            document.getElementById("sched_target").value = "";
+            document.getElementById("sched_interval").value = "";
+            loadSchedules();
+        }
+
+        async function pauseSchedule(id) {
+            await apiFetch(`/schedules/${id}/pause`, { method: 'POST' });
+            loadSchedules();
+        }
+
+        async function resumeSchedule(id) {
+            await apiFetch(`/schedules/${id}/resume`, { method: 'POST' });
+            loadSchedules();
+        }
+
+        async function deleteSchedule(id) {
+            showConfirm(
+                'Delete this schedule? Any jobs already created will not be affected.',
+                async () => {
+                    await apiFetch(`/schedules/${id}`, { method: 'DELETE' });
+                    loadSchedules();
+                }
+            );
+        }
+
         // --- DISCOVERY ---
 
         let activeSweepId = null;
@@ -2220,6 +2557,7 @@ def dashboard():
         loadAll = async function() {
             await _origLoadAll();
             loadSweepHistory();
+            loadSchedules();
         };
         </script>
     </body>

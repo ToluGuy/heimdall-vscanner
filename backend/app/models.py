@@ -20,7 +20,7 @@ class Agent(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_seen = Column(DateTime, default=datetime.utcnow)
     capabilities = Column(String, default="nmap_scan")
-    is_stale = Column(Boolean, default=False)
+    is_stale = Column(Boolean, default=False)   # flagged by cleanup, hidden from dashboard
 
 
 class Job(Base):
@@ -42,7 +42,7 @@ class Job(Base):
     mode = Column(String, default="remote")
     profile = Column(String, default="standard")
     port = Column(Integer, nullable=True)       # single port — used by nikto_scan
-    ports = Column(String, nullable=True)       # comma-separated — used by nse_scan
+    ports = Column(String, nullable=True)       # comma-separated — used by nse_scan and multi-port nikto
     cleared = Column(Boolean, default=False)
 
 
@@ -67,3 +67,21 @@ class DiscoverySweep(Base):
     result = Column(Text, nullable=True)              # JSON list of discovered hosts
     started_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
+
+
+class Schedule(Base):
+    __tablename__ = "schedules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)               # human label e.g. "Daily firewall scan"
+    type = Column(String, nullable=False)               # nmap_scan, nikto_scan, nse_scan
+    target = Column(String, nullable=False)             # IP or hostname
+    mode = Column(String, default="remote")
+    profile = Column(String, default="standard")
+    priority = Column(String, default="medium")
+    ports = Column(String, nullable=True)               # for nse_scan
+    interval_hours = Column(Integer, nullable=False)    # how often to fire
+    paused = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_run_at = Column(DateTime, nullable=True)       # when the last job was created
+    next_run_at = Column(DateTime, nullable=True)       # when the next job should fire
