@@ -364,6 +364,7 @@ def get_jobs(
             "agent": agent_name or "any",
             "mode": j.mode,
             "profile": j.profile,
+            "started_at": j.started_at.isoformat() if j.started_at else None,
             "completed_at": j.completed_at,
             "cleared": j.cleared
         })
@@ -835,7 +836,6 @@ def dashboard():
                         <label class="text-xs text-gray-400">Ports (optional, comma-separated)</label>
                         <input id="ports" placeholder="22,445,3389"
                             class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-52">
-                        <p class="text-xs text-gray-500 mt-0.5">Leave blank to use profile default range. Web ports auto-excluded.</p>
                     </div>
 
                     <div class="flex flex-col gap-1">
@@ -1314,6 +1314,26 @@ def dashboard():
             return `${d.toISOString().split('T')[0]} at ${d.toTimeString().split(' ')[0]}`;
         }
 
+        function elapsedDisplay(startedAt) {
+            if (!startedAt) return 'running…';
+            const secs = Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000);
+            if (secs < 60) return `${secs}s elapsed`;
+            const mins = Math.floor(secs / 60);
+            return `${mins}m ${secs % 60}s elapsed`;
+        }
+
+        // Tick elapsed counters every second without reloading the whole table
+        setInterval(() => {
+            document.querySelectorAll('[id^="job-time-"]').forEach(cell => {
+                const startedAt = cell.dataset.startedAt;
+                if (!startedAt) return;
+                const badge = cell.closest('tr')?.querySelector('span');
+                if (badge && badge.textContent.trim() === 'running') {
+                    cell.textContent = elapsedDisplay(startedAt);
+                }
+            });
+        }, 1000);
+
         // --- AGENTS ---
 
         async function loadAgents() {
@@ -1389,7 +1409,7 @@ def dashboard():
                     <td class="py-2 pr-3 text-xs text-gray-300">${j.mode}</td>
                     <td class="py-2 pr-3 text-xs text-gray-300">${j.profile}</td>
                     <td class="py-2 pr-3 text-xs text-gray-300">${j.agent}</td>
-                    <td class="py-2 pr-3 text-xs text-gray-400">${formatTimestamp(j.completed_at)}</td>
+                    <td class="py-2 pr-3 text-xs text-gray-400 tabular-nums" id="job-time-${j.id}" data-started-at="${j.started_at || ''}">\n                        ${j.status === 'running' ? elapsedDisplay(j.started_at) : formatTimestamp(j.completed_at)}\n                    </td>
                     <td class="py-2">${action}</td>
                 </tr>`;
             });
