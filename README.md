@@ -14,6 +14,14 @@ Heimdall follows a server-agent model:
 
 ---
 
+## Legal
+
+Heimdall V-Scanner is licensed under the [MIT License](LICENSE).
+
+This tool is for use on networks and systems you own or have **explicit written authorisation** to test. Unauthorised scanning is illegal in most jurisdictions. By using this software you agree to the terms in [DISCLAIMER.md](DISCLAIMER.md).
+
+---
+
 ## Scan Tools
 
 - **Nmap** — Port discovery and service detection across all scan modes and agents
