@@ -1,39 +1,52 @@
-# VAPT Scanner Project
+# Heimdall V-Scanner
 
-A distributed vulnerability assessment and penetration testing (VAPT) scanner built for internal office network use. The system coordinates scan jobs across multiple agents and a central server, providing a unified dashboard for visibility into network vulnerabilities.
+A distributed vulnerability assessment and penetration testing scanner built for internal office network use. Heimdall coordinates scan jobs across a central server and multiple remote agents, providing a unified dashboard for visibility into network vulnerabilities across the entire LAN.
 
 ## Architecture
 
-The project follows a server-agent model:
+Heimdall follows a server-agent model:
 
-- **Backend server** — A FastAPI application that manages job queuing, agent registration, and scan results. Backed by PostgreSQL.
-- **Agent** (`agent.py`) — Runs on individual workstations or servers. Polls the server for jobs and executes scans locally.
-- **Scanner** (`scanner.py`) — Runs on the central server. Handles agentless remote scans against targets that cannot run an agent directly, such as firewalls, switches, and printers.
-- **Dashboard** — A web interface served by the backend for creating jobs, monitoring agents, and reviewing scan results.
-
-## Scan Tools
-
-- **Nmap** — Port discovery and service detection across all scan modes
-- **Nikto** — Web vulnerability scanning, triggered automatically when Nmap finds open web ports
-- **OpenVAS** — Planned for future integration
-
-## Scan Profiles
-
-| Profile | Nmap | Nikto | Description |
-|---------|------|-------|-------------|
-| light | `-F` | `-Tuning 1` | Top 100 ports, fast |
-| standard | `-sV` | default | Top 1000 ports with service detection |
-| full | `-sV -O -p-` | `-Tuning x6` | All ports, deep service and OS detection |
+- **Backend server** — A FastAPI application that manages job queuing, agent registration, scheduling, and scan results. Backed by PostgreSQL.
+- **Remote scanner** (`scanner.py`) — Runs on the central server alongside the backend. Handles agentless remote scans against targets that cannot run an agent directly, such as firewalls, switches, and printers.
+- **Agent** (`agent/agent.py`) — Runs on any endpoint across the network. Polls the server for jobs and executes scans from that machine's network position.
+- **Local scanner** (`agent/local_scanner.py`) — A fully standalone scan tool for any endpoint. Runs its own local web UI, requires no central server, and keeps results in memory for the session.
+- **Dashboard** — A web interface served by the backend for creating jobs, monitoring agents, reviewing scan results, managing schedules, and generating reports.
 
 ---
 
-## Quick Install (Linux)
+## Scan Tools
 
-The installer handles everything — dependencies, database, environment config, and systemd services.
+- **Nmap** — Port discovery and service detection across all scan modes and agents
+- **Nikto** — Web vulnerability scanning, triggered automatically when Nmap finds open web ports
+- **NSE (Nmap Scripting Engine)** — Vulnerability and exploit script scanning against non-web services (SSH, SMB, RDP, databases, etc.)
+
+---
+
+## Scan Types
+
+| Type | Description |
+|------|-------------|
+| `nmap_scan` | Port scan with automatic Nikto follow-up on any open web ports found |
+| `nikto_scan` | Standalone web vulnerability scan against a specific port |
+| `nse_scan` | NSE script scan against non-web ports (web ports excluded — Nikto owns that surface) |
+
+## Scan Profiles
+
+| Profile | Nmap flags | Nikto flags | NSE scripts | Description |
+|---------|-----------|-------------|-------------|-------------|
+| light | `-F` | `-Tuning 1` | `safe` | Top 100 ports, fast, non-intrusive |
+| standard | `-sV` | default | `vuln` | Top 1000 ports with service detection |
+| full | `-sV -O -p-` | `-Tuning x6` | `vuln,exploit` ⚠️ | All ports, deep scan — exploit scripts are intrusive |
+
+---
+
+## Quick Install (Linux Server)
+
+The installer handles everything: dependencies, database, environment config, and systemd services.
 
 ```bash
-git clone https://github.com/ToluGuy/VAPT-Scanner-Project.git
-cd VAPT-Scanner-Project
+git clone https://github.com/ToluGuy/heimdall-vscanner.git
+cd heimdall-vscanner
 chmod +x install.sh
 ./install.sh
 ```
@@ -44,7 +57,7 @@ The installer will:
 - Install system packages (nmap, nikto, postgresql, python3-venv)
 - Create a Python virtual environment and install dependencies
 - Prompt for dashboard credentials and database settings, then write `.env`
-- Set up the PostgreSQL database, user, and permissions
+- Set up the PostgreSQL database, user, and all required permissions
 - Run all schema migrations automatically
 - Install and optionally start the `vapt-server` and `vapt-scanner` systemd services
 - Open port 8000 in UFW if active
@@ -53,13 +66,13 @@ The installer will:
 
 ## Manual Setup
 
-If you prefer to set things up yourself rather than using the installer:
+If you prefer not to use the installer:
 
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/ToluGuy/VAPT-Scanner-Project.git
-cd VAPT-Scanner-Project
+git clone https://github.com/ToluGuy/heimdall-vscanner.git
+cd heimdall-vscanner
 ```
 
 ### 2. Install system dependencies
@@ -120,7 +133,7 @@ Base.metadata.create_all(bind=engine)
 "
 ```
 
-If upgrading from an earlier version, also run:
+If upgrading from an earlier version, also run these SQL statements against the database:
 
 ```sql
 ALTER TABLE results ADD COLUMN IF NOT EXISTS cleared BOOLEAN DEFAULT FALSE;
@@ -132,6 +145,26 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS next_run_at TIMESTAMP;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS port INTEGER;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ports VARCHAR;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS is_stale BOOLEAN DEFAULT FALSE;
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR NOT NULL,
+    type VARCHAR NOT NULL,
+    target VARCHAR NOT NULL,
+    mode VARCHAR DEFAULT 'remote',
+    profile VARCHAR DEFAULT 'standard',
+    priority VARCHAR DEFAULT 'medium',
+    ports VARCHAR,
+    interval_hours INTEGER NOT NULL,
+    paused BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    last_run_at TIMESTAMP,
+    next_run_at TIMESTAMP
+);
+
+GRANT ALL ON TABLE schedules TO vapt_user;
+GRANT USAGE, SELECT ON SEQUENCE schedules_id_seq TO vapt_user;
 ```
 
 The `discovery_sweeps` table is created automatically by SQLAlchemy on startup.
@@ -142,7 +175,7 @@ The `discovery_sweeps` table is created automatically by SQLAlchemy on startup.
 uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
 ```
 
-The dashboard is available at `http://localhost:8000/dashboard`
+The dashboard is available at `http://localhost:8000/dashboard`.
 
 ---
 
@@ -150,7 +183,7 @@ The dashboard is available at `http://localhost:8000/dashboard`
 
 ### Recommended setup
 
-The recommended deployment is a dedicated Linux VM — either on ESXi, Proxmox, VirtualBox, or any hypervisor you have available. The server and remote scanner both run on this VM. Agents run separately on individual workstations across the network.
+The recommended deployment is a dedicated Linux VM on whatever hypervisor you have available (ESXi, Proxmox, VirtualBox, etc.). The backend server and remote scanner both run on this VM. Agents run separately on individual endpoints across the network.
 
 **Minimum VM spec:**
 - 2 vCPU, 2 GB RAM, 20 GB disk
@@ -180,14 +213,7 @@ network:
 sudo netplan apply
 ```
 
-5. SSH in and run the installer:
-
-```bash
-git clone https://github.com/ToluGuy/VAPT-Scanner-Project.git
-cd VAPT-Scanner-Project
-chmod +x install.sh
-./install.sh
-```
+5. SSH in and run the installer.
 
 ### Systemd services
 
@@ -205,7 +231,7 @@ sudo systemctl restart vapt-server
 # Enable on boot
 sudo systemctl enable vapt-server vapt-scanner
 
-# Logs (live)
+# Live logs
 journalctl -u vapt-server -f
 journalctl -u vapt-scanner -f
 ```
@@ -221,83 +247,19 @@ sudo systemctl start vapt-server vapt-scanner
 
 ### Network requirements
 
-For agents on workstations to reach the server, port 8000 must be reachable from the LAN:
+Port 8000 on the server must be reachable from the LAN for agents and browsers:
 
 ```bash
 sudo ufw allow 8000/tcp
 ```
 
-The server itself needs outbound access to reach scan targets (standard LAN access is sufficient). Agents only need outbound access to the server on port 8000 — they do not need to be reachable inbound.
-
 | Direction | From | To | Port | Purpose |
 |-----------|------|----|------|---------|
-| Outbound | Server/Scanner | Scan targets | any | Nmap, Nikto |
+| Outbound | Server/Scanner | Scan targets | any | Nmap, Nikto, NSE |
 | Outbound | Agents | Server | 8000 | Job polling, heartbeat, results |
-| Inbound | Agents | Server | 8000 | Must be open on server firewall |
 | Inbound | Browser | Server | 8000 | Dashboard access |
 
----
-
-## Running Agents
-
-### Linux workstation
-
-Copy `agent.py` and `requirements.txt` to the workstation, then:
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install requests python-dotenv
-
-VAPT_AGENT_NAME=office-pc-1 \
-VAPT_SERVER_URL=http://<server-ip>:8000 \
-VAPT_CAPABILITIES=nmap_scan,nikto_scan \
-python3 agent.py
-```
-
-To run as a background service on a Linux workstation, create `/etc/systemd/system/vapt-agent.service`:
-
-```ini
-[Unit]
-Description=VAPT Agent
-After=network.target
-
-[Service]
-Type=simple
-User=YOUR_USERNAME
-WorkingDirectory=/home/YOUR_USERNAME/vapt-scanner-project
-Environment=VAPT_AGENT_NAME=office-pc-1
-Environment=VAPT_SERVER_URL=http://192.168.1.200:8000
-Environment=VAPT_CAPABILITIES=nmap_scan,nikto_scan
-ExecStart=/home/YOUR_USERNAME/vapt-scanner-project/venv/bin/python agent.py
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable vapt-agent
-sudo systemctl start vapt-agent
-```
-
-### Windows workstation
-
-Install Python 3.10+ from python.org, then in PowerShell:
-
-```powershell
-pip install requests python-dotenv
-$env:VAPT_AGENT_NAME="office-pc-1"
-$env:VAPT_SERVER_URL="http://192.168.1.200:8000"
-$env:VAPT_CAPABILITIES="nmap_scan,nikto_scan"
-python agent.py
-```
-
-Note: Nmap must also be installed on Windows workstations for `nmap_scan` jobs. Download from nmap.org. Nikto on Windows requires Perl — if Nikto is not available, set `VAPT_CAPABILITIES=nmap_scan` to run Nmap-only scans.
-
-Agents register automatically on first run and save their API key to a local file (`{agent-name}_key.txt`). If this file is deleted, the agent re-registers as a new entry.
+Agents only need outbound access to port 8000 on the server. They do not need to be reachable inbound.
 
 ---
 
@@ -307,33 +269,94 @@ Access the dashboard at `/dashboard`. You will be prompted for credentials on fi
 
 From the dashboard you can:
 
-- Create scan jobs targeting any IP on the network
-- Monitor agent status in real time (auto-refreshes every 5 seconds)
-- Filter jobs by status (pending, running, done, failed)
-- Toggle job history to see archived jobs
-- View and expand scan results from Nmap and Nikto
-- Clear results (soft-archives the result and its job)
-- Permanently delete results from the History tab (also removes the associated job)
-- Bulk select and delete multiple archived results
+- **Network Discovery** — Sweep a subnet in CIDR notation to find live hosts and automatically create scan jobs for each one
+- **Schedules** — Set up recurring scans on a configurable interval (hourly, daily, or any number of hours); pause, resume, or delete schedules at any time
+- **Create Jobs** — Submit scan jobs manually for any IP on the network, with control over scan type, profile, mode, and priority
+- **Agents** — Monitor all registered agents, their online/offline status, and last heartbeat; show or hide stale agents; restore or permanently dismiss them
+- **Jobs** — View the job queue with live elapsed timers on running jobs; filter by status; delete pending and failed jobs in bulk
+- **Scan Results** — Expand results to view Nmap port tables, NSE findings, and Nikto web findings; toggle between active results and history
+- **Reports** — Generate a printable HTML report for any scan result, exportable as PDF via the browser print dialog
+- **Export** — Download scan results as structured JSON, individually or in bulk
+
+---
+
+## Agents
+
+For full agent setup instructions on both Linux and Windows endpoints, see [`agent/SETUP.md`](agent/SETUP.md).
+
+### Quick start — Linux
+
+```bash
+cd agent/
+pip install requests python-dotenv
+
+VAPT_AGENT_NAME=office-pc-1 \
+VAPT_SERVER_URL=http://192.168.1.200:8000 \
+VAPT_CAPABILITIES=nmap_scan,nikto_scan,nse_scan \
+python3 agent.py
+```
+
+### Quick start — Windows
+
+Run `agent/setup_agent.ps1` as Administrator in PowerShell. It handles Python, Nmap, dependencies, configuration, and desktop shortcuts automatically.
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\agent\setup_agent.ps1
+```
+
+### Local scanner (any endpoint, no server required)
+
+```bash
+python3 agent/local_scanner.py
+```
+
+Opens a browser-based scan UI at `http://127.0.0.1:9731`. Supports Nmap and NSE scans. Results live in memory for the session and can be exported as JSON before closing.
+
+---
+
+## Scheduling
+
+Schedules are created from the dashboard and stored in the database. Each schedule defines a scan type, target, profile, mode, priority, and repeat interval in hours. The scheduler runs a background thread that checks every 60 seconds for due schedules and creates the corresponding jobs automatically.
+
+Schedules fire immediately on creation (first tick after save), then repeat at the configured interval. Resuming a paused schedule waits one full interval before firing again.
+
+---
+
+## Stale Agent Cleanup
+
+Agents that have not sent a heartbeat within the configurable threshold (default 24 hours) are automatically flagged as stale by a background cleanup thread that runs hourly. Stale agents are hidden from the default agents view but can be shown via the "Show Stale" toggle. From there they can be restored (clears the stale flag) or permanently dismissed.
+
+The threshold can be adjusted by setting `STALE_AGENT_HOURS` in the `.env` file.
+
+---
+
+## Priority Queue
+
+Jobs support three priority levels: `high`, `medium`, and `low`. The dispatcher always picks the highest-priority eligible job first. Within the same priority level, agent-specific jobs are preferred over any-agent jobs, and older jobs are picked before newer ones.
 
 ---
 
 ## Project Structure
 
 ```
-VAPT-Scanner-Project/
-├── agent.py                  # Workstation/server agent
-├── scanner.py                # Agentless remote scanner
-├── install.sh                # Automated installer
-├── vapt-server.service       # Systemd service — server
-├── vapt-scanner.service      # Systemd service — scanner
+heimdall-vscanner/
+├── agent/
+│   ├── agent.py              # Endpoint agent — polls server, runs scans locally
+│   ├── local_scanner.py      # Standalone scan tool with browser UI (no server needed)
+│   ├── setup_agent.ps1       # Windows endpoint setup script
+│   └── SETUP.md              # Agent and local scanner setup guide
 ├── backend/
 │   └── app/
-│       ├── main.py           # FastAPI server, endpoints, dashboard
-│       ├── models.py         # Database models
-│       ├── schemas.py        # Request/response schemas
-│       ├── db.py             # Database connection
+│       ├── main.py           # FastAPI server, all endpoints, dashboard HTML
+│       ├── models.py         # SQLAlchemy database models
+│       ├── schemas.py        # Pydantic request/response schemas
+│       ├── db.py             # Database connection and session
 │       └── logger.py         # Logging configuration
+├── scanner.py                # Agentless remote scanner (runs on central server)
+├── install.sh                # Automated Linux installer
+├── vapt-server.service       # Systemd service file — backend server
+├── vapt-scanner.service      # Systemd service file — remote scanner
 ├── requirements.txt
 ├── .env                      # Not committed — created by installer or manually
 └── logs/                     # Not committed — created at runtime
@@ -343,41 +366,55 @@ VAPT-Scanner-Project/
 
 ## Environment Variables
 
+### Server
+
 | Variable | Description | Default |
 |----------|-------------|---------|
-| VAPT_SERVER_URL | URL of the backend server | http://127.0.0.1:8000 |
-| VAPT_AGENT_NAME | Name for this agent instance | agent-default |
-| VAPT_CAPABILITIES | Comma-separated scan capabilities | nmap_scan,nikto_scan |
-| VAPT_KEY_FILE | Path to store the agent API key | {agent-name}_key.txt |
-| DASHBOARD_USERNAME | Dashboard login username | admin |
-| DASHBOARD_PASSWORD | Dashboard login password | vapt-admin |
-| DB_HOST | PostgreSQL host | localhost |
-| DB_PORT | PostgreSQL port | 5432 |
-| DB_NAME | Database name | vapt |
-| DB_USER | Database user | vapt_user |
-| DB_PASSWORD | Database password | — |
+| `DASHBOARD_USERNAME` | Dashboard login username | `admin` |
+| `DASHBOARD_PASSWORD` | Dashboard login password | `vapt-admin` |
+| `DB_HOST` | PostgreSQL host | `localhost` |
+| `DB_PORT` | PostgreSQL port | `5432` |
+| `DB_NAME` | Database name | `vapt` |
+| `DB_USER` | Database user | `vapt_user` |
+| `DB_PASSWORD` | Database password | — |
+| `STALE_AGENT_HOURS` | Hours before an agent is flagged stale | `24` |
+
+### Agent
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `VAPT_SERVER_URL` | URL of the backend server | `http://127.0.0.1:8000` |
+| `VAPT_AGENT_NAME` | Name for this agent instance | `agent-default` |
+| `VAPT_CAPABILITIES` | Comma-separated scan capabilities | `nmap_scan,nikto_scan,nse_scan` |
+| `VAPT_KEY_FILE` | Path to store the agent API key | `{agent-name}_key.txt` |
 
 ---
 
 ## Troubleshooting
 
 **Server won't start**
-```bash
-journalctl -u vapt-server -n 50
-```
-Most common cause is a bad `.env` file or PostgreSQL not running. Check with `sudo systemctl status postgresql`.
+Check the logs: `journalctl -u vapt-server -n 50`. The most common causes are a bad `.env` file or PostgreSQL not running (`sudo systemctl status postgresql`).
 
 **Agent shows offline in dashboard**
-The agent heartbeat timeout is 30 seconds. If the agent hasn't sent a heartbeat in that window it shows offline. Check the agent is running and can reach the server on port 8000.
+The heartbeat timeout is 30 seconds. If the agent hasn't sent a heartbeat within that window it shows offline. Confirm the agent is running and can reach the server on port 8000.
+
+**Schedules fail with a permission error**
+This means the `schedules` table was created without the database user having write access. Run the following as the postgres superuser:
+```sql
+GRANT ALL ON TABLE schedules TO vapt_user;
+GRANT USAGE, SELECT ON SEQUENCE schedules_id_seq TO vapt_user;
+```
 
 **Nikto hangs**
-This is caused by a CIRT.net update prompt in Nikto 2.6.x. The scanner passes `input="n\n"` to suppress it automatically. If scans still hang, check Nikto is installed correctly with `nikto -Version`.
+Caused by a CIRT.net update prompt in Nikto 2.6.x. The scanner suppresses it automatically with `input="n\n"`. If scans still hang, check Nikto is installed correctly with `nikto -Version`.
+
+**NSE scan returns no findings**
+This is normal if the target has no non-web services running on discoverable ports. NSE deliberately skips web ports (80, 443, 8080, 8443, 8000, 8888) — use a Nikto scan for web surface testing.
 
 **Port 8000 unreachable from agents**
-Check the firewall on the server: `sudo ufw status`. If active, run `sudo ufw allow 8000/tcp`.
+Check the server firewall: `sudo ufw status`. If active, run `sudo ufw allow 8000/tcp`.
 
 **PostgreSQL permission errors on startup**
-Run the following as the postgres user:
 ```sql
 GRANT ALL ON SCHEMA public TO vapt_user;
 ALTER DATABASE vapt OWNER TO vapt_user;
