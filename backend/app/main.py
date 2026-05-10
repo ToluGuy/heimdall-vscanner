@@ -258,24 +258,32 @@ def clear_result(
     return {"ok": True}
 
 
-@app.delete("/results/{result_id}")
-def delete_result(
-    result_id: int,
+@app.delete("/results/clear-all-history")
+def clear_all_history(
     db: Session = Depends(get_db),
-    username: str = Depends(require_auth)
+    username: str = Depends(require_auth),
 ):
-    result = db.query(Result).filter(Result.id == result_id).first()
-    if not result:
-        raise HTTPException(status_code=404, detail="Result not found")
+    """
+    Permanently delete all cleared (archived) results and their associated jobs.
+    Useful for clearing accumulated history in bulk.
+    """
+    cleared_results = db.query(Result).filter(Result.cleared == True).all()
+    job_ids = [r.job_id for r in cleared_results]
 
-    job = db.query(Job).filter(Job.id == result.job_id).first()
+    deleted_results = len(cleared_results)
+    for r in cleared_results:
+        db.delete(r)
 
-    db.delete(result)
-    if job:
-        db.delete(job)
+    deleted_jobs = 0
+    if job_ids:
+        jobs = db.query(Job).filter(Job.id.in_(job_ids)).all()
+        for j in jobs:
+            db.delete(j)
+            deleted_jobs += 1
 
     db.commit()
-    return {"ok": True}
+    logger.info(f"Bulk history clear: {deleted_results} results and {deleted_jobs} jobs deleted")
+    return {"ok": True, "deleted_results": deleted_results, "deleted_jobs": deleted_jobs}
 
 
 @app.delete("/results/bulk")
@@ -301,6 +309,26 @@ def delete_results_bulk(
 
     db.commit()
     return {"ok": True, "deleted": len(results)}
+
+
+@app.delete("/results/{result_id}")
+def delete_result(
+    result_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth)
+):
+    result = db.query(Result).filter(Result.id == result_id).first()
+    if not result:
+        raise HTTPException(status_code=404, detail="Result not found")
+
+    job = db.query(Job).filter(Job.id == result.job_id).first()
+
+    db.delete(result)
+    if job:
+        db.delete(job)
+
+    db.commit()
+    return {"ok": True}
 
 
 # --- EXPORT ---
@@ -446,6 +474,9 @@ def dismiss_agent(
         raise HTTPException(status_code=404, detail="Agent not found")
     if not agent.is_stale:
         raise HTTPException(status_code=400, detail="Agent is not stale — cannot dismiss active agents")
+
+    db.query(Job).filter(Job.agent_id == agent_id).update({"agent_id": None})
+
     db.delete(agent)
     db.commit()
     return {"ok": True}
@@ -1291,7 +1322,7 @@ def dashboard():
         <div class="bg-gray-900 border-b border-gray-800 px-6 py-4 flex items-center justify-between">
             <div class="flex items-center gap-3">
                 <div class="w-3 h-3 rounded-full bg-green-400 animate-pulse"></div>
-                <h1 class="text-xl font-bold text-green-400 tracking-wider">VAPT Control Dashboard</h1>
+                <h1 class="text-xl font-bold text-green-400 tracking-wider">Heimdall V-Scanner Control Dashboard</h1>
             </div>
             <button onclick="loadAll()" class="text-sm bg-gray-800 hover:bg-gray-700 px-4 py-2 rounded-lg transition">
                 ↻ Refresh
@@ -1554,6 +1585,10 @@ def dashboard():
                     <button onclick="deleteSelected()"
                         class="text-xs px-3 py-1.5 rounded-lg bg-red-900 hover:bg-red-800 text-red-200 border border-red-700 transition font-medium">
                         Delete Selected
+                    </button>
+                    <button onclick="clearAllHistory()"
+                        class="text-xs px-3 py-1.5 rounded-lg bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 transition font-medium">
+                                                ⚠ Clear All History
                     </button>
                     <button onclick="exportResults()"
                         class="text-xs px-3 py-1.5 rounded-lg bg-cyan-900 hover:bg-cyan-800 text-cyan-200 border border-cyan-700 transition font-medium">
@@ -2269,6 +2304,20 @@ def dashboard():
                 async () => {
                     await apiFetch(`/results/${result_id}`, { method: 'DELETE' });
                     loadResults(); loadJobs();
+                }
+            );
+        }
+        
+        async function clearAllHistory() {
+            showConfirm(
+                'Permanently delete ALL archived results and their jobs? This cannot be undone.',
+                async () => {
+                    const res = await apiFetch('/results/clear-all-history', { method: 'DELETE' });
+                    if (!res) return;
+                    const data = await res.json();
+                    alert(`Cleared ${data.deleted_results} result(s) and ${data.deleted_jobs} job(s).`);
+                    loadResults();
+                    loadJobs();
                 }
             );
         }
