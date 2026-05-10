@@ -263,26 +263,23 @@ def clear_all_history(
     db: Session = Depends(get_db),
     username: str = Depends(require_auth),
 ):
-    """
-    Permanently delete all cleared (archived) results and their associated jobs.
-    Useful for clearing accumulated history in bulk.
-    """
+    """Permanently delete all cleared (archived) results and their jobs."""
     cleared_results = db.query(Result).filter(Result.cleared == True).all()
     job_ids = [r.job_id for r in cleared_results]
-
+ 
     deleted_results = len(cleared_results)
     for r in cleared_results:
         db.delete(r)
-
+ 
     deleted_jobs = 0
     if job_ids:
         jobs = db.query(Job).filter(Job.id.in_(job_ids)).all()
         for j in jobs:
             db.delete(j)
             deleted_jobs += 1
-
+ 
     db.commit()
-    logger.info(f"Bulk history clear: {deleted_results} results and {deleted_jobs} jobs deleted")
+    logger.info(f"Bulk history clear: {deleted_results} results, {deleted_jobs} jobs deleted")
     return {"ok": True, "deleted_results": deleted_results, "deleted_jobs": deleted_jobs}
 
 
@@ -474,13 +471,12 @@ def dismiss_agent(
         raise HTTPException(status_code=404, detail="Agent not found")
     if not agent.is_stale:
         raise HTTPException(status_code=400, detail="Agent is not stale — cannot dismiss active agents")
-
+ 
     db.query(Job).filter(Job.agent_id == agent_id).update({"agent_id": None})
-
+ 
     db.delete(agent)
     db.commit()
     return {"ok": True}
-
 
 @app.post("/agents/{agent_id}/restore")
 def restore_agent(
@@ -941,6 +937,80 @@ def get_sweep_history(
     ]
 
 
+@app.post("/discover/ping")
+def ping_sweep(
+    data: dict,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth)
+):
+    """
+    Fast ping sweep — discovers live hosts in a subnet but does NOT create jobs.
+    Returns the list of responding hosts for the user to review before committing.
+    """
+    subnet = data.get("subnet", "").strip()
+    if not subnet:
+        raise HTTPException(status_code=400, detail="subnet is required")
+ 
+    try:
+        result = subprocess.run(
+            ["nmap", "-sn", "-oX", "-", subnet],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+ 
+        hosts = []
+        if result.returncode == 0:
+            try:
+                root = ET.fromstring(result.stdout)
+                for host in root.findall("host"):
+                    status = host.find("status")
+                    if status is not None and status.get("state") == "up":
+                        addr = host.find("address")
+                        hostname_el = host.find(".//hostname")
+                        if addr is not None:
+                            hosts.append({
+                                "ip": addr.get("addr"),
+                                "hostname": hostname_el.get("name") if hostname_el is not None else None,
+                            })
+            except ET.ParseError as e:
+                raise HTTPException(status_code=500, detail=f"XML parse error: {e}")
+ 
+        logger.info(f"Ping sweep on {subnet}: {len(hosts)} host(s) found")
+        return {"subnet": subnet, "hosts": hosts, "count": len(hosts)}
+ 
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Ping sweep timed out")
+ 
+ 
+@app.delete("/discover/{sweep_id}")
+def delete_sweep(
+    sweep_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    """Permanently delete a discovery sweep record."""
+    sweep = db.query(DiscoverySweep).filter(DiscoverySweep.id == sweep_id).first()
+    if not sweep:
+        raise HTTPException(status_code=404, detail="Sweep not found")
+    db.delete(sweep)
+    db.commit()
+    return {"ok": True}
+ 
+ 
+@app.delete("/discover")
+def delete_all_sweeps(
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    """Permanently delete all discovery sweep records."""
+    count = db.query(DiscoverySweep).count()
+    db.query(DiscoverySweep).delete()
+    db.commit()
+    logger.info(f"Deleted all {count} discovery sweep records")
+    return {"ok": True, "deleted": count}
+
+
 # --- REPORT ---
 
 @app.get("/report/{result_id}", response_class=HTMLResponse)
@@ -1243,23 +1313,50 @@ def dashboard():
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <title>VAPT Dashboard</title>
+        <title>Heimdall V-Scanner</title>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            .nav-tab { transition: all 0.15s ease; }
+            .nav-tab.active {
+                background: rgba(74, 222, 128, 0.1);
+                color: #4ade80;
+                border-color: #4ade80;
+            }
+            .tab-panel { display: none; }
+            .tab-panel.active { display: block; }
+        </style>
     </head>
     <body class="bg-gray-950 text-gray-100 min-h-screen">
+
+        <!-- ── DIALOGS ──────────────────────────────────────────────────── -->
 
         <!-- Confirm Dialog -->
         <div id="confirmDialog" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 hidden">
             <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-sm">
-                <h3 class="text-sm font-semibold text-white mb-2">Confirm Permanent Delete</h3>
+                <h3 class="text-sm font-semibold text-white mb-2">Confirm Action</h3>
                 <p id="confirmMsg" class="text-xs text-gray-400 mb-5">This action cannot be undone.</p>
                 <div class="flex gap-3 justify-end">
-                    <button onclick="cancelConfirm()"
-                        class="text-xs px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 transition">Cancel</button>
-                    <button id="confirmOkBtn"
-                        class="text-xs px-4 py-2 rounded-lg bg-red-700 hover:bg-red-600 text-white font-semibold transition">Delete</button>
+                    <button onclick="cancelConfirm()" class="text-xs px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 transition">Cancel</button>
+                    <button id="confirmOkBtn" class="text-xs px-4 py-2 rounded-lg bg-red-700 hover:bg-red-600 text-white font-semibold transition">Confirm</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Sweep Confirm Dialog (ping results → assign jobs?) -->
+        <div id="sweepConfirmDialog" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 hidden">
+            <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md">
+                <div class="flex items-center gap-3 mb-3">
+                    <span class="text-cyan-400 text-lg">⌖</span>
+                    <h3 class="text-sm font-semibold text-white">Assign Scan Jobs?</h3>
+                </div>
+                <p id="sweepConfirmMsg" class="text-xs text-gray-400 mb-2"></p>
+                <div id="sweepHostList" class="max-h-40 overflow-y-auto mb-4 space-y-1"></div>
+                <p class="text-xs text-gray-500 mb-5">Confirming will create an Nmap scan job for each host above.</p>
+                <div class="flex gap-3 justify-end">
+                    <button onclick="cancelSweepConfirm()" class="text-xs px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 transition">Cancel</button>
+                    <button onclick="confirmSweep()" class="text-xs px-4 py-2 rounded-lg bg-cyan-700 hover:bg-cyan-600 text-white font-semibold transition">Assign Jobs</button>
                 </div>
             </div>
         </div>
@@ -1271,21 +1368,11 @@ def dashboard():
                     <span class="text-red-400 text-xl">⚠</span>
                     <h3 class="text-sm font-semibold text-red-400">Intrusive Scan Warning</h3>
                 </div>
-                <p class="text-xs text-gray-300 mb-2">
-                    You are about to run an NSE scan with the <span class="text-red-300 font-mono font-semibold">full</span> profile.
-                </p>
-                <p class="text-xs text-gray-400 mb-4">
-                    This uses <span class="font-mono text-orange-300">--script vuln,exploit</span>, which includes
-                    <strong class="text-white">intrusive exploit scripts</strong> that can disrupt or crash services on the target.
-                    Only proceed if you have explicit authorisation to run exploit-level scans against this host.
-                </p>
+                <p class="text-xs text-gray-300 mb-2">You are about to run an NSE scan with the <span class="text-red-300 font-mono font-semibold">full</span> profile.</p>
+                <p class="text-xs text-gray-400 mb-4">This uses <span class="font-mono text-orange-300">--script vuln,exploit</span> — intrusive scripts that can disrupt or crash services. Only proceed with explicit authorisation.</p>
                 <div class="flex gap-3 justify-end">
-                    <button onclick="cancelExploitWarning()"
-                        class="text-xs px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 transition">Cancel</button>
-                    <button onclick="confirmExploitWarning()"
-                        class="text-xs px-4 py-2 rounded-lg bg-red-700 hover:bg-red-600 text-white font-semibold transition">
-                        I understand — proceed
-                    </button>
+                    <button onclick="cancelExploitWarning()" class="text-xs px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 transition">Cancel</button>
+                    <button onclick="confirmExploitWarning()" class="text-xs px-4 py-2 rounded-lg bg-red-700 hover:bg-red-600 text-white font-semibold transition">I understand — proceed</button>
                 </div>
             </div>
         </div>
@@ -1295,7 +1382,7 @@ def dashboard():
             <div class="bg-gray-900 border border-gray-700 rounded-xl p-8 w-full max-w-sm">
                 <div class="flex items-center gap-3 mb-6">
                     <div class="w-3 h-3 rounded-full bg-green-400"></div>
-                    <h2 class="text-lg font-bold text-green-400">VAPT Dashboard</h2>
+                    <h2 class="text-lg font-bold text-green-400">Heimdall V-Scanner</h2>
                 </div>
                 <p class="text-sm text-gray-400 mb-6">Sign in to continue</p>
                 <div class="space-y-4">
@@ -1310,30 +1397,173 @@ def dashboard():
                             class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
                     </div>
                     <p id="loginError" class="text-xs text-red-400 hidden">Invalid credentials. Please try again.</p>
-                    <button onclick="submitLogin()"
-                        class="w-full bg-green-600 hover:bg-green-500 text-white font-semibold py-2 rounded-lg transition text-sm">
-                        Sign In
-                    </button>
+                    <button onclick="submitLogin()" class="w-full bg-green-600 hover:bg-green-500 text-white font-semibold py-2 rounded-lg transition text-sm">Sign In</button>
                 </div>
             </div>
         </div>
 
-        <!-- Header -->
-        <div class="bg-gray-900 border-b border-gray-800 px-6 py-4 flex items-center justify-between">
+        <!-- ── HEADER ───────────────────────────────────────────────────── -->
+        <div class="bg-gray-900 border-b border-gray-800 px-6 py-3 flex items-center justify-between">
             <div class="flex items-center gap-3">
                 <div class="w-3 h-3 rounded-full bg-green-400 animate-pulse"></div>
-                <h1 class="text-xl font-bold text-green-400 tracking-wider">Heimdall V-Scanner Control Dashboard</h1>
+                <h1 class="text-lg font-bold text-green-400 tracking-wider">Heimdall V-Scanner</h1>
             </div>
-            <button onclick="loadAll()" class="text-sm bg-gray-800 hover:bg-gray-700 px-4 py-2 rounded-lg transition">
-                ↻ Refresh
-            </button>
+
+            <!-- Tab navigation -->
+            <nav class="flex items-center gap-1">
+                <button onclick="switchTab('dashboard')" id="nav-dashboard"
+                    class="nav-tab active text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
+                    Dashboard
+                </button>
+                <button onclick="switchTab('discovery')" id="nav-discovery"
+                    class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
+                    Discovery
+                </button>
+                <button onclick="switchTab('schedules')" id="nav-schedules"
+                    class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
+                    Schedules
+                </button>
+            </nav>
+
+            <button onclick="loadAll()" class="text-sm bg-gray-800 hover:bg-gray-700 px-4 py-2 rounded-lg transition">↻ Refresh</button>
         </div>
 
+        <!-- ── TAB: DASHBOARD ───────────────────────────────────────────── -->
+        <div id="tab-dashboard" class="tab-panel active">
         <div class="max-w-screen-xl mx-auto px-6 py-8 space-y-10">
 
-            <!-- Network Discovery -->
+            <!-- Create Job -->
             <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
-                <h2 class="text-lg font-semibold text-green-400 mb-4">Network Discovery</h2>
+                <h2 class="text-lg font-semibold text-green-400 mb-4">Create Job</h2>
+                <div class="flex flex-wrap gap-3 items-end">
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Target IP</label>
+                        <input id="target" placeholder="192.168.1.50"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-44">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Agent ID (optional)</label>
+                        <input id="agent_id" placeholder="Leave blank for any"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-44">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Scan Type</label>
+                        <select id="job_type" onchange="onJobTypeChange()"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="nmap_scan">Nmap Scan</option>
+                            <option value="nikto_scan">Nikto Scan</option>
+                            <option value="nse_scan">NSE Scan</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1" id="portField" style="display:none">
+                        <label class="text-xs text-gray-400">Port</label>
+                        <input id="port" placeholder="80"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-24">
+                    </div>
+                    <div class="flex flex-col gap-1" id="portsField" style="display:none">
+                        <label class="text-xs text-gray-400">Ports (optional, comma-separated)</label>
+                        <input id="ports" placeholder="22,445,3389"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-52">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Mode</label>
+                        <select id="mode" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="remote">Remote</option>
+                            <option value="agent">Agent</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Profile</label>
+                        <select id="profile" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="standard">Standard</option>
+                            <option value="light">Light</option>
+                            <option value="full">Full</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Priority</label>
+                        <select id="priority" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="medium">Medium</option>
+                            <option value="high">High</option>
+                            <option value="low">Low</option>
+                        </select>
+                    </div>
+                    <button onclick="createJob()" class="bg-green-600 hover:bg-green-500 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">+ Create</button>
+                </div>
+                <div id="nseExploitBanner" class="hidden mt-4 flex items-start gap-3 bg-red-950 border border-red-800 rounded-lg px-4 py-3">
+                    <span class="text-red-400 text-sm mt-0.5">⚠</span>
+                    <p class="text-xs text-red-300"><strong class="text-red-200">Full profile with NSE</strong> uses <span class="font-mono">--script vuln,exploit</span> — intrusive scripts that may disrupt services.</p>
+                </div>
+            </div>
+
+            <!-- Agents -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-semibold text-green-400">Agents</h2>
+                    <button onclick="toggleStaleAgents()" id="staleAgentsBtn"
+                        class="text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-yellow-500 transition">Show Stale</button>
+                </div>
+                <div id="agents" class="overflow-x-auto"></div>
+            </div>
+
+            <!-- Jobs -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <div class="flex items-center justify-between mb-3">
+                    <h2 class="text-lg font-semibold text-green-400">Jobs</h2>
+                    <div class="flex gap-2 flex-wrap justify-end">
+                        <button onclick="setJobFilter('all')" id="filter-all" class="filter-btn active-filter text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-green-500 transition">All</button>
+                        <button onclick="setJobFilter('pending')" id="filter-pending" class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-yellow-500 transition">Pending</button>
+                        <button onclick="setJobFilter('running')" id="filter-running" class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-blue-500 transition">Running</button>
+                        <button onclick="setJobFilter('done')" id="filter-done" class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-green-500 transition">Done</button>
+                        <button onclick="setJobFilter('failed')" id="filter-failed" class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-red-500 transition">Failed</button>
+                        <button onclick="toggleJobHistory()" id="jobHistoryBtn" class="text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-purple-500 transition">Show History</button>
+                    </div>
+                </div>
+                <div class="flex gap-2 mb-3">
+                    <button onclick="clearAllByStatus('pending')" class="text-xs px-3 py-1 rounded-lg bg-yellow-950 hover:bg-yellow-900 text-yellow-300 border border-yellow-800 transition">Delete all pending</button>
+                    <button onclick="clearAllByStatus('failed')" class="text-xs px-3 py-1 rounded-lg bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 transition">Delete all failed</button>
+                </div>
+                <div id="jobs" class="overflow-x-auto"></div>
+            </div>
+
+            <!-- Results -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-semibold text-green-400">Scan Results</h2>
+                    <div class="flex gap-1 bg-gray-800 rounded-lg p-1">
+                        <button onclick="setResultTab('active')" id="tab-active" class="result-tab text-xs px-4 py-1.5 rounded-md transition font-medium bg-gray-700 text-white">Active</button>
+                        <button onclick="setResultTab('history')" id="tab-history" class="result-tab text-xs px-4 py-1.5 rounded-md transition font-medium text-gray-400 hover:text-gray-200">History</button>
+                    </div>
+                </div>
+                <div id="activeToolbar" class="mb-4 flex items-center gap-3">
+                    <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
+                        <input type="checkbox" id="selectAllActiveCheckbox" onchange="toggleSelectAllActive()" class="accent-yellow-500"> Select all
+                    </label>
+                    <button onclick="clearSelected()" class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-600 transition font-medium">Clear Selected</button>
+                    <button onclick="exportResults()" class="text-xs px-3 py-1.5 rounded-lg bg-cyan-900 hover:bg-cyan-800 text-cyan-200 border border-cyan-700 transition font-medium">↓ Export JSON</button>
+                </div>
+                <div id="historyToolbar" class="hidden mb-4 flex items-center gap-3">
+                    <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
+                        <input type="checkbox" id="selectAllCheckbox" onchange="toggleSelectAll()" class="accent-red-500"> Select all
+                    </label>
+                    <button onclick="deleteSelected()" class="text-xs px-3 py-1.5 rounded-lg bg-red-900 hover:bg-red-800 text-red-200 border border-red-700 transition font-medium">Delete Selected</button>
+                    <button onclick="clearAllHistory()" class="text-xs px-3 py-1.5 rounded-lg bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 transition font-medium">⚠ Clear All History</button>
+                    <button onclick="exportResults()" class="text-xs px-3 py-1.5 rounded-lg bg-cyan-900 hover:bg-cyan-800 text-cyan-200 border border-cyan-700 transition font-medium">↓ Export JSON</button>
+                </div>
+                <div id="results" class="space-y-4"></div>
+            </div>
+
+        </div>
+        </div>
+
+        <!-- ── TAB: DISCOVERY ───────────────────────────────────────────── -->
+        <div id="tab-discovery" class="tab-panel">
+        <div class="max-w-screen-xl mx-auto px-6 py-8 space-y-8">
+
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <h2 class="text-lg font-semibold text-green-400 mb-1">Network Discovery</h2>
+                <p class="text-xs text-gray-500 mb-5">Ping scans find live hosts. Sweep scans find hosts and automatically assign Nmap jobs.</p>
+
                 <div class="flex flex-wrap gap-3 items-end mb-5">
                     <div class="flex flex-col gap-1">
                         <label class="text-xs text-gray-400">Subnet (CIDR)</label>
@@ -1355,27 +1585,54 @@ def dashboard():
                             <option value="full">Full</option>
                         </select>
                     </div>
-                    <button onclick="startDiscovery()"
-                        class="bg-cyan-700 hover:bg-cyan-600 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">
-                        ⌖ Sweep
-                    </button>
+                    <div class="flex gap-2">
+                        <button onclick="startPing()" id="pingBtn"
+                            class="bg-gray-700 hover:bg-gray-600 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">
+                            ⬡ Ping
+                        </button>
+                        <button onclick="startSweep()" id="sweepBtn"
+                            class="bg-cyan-700 hover:bg-cyan-600 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">
+                            ⌖ Sweep
+                        </button>
+                    </div>
                 </div>
 
+                <!-- Status bar — dismissible -->
                 <div id="sweepStatus" class="hidden mb-4 p-3 bg-gray-800 rounded-lg border border-gray-700 text-xs text-gray-300 flex items-center gap-3">
-                    <div id="sweepSpinner" class="w-3 h-3 rounded-full bg-cyan-400 animate-pulse"></div>
-                    <span id="sweepStatusText">Sweeping...</span>
+                    <div id="sweepSpinner" class="w-3 h-3 rounded-full bg-cyan-400 animate-pulse flex-shrink-0"></div>
+                    <span id="sweepStatusText" class="flex-1">Working...</span>
+                    <button onclick="dismissSweepStatus()" class="text-gray-500 hover:text-gray-300 transition text-base leading-none">✕</button>
                 </div>
 
+                <!-- Ping results panel -->
+                <div id="pingResults" class="hidden mb-4 p-4 bg-gray-800 rounded-lg border border-gray-700">
+                    <div class="flex items-center justify-between mb-3">
+                        <p class="text-xs font-semibold text-gray-300" id="pingResultsTitle">Ping Results</p>
+                        <button onclick="dismissPingResults()" class="text-gray-500 hover:text-gray-300 transition text-sm">✕</button>
+                    </div>
+                    <div id="pingResultsList" class="space-y-1 max-h-48 overflow-y-auto"></div>
+                </div>
+
+            </div>
+
+            <!-- Sweep History -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-semibold text-green-400">Sweep History</h2>
+                    <button onclick="clearAllSweeps()" class="text-xs px-3 py-1.5 rounded-lg bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 transition">Clear All</button>
+                </div>
                 <div id="sweepHistory"></div>
             </div>
 
-            <!-- Schedules -->
-            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
-                <div class="flex items-center justify-between mb-4">
-                    <h2 class="text-lg font-semibold text-green-400">Schedules</h2>
-                </div>
+        </div>
+        </div>
 
-                <!-- Create schedule form -->
+        <!-- ── TAB: SCHEDULES ───────────────────────────────────────────── -->
+        <div id="tab-schedules" class="tab-panel">
+        <div class="max-w-screen-xl mx-auto px-6 py-8 space-y-8">
+
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <h2 class="text-lg font-semibold text-green-400 mb-4">Create Schedule</h2>
                 <div class="flex flex-wrap gap-3 items-end mb-5">
                     <div class="flex flex-col gap-1">
                         <label class="text-xs text-gray-400">Name</label>
@@ -1423,202 +1680,55 @@ def dashboard():
                         <input id="sched_interval" type="number" min="1" placeholder="24"
                             class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-24">
                     </div>
-                    <button onclick="createSchedule()"
-                        class="bg-green-600 hover:bg-green-500 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">
-                        + Schedule
-                    </button>
+                    <button onclick="createSchedule()" class="bg-green-600 hover:bg-green-500 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">+ Schedule</button>
                 </div>
+            </div>
 
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <h2 class="text-lg font-semibold text-green-400 mb-4">Active Schedules</h2>
                 <div id="schedules" class="overflow-x-auto"></div>
             </div>
 
-            <!-- Create Job -->
-            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
-                <h2 class="text-lg font-semibold text-green-400 mb-4">Create Job</h2>
-                <div class="flex flex-wrap gap-3 items-end">
-                    <div class="flex flex-col gap-1">
-                        <label class="text-xs text-gray-400">Target IP</label>
-                        <input id="target" placeholder="192.168.1.50"
-                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-44">
-                    </div>
-                    <div class="flex flex-col gap-1">
-                        <label class="text-xs text-gray-400">Agent ID (optional)</label>
-                        <input id="agent_id" placeholder="Leave blank for any"
-                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-44">
-                    </div>
-                    <div class="flex flex-col gap-1">
-                        <label class="text-xs text-gray-400">Scan Type</label>
-                        <select id="job_type" onchange="onJobTypeChange()"
-                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
-                            <option value="nmap_scan">Nmap Scan</option>
-                            <option value="nikto_scan">Nikto Scan</option>
-                            <option value="nse_scan">NSE Scan</option>
-                        </select>
-                    </div>
-
-                    <!-- Single port — nikto only -->
-                    <div class="flex flex-col gap-1" id="portField" style="display:none">
-                        <label class="text-xs text-gray-400">Port</label>
-                        <input id="port" placeholder="80"
-                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-24">
-                    </div>
-
-                    <!-- Ports (comma-separated) — nse only -->
-                    <div class="flex flex-col gap-1" id="portsField" style="display:none">
-                        <label class="text-xs text-gray-400">Ports (optional, comma-separated)</label>
-                        <input id="ports" placeholder="22,445,3389"
-                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-52">
-                    </div>
-
-                    <div class="flex flex-col gap-1">
-                        <label class="text-xs text-gray-400">Mode</label>
-                        <select id="mode" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
-                            <option value="remote">Remote</option>
-                            <option value="agent">Agent</option>
-                        </select>
-                    </div>
-                    <div class="flex flex-col gap-1">
-                        <label class="text-xs text-gray-400">Profile</label>
-                        <select id="profile" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
-                            <option value="standard">Standard</option>
-                            <option value="light">Light</option>
-                            <option value="full">Full</option>
-                        </select>
-                    </div>
-                    <button onclick="createJob()"
-                        class="bg-green-600 hover:bg-green-500 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">
-                        + Create
-                    </button>
-                </div>
-
-                <!-- NSE exploit warning banner — shown inline when full + nse_scan selected -->
-                <div id="nseExploitBanner" class="hidden mt-4 flex items-start gap-3 bg-red-950 border border-red-800 rounded-lg px-4 py-3">
-                    <span class="text-red-400 text-sm mt-0.5">⚠</span>
-                    <p class="text-xs text-red-300">
-                        <strong class="text-red-200">Full profile with NSE</strong> uses
-                        <span class="font-mono">--script vuln,exploit</span> — these scripts are intrusive and may
-                        disrupt or crash services. Only use against hosts you are authorised to test.
-                    </p>
-                </div>
-            </div>
-
-            <!-- Agents -->
-            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
-                <div class="flex items-center justify-between mb-4">
-                    <h2 class="text-lg font-semibold text-green-400">Agents</h2>
-                    <button onclick="toggleStaleAgents()" id="staleAgentsBtn"
-                        class="text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-yellow-500 transition">
-                        Show Stale
-                    </button>
-                </div>
-                <div id="agents" class="overflow-x-auto"></div>
-            </div>
-
-            <!-- Jobs -->
-            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
-                <div class="flex items-center justify-between mb-3">
-                    <h2 class="text-lg font-semibold text-green-400">Jobs</h2>
-                    <div class="flex gap-2 flex-wrap justify-end">
-                        <button onclick="setJobFilter('all')" id="filter-all"
-                            class="filter-btn active-filter text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-green-500 transition">All</button>
-                        <button onclick="setJobFilter('pending')" id="filter-pending"
-                            class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-yellow-500 transition">Pending</button>
-                        <button onclick="setJobFilter('running')" id="filter-running"
-                            class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-blue-500 transition">Running</button>
-                        <button onclick="setJobFilter('done')" id="filter-done"
-                            class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-green-500 transition">Done</button>
-                        <button onclick="setJobFilter('failed')" id="filter-failed"
-                            class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-red-500 transition">Failed</button>
-                        <button onclick="toggleJobHistory()" id="jobHistoryBtn"
-                            class="text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-purple-500 transition">Show History</button>
-                    </div>
-                </div>
-                <div class="flex gap-2 mb-3">
-                    <button onclick="clearAllByStatus('pending')"
-                        class="text-xs px-3 py-1 rounded-lg bg-yellow-950 hover:bg-yellow-900 text-yellow-300 border border-yellow-800 transition">
-                        Delete all pending
-                    </button>
-                    <button onclick="clearAllByStatus('failed')"
-                        class="text-xs px-3 py-1 rounded-lg bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 transition">
-                        Delete all failed
-                    </button>
-                </div>
-                <div id="jobs" class="overflow-x-auto"></div>
-            </div>
-
-            <!-- Results -->
-            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
-                <div class="flex items-center justify-between mb-4">
-                    <h2 class="text-lg font-semibold text-green-400">Scan Results</h2>
-                    <div class="flex gap-1 bg-gray-800 rounded-lg p-1">
-                        <button onclick="setResultTab('active')" id="tab-active"
-                            class="result-tab text-xs px-4 py-1.5 rounded-md transition font-medium bg-gray-700 text-white">
-                            Active
-                        </button>
-                        <button onclick="setResultTab('history')" id="tab-history"
-                            class="result-tab text-xs px-4 py-1.5 rounded-md transition font-medium text-gray-400 hover:text-gray-200">
-                            History
-                        </button>
-                    </div>
-                </div>
-
-                <div id="activeToolbar" class="mb-4 flex items-center gap-3">
-                    <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
-                        <input type="checkbox" id="selectAllActiveCheckbox" onchange="toggleSelectAllActive()" class="accent-yellow-500">
-                        Select all
-                    </label>
-                    <button onclick="clearSelected()"
-                        class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-600 transition font-medium">
-                        Clear Selected
-                    </button>
-                    <button onclick="exportResults()"
-                        class="text-xs px-3 py-1.5 rounded-lg bg-cyan-900 hover:bg-cyan-800 text-cyan-200 border border-cyan-700 transition font-medium">
-                        ↓ Export JSON
-                    </button>
-                </div>
-
-                <div id="historyToolbar" class="hidden mb-4 flex items-center gap-3">
-                    <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
-                        <input type="checkbox" id="selectAllCheckbox" onchange="toggleSelectAll()" class="accent-red-500">
-                        Select all
-                    </label>
-                    <button onclick="deleteSelected()"
-                        class="text-xs px-3 py-1.5 rounded-lg bg-red-900 hover:bg-red-800 text-red-200 border border-red-700 transition font-medium">
-                        Delete Selected
-                    </button>
-                    <button onclick="clearAllHistory()"
-                        class="text-xs px-3 py-1.5 rounded-lg bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 transition font-medium">
-                                                ⚠ Clear All History
-                    </button>
-                    <button onclick="exportResults()"
-                        class="text-xs px-3 py-1.5 rounded-lg bg-cyan-900 hover:bg-cyan-800 text-cyan-200 border border-cyan-700 transition font-medium">
-                        ↓ Export JSON
-                    </button>
-                </div>
-
-                <div id="results" class="space-y-4"></div>
-            </div>
-
+        </div>
         </div>
 
+        <!-- ── SCRIPTS ──────────────────────────────────────────────────── -->
         <script>
+        // ── STATE ──────────────────────────────────────────────────────────
         let jobFilter = "all";
         let showJobHistory = false;
         let resultTab = "active";
         let authCredentials = "";
         let confirmCallback = null;
         let exploitWarningCallback = null;
+        let showStaleAgents = false;
+        let activeTab = "dashboard";
 
-        // --- AUTH ---
+        // Tracks job statuses from last poll — used to detect completions
+        let lastJobStatuses = {};
 
+        // Pending sweep payload (hosts + params) waiting for user confirmation
+        let pendingSweepPayload = null;
+
+        // ── TAB SWITCHING ──────────────────────────────────────────────────
+        function switchTab(tab) {
+            activeTab = tab;
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.nav-tab').forEach(b => b.classList.remove('active'));
+            document.getElementById('tab-' + tab).classList.add('active');
+            document.getElementById('nav-' + tab).classList.add('active');
+
+            if (tab === 'discovery') { loadSweepHistory(); }
+            if (tab === 'schedules') { loadSchedules(); }
+        }
+
+        // ── AUTH ───────────────────────────────────────────────────────────
         function submitLogin() {
             const username = document.getElementById("loginUsername").value;
             const password = document.getElementById("loginPassword").value;
             if (!username || !password) return;
             authCredentials = 'Basic ' + btoa(username + ':' + password);
-            fetch('/agents', {
-                headers: { 'Authorization': authCredentials }
-            }).then(res => {
+            fetch('/agents', { headers: { 'Authorization': authCredentials } }).then(res => {
                 if (res.status === 401) {
                     authCredentials = "";
                     document.getElementById("loginError").classList.remove('hidden');
@@ -1628,19 +1738,11 @@ def dashboard():
                 }
             });
         }
-
-        document.getElementById("loginPassword").addEventListener('keydown', e => {
-            if (e.key === 'Enter') submitLogin();
-        });
-        document.getElementById("loginUsername").addEventListener('keydown', e => {
-            if (e.key === 'Enter') submitLogin();
-        });
+        document.getElementById("loginPassword").addEventListener('keydown', e => { if (e.key === 'Enter') submitLogin(); });
+        document.getElementById("loginUsername").addEventListener('keydown', e => { if (e.key === 'Enter') submitLogin(); });
 
         async function apiFetch(url, options = {}) {
-            options.headers = {
-                ...options.headers,
-                'Authorization': authCredentials
-            };
+            options.headers = { ...options.headers, 'Authorization': authCredentials };
             const res = await fetch(url, options);
             if (res.status === 401) {
                 authCredentials = "";
@@ -1650,81 +1752,49 @@ def dashboard():
             return res;
         }
 
-        // --- CONFIRM DIALOG ---
-
-        function showConfirm(message, onConfirm) {
+        // ── DIALOGS ────────────────────────────────────────────────────────
+        function showConfirm(message, onConfirm, okLabel = 'Confirm') {
             document.getElementById("confirmMsg").textContent = message;
+            document.getElementById("confirmOkBtn").textContent = okLabel;
             document.getElementById("confirmDialog").classList.remove('hidden');
-            confirmCallback = onConfirm;
             document.getElementById("confirmOkBtn").onclick = () => {
                 document.getElementById("confirmDialog").classList.add('hidden');
-                if (confirmCallback) confirmCallback();
+                if (onConfirm) onConfirm();
             };
         }
-
-        function cancelConfirm() {
-            document.getElementById("confirmDialog").classList.add('hidden');
-            confirmCallback = null;
-        }
-
-        // --- EXPLOIT WARNING DIALOG ---
+        function cancelConfirm() { document.getElementById("confirmDialog").classList.add('hidden'); }
 
         function showExploitWarning(onConfirm) {
             exploitWarningCallback = onConfirm;
             document.getElementById("exploitWarningDialog").classList.remove('hidden');
         }
+        function cancelExploitWarning() { document.getElementById("exploitWarningDialog").classList.add('hidden'); exploitWarningCallback = null; }
+        function confirmExploitWarning() { document.getElementById("exploitWarningDialog").classList.add('hidden'); if (exploitWarningCallback) exploitWarningCallback(); }
 
-        function cancelExploitWarning() {
-            document.getElementById("exploitWarningDialog").classList.add('hidden');
-            exploitWarningCallback = null;
-        }
-
-        function confirmExploitWarning() {
-            document.getElementById("exploitWarningDialog").classList.add('hidden');
-            if (exploitWarningCallback) exploitWarningCallback();
-        }
-
-        // --- LOAD ALL ---
-
+        // ── LOAD ALL ───────────────────────────────────────────────────────
         async function loadAll() {
             loadAgents();
             loadJobs();
             loadResults();
+            if (activeTab === 'discovery') loadSweepHistory();
+            if (activeTab === 'schedules') loadSchedules();
         }
 
-        // --- JOB TYPE CHANGE ---
-
+        // ── JOB TYPE CHANGE ────────────────────────────────────────────────
         function onJobTypeChange() {
             const type = document.getElementById("job_type").value;
-            const profile = document.getElementById("profile").value;
-
-            // single port field — nikto only
-            document.getElementById("portField").style.display =
-                type === "nikto_scan" ? "flex" : "none";
-
-            // multi-port field — nse only
-            document.getElementById("portsField").style.display =
-                type === "nse_scan" ? "flex" : "none";
-
+            document.getElementById("portField").style.display = type === "nikto_scan" ? "flex" : "none";
+            document.getElementById("portsField").style.display = type === "nse_scan" ? "flex" : "none";
             updateNseExploitBanner();
         }
-
         function updateNseExploitBanner() {
             const type = document.getElementById("job_type").value;
             const profile = document.getElementById("profile").value;
-            const banner = document.getElementById("nseExploitBanner");
-            if (type === "nse_scan" && profile === "full") {
-                banner.classList.remove("hidden");
-            } else {
-                banner.classList.add("hidden");
-            }
+            document.getElementById("nseExploitBanner").classList.toggle("hidden", !(type === "nse_scan" && profile === "full"));
         }
-
-        // Watch profile changes too so the banner reacts
         document.getElementById("profile").addEventListener("change", updateNseExploitBanner);
 
-        // --- JOB FILTERS ---
-
+        // ── JOB FILTERS ────────────────────────────────────────────────────
         function setJobFilter(filter) {
             jobFilter = filter;
             document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active-filter', 'border-green-500', 'text-green-400'));
@@ -1732,7 +1802,6 @@ def dashboard():
             if (active) active.classList.add('active-filter', 'border-green-500', 'text-green-400');
             loadJobs();
         }
-
         function toggleJobHistory() {
             showJobHistory = !showJobHistory;
             document.getElementById("jobHistoryBtn").innerText = showJobHistory ? "Hide History" : "Show History";
@@ -1740,7 +1809,6 @@ def dashboard():
             document.getElementById("jobHistoryBtn").classList.toggle('text-purple-400');
             loadJobs();
         }
-
         function toggleStaleAgents() {
             showStaleAgents = !showStaleAgents;
             const btn = document.getElementById("staleAgentsBtn");
@@ -1750,75 +1818,55 @@ def dashboard():
             loadAgents();
         }
 
-        // --- RESULT TABS ---
-
+        // ── RESULT TABS ────────────────────────────────────────────────────
         function setResultTab(tab) {
             resultTab = tab;
-            document.querySelectorAll('.result-tab').forEach(b => {
-                b.classList.remove('bg-gray-700', 'text-white');
-                b.classList.add('text-gray-400');
-            });
-            const active = document.getElementById('tab-' + tab);
-            active.classList.add('bg-gray-700', 'text-white');
-            active.classList.remove('text-gray-400');
-
-            if (tab === 'history') {
-                document.getElementById('historyToolbar').classList.remove('hidden');
-                document.getElementById('activeToolbar').classList.add('hidden');
-            } else {
-                document.getElementById('historyToolbar').classList.add('hidden');
-                document.getElementById('activeToolbar').classList.remove('hidden');
-            }
-
+            document.querySelectorAll('.result-tab').forEach(b => { b.classList.remove('bg-gray-700', 'text-white'); b.classList.add('text-gray-400'); });
+            document.getElementById('tab-' + tab).classList.add('bg-gray-700', 'text-white');
+            document.getElementById('tab-' + tab).classList.remove('text-gray-400');
+            document.getElementById('historyToolbar').classList.toggle('hidden', tab !== 'history');
+            document.getElementById('activeToolbar').classList.toggle('hidden', tab === 'history');
             document.getElementById('selectAllCheckbox').checked = false;
             document.getElementById('selectAllActiveCheckbox').checked = false;
-
             loadResults();
         }
-
         function toggleSelectAll() {
             const checked = document.getElementById('selectAllCheckbox').checked;
             document.querySelectorAll('.result-checkbox').forEach(cb => cb.checked = checked);
         }
-
         function toggleSelectAllActive() {
             const checked = document.getElementById('selectAllActiveCheckbox').checked;
             document.querySelectorAll('.result-checkbox').forEach(cb => cb.checked = checked);
         }
-
         function getSelectedIds() {
-            return Array.from(document.querySelectorAll('.result-checkbox:checked'))
-                .map(cb => parseInt(cb.dataset.id));
+            return Array.from(document.querySelectorAll('.result-checkbox:checked')).map(cb => parseInt(cb.dataset.id));
         }
 
         async function clearSelected() {
             const ids = getSelectedIds();
             if (!ids.length) { alert("No results selected."); return; }
-            showConfirm(
-                `Clear ${ids.length} result(s)? They will move to History.`,
-                async () => {
-                    await Promise.all(ids.map(id => apiFetch(`/results/${id}/clear`, { method: 'POST' })));
-                    document.getElementById('selectAllActiveCheckbox').checked = false;
-                    loadResults(); loadJobs();
-                }
-            );
+            showConfirm(`Clear ${ids.length} result(s)? They will move to History.`, async () => {
+                await Promise.all(ids.map(id => apiFetch(`/results/${id}/clear`, { method: 'POST' })));
+                document.getElementById('selectAllActiveCheckbox').checked = false;
+                loadResults(); loadJobs();
+            }, 'Clear');
         }
-
         async function deleteSelected() {
             const ids = getSelectedIds();
             if (!ids.length) { alert("No results selected."); return; }
-            showConfirm(
-                `Permanently delete ${ids.length} result(s) and their jobs? This cannot be undone.`,
-                async () => {
-                    await apiFetch('/results/bulk', {
-                        method: 'DELETE',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ ids })
-                    });
-                    document.getElementById('selectAllCheckbox').checked = false;
-                    loadResults(); loadJobs();
-                }
-            );
+            showConfirm(`Permanently delete ${ids.length} result(s) and their jobs? This cannot be undone.`, async () => {
+                await apiFetch('/results/bulk', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
+                document.getElementById('selectAllCheckbox').checked = false;
+                loadResults(); loadJobs();
+            }, 'Delete');
+        }
+        async function clearAllHistory() {
+            showConfirm('Permanently delete ALL archived results and their jobs? This cannot be undone.', async () => {
+                const res = await apiFetch('/results/clear-all-history', { method: 'DELETE' });
+                if (!res) return;
+                const data = await res.json();
+                loadResults(); loadJobs();
+            }, 'Clear All');
         }
 
         async function exportResults() {
@@ -1828,786 +1876,403 @@ def dashboard():
             const res = await apiFetch(url);
             if (!res) return;
             const data = await res.json();
-
-            const toExport = selectedIds.length
-                ? data.filter(r => selectedIds.includes(r.id))
-                : data;
-
+            const toExport = selectedIds.length ? data.filter(r => selectedIds.includes(r.id)) : data;
             if (!toExport.length) { alert("No results to export."); return; }
-
             const exportDoc = {
                 exported_at: new Date().toISOString(),
-                source: "VAPT Scanner",
+                source: "Heimdall V-Scanner",
                 tab: resultTab,
                 total: toExport.length,
-                results: toExport.map(r => {
-                    const out = r.output;
-                    return {
-                        result_id: r.id,
-                        job: r.job_info ? {
-                            target: r.job_info.target,
-                            type: r.job_info.type,
-                            mode: r.job_info.mode,
-                            profile: r.job_info.profile,
-                            priority: r.job_info.priority,
-                            completed_at: r.job_info.completed_at
-                        } : { job_id: r.job_id },
-                        nmap: out.nmap || null,
-                        nikto: out.nikto ? Object.entries(out.nikto).reduce((acc, [port, result]) => {
-                            if (result.raw) {
-                                const findings = result.raw.split('\\n')
-                                    .filter(l => l.match(/^\\+ \\[/))
-                                    .map(line => {
-                                        const match = line.match(/^\\+ \\[(\\w+)\\] (.+?):\\s*(.+)$/);
-                                        return match
-                                            ? { id: match[1], url: match[2], message: match[3] }
-                                            : { raw_line: line.replace(/^\\+ /, '') };
-                                    });
-                                acc[port] = { findings };
-                            } else if (result.error) {
-                                acc[port] = { error: result.error };
-                            } else {
-                                acc[port] = { vulnerabilities: result[0]?.vulnerabilities || [] };
-                            }
-                            return acc;
-                        }, {}) : null,
-                        nse: out.nse || null,
-                    };
-                })
+                results: toExport.map(r => ({
+                    result_id: r.id,
+                    job: r.job_info ? { target: r.job_info.target, type: r.job_info.type, mode: r.job_info.mode, profile: r.job_info.profile, priority: r.job_info.priority, completed_at: r.job_info.completed_at } : { job_id: r.job_id },
+                    nmap: r.output.nmap || null,
+                    nikto: r.output.nikto || null,
+                    nse: r.output.nse || null,
+                }))
             };
-
             const blob = new Blob([JSON.stringify(exportDoc, null, 2)], { type: 'application/json' });
             const a = document.createElement('a');
             a.href = URL.createObjectURL(blob);
-            const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-            a.download = `vapt-export-${ts}.json`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
+            a.download = `heimdall-export-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.json`;
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
             URL.revokeObjectURL(a.href);
         }
 
-        // --- CREATE JOB ---
-
-        async function createJob() {
-            const target  = document.getElementById("target").value.trim();
-            const agent_id = document.getElementById("agent_id").value.trim();
-            const type    = document.getElementById("job_type").value;
-            const mode    = document.getElementById("mode").value;
-            const profile = document.getElementById("profile").value;
-            const port    = document.getElementById("port").value.trim();
-            const ports   = document.getElementById("ports").value.trim();
-
-            if (!target) { alert("Please enter a target IP."); return; }
-
-            // Intercept full NSE before we even hit the server
-            if (type === "nse_scan" && profile === "full") {
-                showExploitWarning(() => submitCreateJob(target, agent_id, type, mode, profile, port, ports));
-                return;
-            }
-
-            await submitCreateJob(target, agent_id, type, mode, profile, port, ports);
+        // ── BADGES ─────────────────────────────────────────────────────────
+        function statusBadge(status) {
+            const map = { pending: 'bg-yellow-900 text-yellow-300 border border-yellow-700', running: 'bg-blue-900 text-blue-300 border border-blue-700', done: 'bg-green-900 text-green-300 border border-green-700', failed: 'bg-red-900 text-red-300 border border-red-700' };
+            return `<span class="text-xs px-2 py-0.5 rounded-full font-medium ${map[status] || 'bg-gray-700 text-gray-300'}">${status}</span>`;
+        }
+        function priorityBadge(priority) {
+            const map = { high: 'text-red-400', medium: 'text-yellow-400', low: 'text-gray-400' };
+            return `<span class="text-xs font-medium ${map[priority] || 'text-gray-400'}">${priority}</span>`;
+        }
+        function formatTimestamp(ts) {
+            if (!ts) return '—';
+            const d = new Date(ts);
+            return `${d.toISOString().split('T')[0]} at ${d.toTimeString().split(' ')[0]}`;
+        }
+        function elapsedDisplay(startedAt) {
+            if (!startedAt) return 'running…';
+            const secs = Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000);
+            if (secs < 60) return `${secs}s elapsed`;
+            return `${Math.floor(secs / 60)}m ${secs % 60}s elapsed`;
         }
 
-        async function submitCreateJob(target, agent_id, type, mode, profile, port, ports) {
-            let payload = { type, target, mode, profile };
+        setInterval(() => {
+            document.querySelectorAll('[id^="job-time-"]').forEach(cell => {
+                const startedAt = cell.dataset.startedAt;
+                if (!startedAt) return;
+                const badge = cell.closest('tr')?.querySelector('span');
+                if (badge && badge.textContent.trim() === 'running') cell.textContent = elapsedDisplay(startedAt);
+            });
+        }, 1000);
+
+        // ── AGENTS ─────────────────────────────────────────────────────────
+        async function loadAgents() {
+            const url = showStaleAgents ? '/agents?show_stale=true' : '/agents';
+            const res = await apiFetch(url);
+            if (!res) return;
+            const data = await res.json();
+            data.sort((a, b) => a.id - b.id);
+            let html = `<table class="w-full text-sm"><thead><tr class="text-left text-gray-400 border-b border-gray-800"><th class="pb-2 pr-4">ID</th><th class="pb-2 pr-4">Name</th><th class="pb-2 pr-4">Status</th><th class="pb-2 pr-4">Last Seen</th><th class="pb-2">Action</th></tr></thead><tbody>`;
+            if (!data.length) html += `<tr><td colspan="5" class="py-4 text-gray-500 text-sm">No agents registered.</td></tr>`;
+            data.forEach(a => {
+                const isStale = a.is_stale;
+                const rowClass = isStale ? 'border-b border-gray-800 bg-gray-900 opacity-60' : 'border-b border-gray-800 hover:bg-gray-800 transition';
+                const dot = a.status === 'online' ? '<span class="inline-block w-2 h-2 rounded-full bg-green-400 mr-2"></span>' : '<span class="inline-block w-2 h-2 rounded-full bg-red-500 mr-2"></span>';
+                const staleTag = isStale ? '<span class="ml-2 text-xs px-1.5 py-0.5 rounded bg-yellow-900 text-yellow-400 border border-yellow-700">stale</span>' : '';
+                const action = isStale
+                    ? `<div class="flex gap-3"><button onclick="restoreAgent(${a.id})" class="text-xs text-blue-400 hover:text-blue-300 transition">Restore</button><button onclick="dismissAgent(${a.id})" class="text-xs text-red-400 hover:text-red-300 transition">Dismiss</button></div>`
+                    : '<span class="text-xs text-gray-600">—</span>';
+                html += `<tr class="${rowClass}"><td class="py-2 pr-4 text-gray-400">#${a.id}</td><td class="py-2 pr-4 font-medium">${a.name}${staleTag}</td><td class="py-2 pr-4">${dot}${a.status}</td><td class="py-2 pr-4 text-gray-400 text-xs">${formatTimestamp(a.last_seen)}</td><td class="py-2">${action}</td></tr>`;
+            });
+            html += '</tbody></table>';
+            document.getElementById("agents").innerHTML = html;
+        }
+        async function dismissAgent(agent_id) {
+            showConfirm('Permanently remove this stale agent?', async () => { await apiFetch(`/agents/${agent_id}/dismiss`, { method: 'POST' }); loadAgents(); }, 'Remove');
+        }
+        async function restoreAgent(agent_id) { await apiFetch(`/agents/${agent_id}/restore`, { method: 'POST' }); loadAgents(); }
+
+        // ── JOBS ───────────────────────────────────────────────────────────
+        async function loadJobs() {
+            const url = showJobHistory ? '/jobs?show_history=true' : '/jobs';
+            const res = await apiFetch(url);
+            if (!res) return;
+            const data = await res.json();
+
+            // Detect newly completed jobs — auto-refresh results if any finished
+            let anyNewlyDone = false;
+            data.forEach(j => {
+                const prev = lastJobStatuses[j.id];
+                if (prev === 'running' && j.status === 'done') anyNewlyDone = true;
+                lastJobStatuses[j.id] = j.status;
+            });
+            if (anyNewlyDone && resultTab === 'active') loadResults();
+
+            const filtered = jobFilter === 'all' ? data : data.filter(j => j.status === jobFilter);
+            if (!filtered.length) { document.getElementById("jobs").innerHTML = '<p class="text-gray-500 text-sm">No jobs found.</p>'; return; }
+
+            let html = `<table class="w-full text-sm"><thead><tr class="text-left text-gray-400 border-b border-gray-800"><th class="pb-2 pr-3">#</th><th class="pb-2 pr-3">DB ID</th><th class="pb-2 pr-3">Type</th><th class="pb-2 pr-3">Target</th><th class="pb-2 pr-3">Status</th><th class="pb-2 pr-3">Priority</th><th class="pb-2 pr-3">Mode</th><th class="pb-2 pr-3">Profile</th><th class="pb-2 pr-3">Agent</th><th class="pb-2 pr-3">Time</th><th class="pb-2">Action</th></tr></thead><tbody>`;
+            filtered.forEach((j, idx) => {
+                let action;
+                if (j.cleared) action = '<span class="text-xs text-gray-500 italic">archived</span>';
+                else if (j.status === 'pending' || j.status === 'failed') action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-red-500 hover:text-red-400 transition font-medium">Delete</button>`;
+                else action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button>`;
+                html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition"><td class="py-2 pr-3 text-gray-500 text-xs">${idx + 1}</td><td class="py-2 pr-3 text-gray-500 text-xs font-mono">${j.id}</td><td class="py-2 pr-3 font-mono text-xs text-blue-300">${j.type}</td><td class="py-2 pr-3 font-mono text-xs">${j.target}</td><td class="py-2 pr-3">${statusBadge(j.status)}</td><td class="py-2 pr-3">${priorityBadge(j.priority)}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.mode}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.profile}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.agent}</td><td class="py-2 pr-3 text-xs text-gray-400 tabular-nums" id="job-time-${j.id}" data-started-at="${j.started_at || ''}">${j.status === 'running' ? elapsedDisplay(j.started_at) : formatTimestamp(j.completed_at)}</td><td class="py-2">${action}</td></tr>`;
+            });
+            html += '</tbody></table>';
+            document.getElementById("jobs").innerHTML = html;
+        }
+        async function clearJob(job_id, status) {
+            if (status === 'pending' || status === 'failed') {
+                showConfirm(`Permanently delete this ${status} job?`, async () => { await apiFetch(`/jobs/${job_id}/clear`, { method: 'POST' }); loadJobs(); }, 'Delete');
+            } else { await apiFetch(`/jobs/${job_id}/clear`, { method: 'POST' }); loadJobs(); }
+        }
+        async function clearAllByStatus(status) {
+            showConfirm(`Permanently delete ALL ${status} jobs?`, async () => {
+                const res = await apiFetch('/jobs');
+                if (!res) return;
+                const jobs = await res.json();
+                await Promise.all(jobs.filter(j => j.status === status && !j.cleared).map(j => apiFetch(`/jobs/${j.id}/clear`, { method: 'POST' })));
+                loadJobs();
+            }, 'Delete All');
+        }
+
+        // ── CREATE JOB ─────────────────────────────────────────────────────
+        async function createJob() {
+            const target   = document.getElementById("target").value.trim();
+            const agent_id = document.getElementById("agent_id").value.trim();
+            const type     = document.getElementById("job_type").value;
+            const mode     = document.getElementById("mode").value;
+            const profile  = document.getElementById("profile").value;
+            const port     = document.getElementById("port").value.trim();
+            const ports    = document.getElementById("ports").value.trim();
+            const priority = document.getElementById("priority").value;
+            if (!target) { alert("Please enter a target IP."); return; }
+            if (type === "nse_scan" && profile === "full") {
+                showExploitWarning(() => submitCreateJob(target, agent_id, type, mode, profile, port, ports, priority));
+                return;
+            }
+            await submitCreateJob(target, agent_id, type, mode, profile, port, ports, priority);
+        }
+        async function submitCreateJob(target, agent_id, type, mode, profile, port, ports, priority) {
+            let payload = { type, target, mode, profile, priority };
             if (agent_id) payload.agent_id = parseInt(agent_id);
             if (type === "nikto_scan" && port) payload.port = parseInt(port);
             if (type === "nse_scan" && ports) payload.ports = ports;
-
-            const res = await apiFetch('/jobs/create', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-
+            const res = await apiFetch('/jobs/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
             if (!res) return;
-
-            if (res.status === 400) {
-                const err = await res.json();
-                alert(`Job creation failed: ${err.detail}`);
-                return;
-            }
-
+            if (res.status === 400) { const err = await res.json(); alert(`Job creation failed: ${err.detail}`); return; }
             const data = await res.json();
-
-            // Surface any server-side warning (e.g. all-web-ports for NSE)
-            if (data.warning) {
-                alert(`Job created with warning:\\n\\n${data.warning}`);
-            }
-
+            if (data.warning) alert(`Job created with warning:\\n\\n${data.warning}`);
             document.getElementById("target").value = "";
             document.getElementById("port").value = "";
             document.getElementById("ports").value = "";
             setTimeout(loadAll, 300);
         }
 
-        // --- BADGES ---
-
-        function statusBadge(status) {
-            const map = {
-                pending: 'bg-yellow-900 text-yellow-300 border border-yellow-700',
-                running: 'bg-blue-900 text-blue-300 border border-blue-700',
-                done:    'bg-green-900 text-green-300 border border-green-700',
-                failed:  'bg-red-900 text-red-300 border border-red-700',
-            };
-            return `<span class="text-xs px-2 py-0.5 rounded-full font-medium ${map[status] || 'bg-gray-700 text-gray-300'}">${status}</span>`;
-        }
-
-        function priorityBadge(priority) {
-            const map = { high: 'text-red-400', medium: 'text-yellow-400', low: 'text-gray-400' };
-            return `<span class="text-xs font-medium ${map[priority] || 'text-gray-400'}">${priority}</span>`;
-        }
-
-        function formatTimestamp(ts) {
-            if (!ts) return '—';
-            const d = new Date(ts);
-            return `${d.toISOString().split('T')[0]} at ${d.toTimeString().split(' ')[0]}`;
-        }
-
-        function elapsedDisplay(startedAt) {
-            if (!startedAt) return 'running…';
-            const secs = Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000);
-            if (secs < 60) return `${secs}s elapsed`;
-            const mins = Math.floor(secs / 60);
-            return `${mins}m ${secs % 60}s elapsed`;
-        }
-
-        // Tick elapsed counters every second without reloading the whole table
-        setInterval(() => {
-            document.querySelectorAll('[id^="job-time-"]').forEach(cell => {
-                const startedAt = cell.dataset.startedAt;
-                if (!startedAt) return;
-                const badge = cell.closest('tr')?.querySelector('span');
-                if (badge && badge.textContent.trim() === 'running') {
-                    cell.textContent = elapsedDisplay(startedAt);
-                }
-            });
-        }, 1000);
-
-        // --- AGENTS ---
-
-        let showStaleAgents = false;
-
-        async function loadAgents() {
-            const url = showStaleAgents ? '/agents?show_stale=true' : '/agents';
-            let res = await apiFetch(url);
-            if (!res) return;
-            let data = await res.json();
-            data.sort((a, b) => a.id - b.id);
-
-            let html = `<table class="w-full text-sm">
-                <thead><tr class="text-left text-gray-400 border-b border-gray-800">
-                    <th class="pb-2 pr-4">ID</th><th class="pb-2 pr-4">Name</th>
-                    <th class="pb-2 pr-4">Status</th><th class="pb-2 pr-4">Last Seen</th>
-                    <th class="pb-2">Action</th>
-                </tr></thead><tbody>`;
-
-            if (!data.length) {
-                html += `<tr><td colspan="5" class="py-4 text-gray-500 text-sm">No agents registered.</td></tr>`;
-            }
-
-            data.forEach(a => {
-                const isStale = a.is_stale;
-                const rowClass = isStale
-                    ? 'border-b border-gray-800 bg-gray-900 opacity-60'
-                    : 'border-b border-gray-800 hover:bg-gray-800 transition';
-
-                const dot = a.status === 'online'
-                    ? '<span class="inline-block w-2 h-2 rounded-full bg-green-400 mr-2"></span>'
-                    : '<span class="inline-block w-2 h-2 rounded-full bg-red-500 mr-2"></span>';
-
-                const staleTag = isStale
-                    ? '<span class="ml-2 text-xs px-1.5 py-0.5 rounded bg-yellow-900 text-yellow-400 border border-yellow-700">stale</span>'
-                    : '';
-
-                const action = isStale
-                    ? `<div class="flex gap-3">
-                        <button onclick="restoreAgent(${a.id})" class="text-xs text-blue-400 hover:text-blue-300 transition">Restore</button>
-                        <button onclick="dismissAgent(${a.id})" class="text-xs text-red-400 hover:text-red-300 transition">Dismiss</button>
-                       </div>`
-                    : '<span class="text-xs text-gray-600">—</span>';
-
-                html += `<tr class="${rowClass}">
-                    <td class="py-2 pr-4 text-gray-400">#${a.id}</td>
-                    <td class="py-2 pr-4 font-medium">${a.name}${staleTag}</td>
-                    <td class="py-2 pr-4">${dot}${a.status}</td>
-                    <td class="py-2 pr-4 text-gray-400 text-xs">${formatTimestamp(a.last_seen)}</td>
-                    <td class="py-2">${action}</td>
-                </tr>`;
-            });
-
-            html += '</tbody></table>';
-            document.getElementById("agents").innerHTML = html;
-        }
-
-        async function dismissAgent(agent_id) {
-            showConfirm(
-                `Permanently remove this stale agent? This cannot be undone.`,
-                async () => {
-                    await apiFetch(`/agents/${agent_id}/dismiss`, { method: 'POST' });
-                    loadAgents();
-                }
-            );
-        }
-
-        async function restoreAgent(agent_id) {
-            await apiFetch(`/agents/${agent_id}/restore`, { method: 'POST' });
-            loadAgents();
-        }
-
-        // --- JOBS ---
-
-        async function loadJobs() {
-            let url = showJobHistory ? '/jobs?show_history=true' : '/jobs';
-            let res = await apiFetch(url);
-            if (!res) return;
-            let data = await res.json();
-
-            if (jobFilter !== "all") data = data.filter(j => j.status === jobFilter);
-
-            if (!data.length) {
-                document.getElementById("jobs").innerHTML = '<p class="text-gray-500 text-sm">No jobs found.</p>';
-                return;
-            }
-
-            let html = `<table class="w-full text-sm">
-                <thead><tr class="text-left text-gray-400 border-b border-gray-800">
-                    <th class="pb-2 pr-3">#</th><th class="pb-2 pr-3">DB ID</th>
-                    <th class="pb-2 pr-3">Type</th><th class="pb-2 pr-3">Target</th>
-                    <th class="pb-2 pr-3">Status</th><th class="pb-2 pr-3">Priority</th>
-                    <th class="pb-2 pr-3">Mode</th><th class="pb-2 pr-3">Profile</th>
-                    <th class="pb-2 pr-3">Agent</th><th class="pb-2 pr-3">Completed</th>
-                    <th class="pb-2">Action</th>
-                </tr></thead><tbody>`;
-
-            data.forEach((j, idx) => {
-                let action;
-                if (j.cleared) {
-                    action = '<span class="text-xs text-gray-500 italic">archived</span>';
-                } else if (j.status === 'pending' || j.status === 'failed') {
-                    action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-red-500 hover:text-red-400 transition font-medium">Delete</button>`;
-                } else {
-                    action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button>`;
-                }
-
-                html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition">
-                    <td class="py-2 pr-3 text-gray-500 text-xs">${idx + 1}</td>
-                    <td class="py-2 pr-3 text-gray-500 text-xs font-mono">${j.id}</td>
-                    <td class="py-2 pr-3 font-mono text-xs text-blue-300">${j.type}</td>
-                    <td class="py-2 pr-3 font-mono text-xs">${j.target}</td>
-                    <td class="py-2 pr-3">${statusBadge(j.status)}</td>
-                    <td class="py-2 pr-3">${priorityBadge(j.priority)}</td>
-                    <td class="py-2 pr-3 text-xs text-gray-300">${j.mode}</td>
-                    <td class="py-2 pr-3 text-xs text-gray-300">${j.profile}</td>
-                    <td class="py-2 pr-3 text-xs text-gray-300">${j.agent}</td>
-                    <td class="py-2 pr-3 text-xs text-gray-400 tabular-nums" id="job-time-${j.id}" data-started-at="${j.started_at || ''}">\n                        ${j.status === 'running' ? elapsedDisplay(j.started_at) : formatTimestamp(j.completed_at)}\n                    </td>
-                    <td class="py-2">${action}</td>
-                </tr>`;
-            });
-
-            html += '</tbody></table>';
-            document.getElementById("jobs").innerHTML = html;
-        }
-
-        async function clearJob(job_id, status) {
-            if (status === 'pending' || status === 'failed') {
-                showConfirm(
-                    `Permanently delete this ${status} job? This cannot be undone.`,
-                    async () => { await apiFetch(`/jobs/${job_id}/clear`, { method: 'POST' }); loadJobs(); }
-                );
-            } else {
-                await apiFetch(`/jobs/${job_id}/clear`, { method: 'POST' });
-                loadJobs();
-            }
-        }
-
-        async function clearAllByStatus(status) {
-            showConfirm(
-                `Permanently delete ALL ${status} jobs? This cannot be undone.`,
-                async () => {
-                    const res = await apiFetch('/jobs');
-                    if (!res) return;
-                    const jobs = await res.json();
-                    const targets = jobs.filter(j => j.status === status && !j.cleared);
-                    await Promise.all(targets.map(j => apiFetch(`/jobs/${j.id}/clear`, { method: 'POST' })));
-                    loadJobs();
-                }
-            );
-        }
-
-        // --- RESULTS RENDERING ---
-
+        // ── RESULTS ────────────────────────────────────────────────────────
         function toggleResult(id) {
             const body = document.getElementById(`result-body-${id}`);
             const arrow = document.getElementById(`result-arrow-${id}`);
-            const isHidden = body.classList.contains('hidden');
             body.classList.toggle('hidden');
-            arrow.innerText = isHidden ? '▲' : '▼';
+            arrow.innerText = body.classList.contains('hidden') ? '▼' : '▲';
         }
-
         function renderNmapResult(nmap) {
             if (!nmap || !nmap.length) return '<p class="text-gray-500 text-xs">No hosts found.</p>';
             return nmap.map(host => {
                 const ports = host.ports && host.ports.length
-                    ? host.ports.map(p => `
-                        <tr class="border-b border-gray-700">
-                            <td class="py-1 pr-4 font-mono text-blue-300">${p.port}</td>
-                            <td class="py-1 pr-4 text-green-400">${p.state}</td>
-                            <td class="py-1 text-gray-300">${p.service}</td>
-                        </tr>`).join('')
+                    ? host.ports.map(p => `<tr class="border-b border-gray-700"><td class="py-1 pr-4 font-mono text-blue-300">${p.port}</td><td class="py-1 pr-4 text-green-400">${p.state}</td><td class="py-1 text-gray-300">${p.service}</td></tr>`).join('')
                     : '<tr><td colspan="3" class="py-2 text-gray-500">No open ports found</td></tr>';
-
-                return `<div class="mb-2">
-                    <p class="text-xs text-gray-400 mb-1">Host: <span class="text-white font-mono">${host.host}</span></p>
-                    <table class="w-full text-xs">
-                        <thead><tr class="text-gray-500">
-                            <th class="text-left pb-1 pr-4">Port</th>
-                            <th class="text-left pb-1 pr-4">State</th>
-                            <th class="text-left pb-1">Service</th>
-                        </tr></thead>
-                        <tbody>${ports}</tbody>
-                    </table>
-                </div>`;
+                return `<div class="mb-2"><p class="text-xs text-gray-400 mb-1">Host: <span class="text-white font-mono">${host.host}</span></p><table class="w-full text-xs"><thead><tr class="text-gray-500"><th class="text-left pb-1 pr-4">Port</th><th class="text-left pb-1 pr-4">State</th><th class="text-left pb-1">Service</th></tr></thead><tbody>${ports}</tbody></table></div>`;
             }).join('');
         }
-
         function renderNiktoResult(nikto) {
             if (!nikto) return '';
             return Object.entries(nikto).map(([port, result]) => {
-                if (result.error) {
-                    return `<div class="mt-2">
-                        <p class="text-xs text-gray-400">Nikto port ${port}:</p>
-                        <p class="text-xs text-red-400">${result.error}</p>
-                    </div>`;
-                }
-
+                if (result.error) return `<div class="mt-2"><p class="text-xs text-gray-400">Nikto port ${port}:</p><p class="text-xs text-red-400">${result.error}</p></div>`;
                 if (result.raw) {
-                    const lines = result.raw.split('\\n');
-                    const findings = lines.filter(l => l.match(/^\\+ \\[/));
-                    if (!findings.length) {
-                        return `<div class="mt-2"><p class="text-xs text-gray-500">Nikto port ${port}: no findings extracted.</p></div>`;
-                    }
-                    return `<div class="mt-2">
-                        <p class="text-xs text-gray-400 mb-2">Nikto port ${port} — ${findings.length} finding(s):</p>
-                        <div class="space-y-1">
-                            ${findings.map(line => {
-                                const match = line.match(/^\\+ \\[(\\w+)\\] (.+?):\\s*(.+)$/);
-                                if (match) {
-                                    const [, id, url, msg] = match;
-                                    return `<div class="bg-gray-950 rounded p-2 text-xs">
-                                        <span class="text-yellow-400 font-mono">[${id}]</span>
-                                        <span class="text-gray-400 font-mono ml-2">${url}:</span>
-                                        <span class="text-gray-200 ml-1">${msg}</span>
-                                    </div>`;
-                                }
-                                return `<div class="bg-gray-950 rounded p-2 text-xs text-gray-300">${line.replace(/^\\+ /, '')}</div>`;
-                            }).join('')}
-                        </div>
-                    </div>`;
+                    const findings = result.raw.split('\\n').filter(l => l.match(/^\\+ \\[/));
+                    if (!findings.length) return `<div class="mt-2"><p class="text-xs text-gray-500">Nikto port ${port}: no findings.</p></div>`;
+                    return `<div class="mt-2"><p class="text-xs text-gray-400 mb-2">Nikto port ${port} — ${findings.length} finding(s):</p><div class="space-y-1">${findings.map(line => { const m = line.match(/^\\+ \\[(\\w+)\\] (.+?):\\s*(.+)$/); return m ? `<div class="bg-gray-950 rounded p-2 text-xs"><span class="text-yellow-400 font-mono">[${m[1]}]</span><span class="text-gray-400 font-mono ml-2">${m[2]}:</span><span class="text-gray-200 ml-1">${m[3]}</span></div>` : `<div class="bg-gray-950 rounded p-2 text-xs text-gray-300">${line.replace(/^\\+ /, '')}</div>`; }).join('')}</div></div>`;
                 }
-
                 const vulns = result[0]?.vulnerabilities || [];
                 if (!vulns.length) return `<p class="text-xs text-gray-500 mt-2">Nikto port ${port}: no vulnerabilities found.</p>`;
-                return `<div class="mt-2">
-                    <p class="text-xs text-gray-400 mb-1">Nikto port ${port} — ${vulns.length} finding(s):</p>
-                    <div class="space-y-1">
-                        ${vulns.map(v => `
-                            <div class="bg-gray-950 rounded p-2 text-xs">
-                                <span class="text-yellow-400 font-mono">[${v.id}]</span>
-                                <span class="text-gray-200 ml-2">${v.msg}</span>
-                                ${v.url ? `<span class="text-gray-500 ml-2"><a href="${v.url}" target="_blank" class="hover:text-blue-400 transition">${v.url}</a></span>` : ''}
-                            </div>`).join('')}
-                    </div>
-                </div>`;
+                return `<div class="mt-2"><p class="text-xs text-gray-400 mb-1">Nikto port ${port} — ${vulns.length} finding(s):</p><div class="space-y-1">${vulns.map(v => `<div class="bg-gray-950 rounded p-2 text-xs"><span class="text-yellow-400 font-mono">[${v.id}]</span><span class="text-gray-200 ml-2">${v.msg}</span>${v.url ? `<span class="text-gray-500 ml-2"><a href="${v.url}" target="_blank" class="hover:text-blue-400">${v.url}</a></span>` : ''}</div>`).join('')}</div></div>`;
             }).join('');
         }
-
         function renderNseResult(nse) {
             if (!nse) return '';
-
-            // Surface any warning from the scanner (e.g. all-web-ports bail-out)
-            let warningHtml = '';
-            if (nse.warning) {
-                warningHtml = `<div class="mb-3 flex items-start gap-2 bg-yellow-950 border border-yellow-800 rounded-lg px-3 py-2">
-                    <span class="text-yellow-400 text-xs mt-0.5">⚠</span>
-                    <p class="text-xs text-yellow-300">${nse.warning}</p>
-                </div>`;
-            }
-
+            let warningHtml = nse.warning ? `<div class="mb-3 flex items-start gap-2 bg-yellow-950 border border-yellow-800 rounded-lg px-3 py-2"><span class="text-yellow-400 text-xs mt-0.5">⚠</span><p class="text-xs text-yellow-300">${nse.warning}</p></div>` : '';
             const findings = nse.findings || [];
-
-            if (!findings.length) {
-                return `${warningHtml}<p class="text-xs text-gray-500">No NSE findings.</p>`;
-            }
-
+            if (!findings.length) return `${warningHtml}<p class="text-xs text-gray-500">No NSE findings.</p>`;
             const rows = findings.map(f => {
-                const portLabel = f.port !== null
-                    ? `<span class="font-mono text-blue-300">${f.port}</span>${f.service ? `<span class="text-gray-500 ml-1">(${f.service})</span>` : ''}`
-                    : '<span class="text-gray-500 italic">host-level</span>';
-
-                // Truncate long output but keep it expandable
+                const portLabel = f.port !== null ? `<span class="font-mono text-blue-300">${f.port}</span>${f.service ? `<span class="text-gray-500 ml-1">(${f.service})</span>` : ''}` : '<span class="text-gray-500 italic">host-level</span>';
                 const outputId = `nse-output-${Math.random().toString(36).slice(2)}`;
-                const shortOutput = f.output.length > 200
-                    ? f.output.slice(0, 200) + '...'
-                    : f.output;
+                const shortOutput = f.output.length > 200 ? f.output.slice(0, 200) + '...' : f.output;
                 const hasMore = f.output.length > 200;
-
-                return `<div class="bg-gray-950 rounded-lg p-3 text-xs space-y-1">
-                    <div class="flex items-center gap-3 flex-wrap">
-                        <span class="text-purple-400 font-mono font-semibold">${f.script_id}</span>
-                        <span class="text-gray-500">on</span>
-                        ${portLabel}
-                        <span class="text-gray-600 font-mono">${f.host}</span>
-                    </div>
-                    <div class="text-gray-300 whitespace-pre-wrap leading-relaxed" id="${outputId}-short">${shortOutput}</div>
-                    ${hasMore ? `
-                        <div class="text-gray-300 whitespace-pre-wrap leading-relaxed hidden" id="${outputId}-full">${f.output}</div>
-                        <button onclick="
-                            document.getElementById('${outputId}-short').classList.toggle('hidden');
-                            document.getElementById('${outputId}-full').classList.toggle('hidden');
-                            this.textContent = this.textContent === 'Show more' ? 'Show less' : 'Show more';
-                        " class="text-xs text-gray-500 hover:text-gray-300 underline transition">Show more</button>
-                    ` : ''}
-                </div>`;
+                return `<div class="bg-gray-950 rounded-lg p-3 text-xs space-y-1"><div class="flex items-center gap-3 flex-wrap"><span class="text-purple-400 font-mono font-semibold">${f.script_id}</span><span class="text-gray-500">on</span>${portLabel}<span class="text-gray-600 font-mono">${f.host}</span></div><div class="text-gray-300 whitespace-pre-wrap leading-relaxed" id="${outputId}-short">${shortOutput}</div>${hasMore ? `<div class="text-gray-300 whitespace-pre-wrap leading-relaxed hidden" id="${outputId}-full">${f.output}</div><button onclick="document.getElementById('${outputId}-short').classList.toggle('hidden');document.getElementById('${outputId}-full').classList.toggle('hidden');this.textContent=this.textContent==='Show more'?'Show less':'Show more';" class="text-xs text-gray-500 hover:text-gray-300 underline transition">Show more</button>` : ''}</div>`;
             }).join('');
-
-            return `${warningHtml}
-                <p class="text-xs text-gray-400 mb-2">${findings.length} NSE finding(s):</p>
-                <div class="space-y-2">${rows}</div>`;
+            return `${warningHtml}<p class="text-xs text-gray-400 mb-2">${findings.length} NSE finding(s):</p><div class="space-y-2">${rows}</div>`;
         }
-
         function renderJobInfo(job_info) {
             if (!job_info) return '';
-            return `<div class="mb-4 bg-gray-900 rounded-lg p-3 border border-gray-700">
-                <p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">Associated Job</p>
-                <div class="grid grid-cols-2 gap-x-6 gap-y-1 text-xs">
-                    <div><span class="text-gray-500">Job ID:</span> <span class="text-gray-200 font-mono">#${job_info.id}</span></div>
-                    <div><span class="text-gray-500">Target:</span> <span class="text-gray-200 font-mono">${job_info.target}</span></div>
-                    <div><span class="text-gray-500">Type:</span> <span class="text-gray-200">${job_info.type}</span></div>
-                    <div><span class="text-gray-500">Mode:</span> <span class="text-gray-200">${job_info.mode}</span></div>
-                    <div><span class="text-gray-500">Profile:</span> <span class="text-gray-200">${job_info.profile}</span></div>
-                    <div><span class="text-gray-500">Priority:</span> <span class="text-gray-200">${job_info.priority}</span></div>
-                    <div class="col-span-2"><span class="text-gray-500">Completed:</span> <span class="text-gray-200">${formatTimestamp(job_info.completed_at)}</span></div>
-                </div>
-            </div>`;
+            return `<div class="mb-4 bg-gray-900 rounded-lg p-3 border border-gray-700"><p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">Associated Job</p><div class="grid grid-cols-2 gap-x-6 gap-y-1 text-xs"><div><span class="text-gray-500">Job ID:</span> <span class="text-gray-200 font-mono">#${job_info.id}</span></div><div><span class="text-gray-500">Target:</span> <span class="text-gray-200 font-mono">${job_info.target}</span></div><div><span class="text-gray-500">Type:</span> <span class="text-gray-200">${job_info.type}</span></div><div><span class="text-gray-500">Mode:</span> <span class="text-gray-200">${job_info.mode}</span></div><div><span class="text-gray-500">Profile:</span> <span class="text-gray-200">${job_info.profile}</span></div><div><span class="text-gray-500">Priority:</span> <span class="text-gray-200">${job_info.priority}</span></div><div class="col-span-2"><span class="text-gray-500">Completed:</span> <span class="text-gray-200">${formatTimestamp(job_info.completed_at)}</span></div></div></div>`;
         }
-
-        async function clearResult(result_id) {
-            await apiFetch(`/results/${result_id}/clear`, { method: 'POST' });
-            loadResults(); loadJobs();
-        }
-
+        async function clearResult(result_id) { await apiFetch(`/results/${result_id}/clear`, { method: 'POST' }); loadResults(); loadJobs(); }
         async function deleteResult(result_id) {
-            showConfirm(
-                `Permanently delete Result #${result_id} and its associated job? This cannot be undone.`,
-                async () => {
-                    await apiFetch(`/results/${result_id}`, { method: 'DELETE' });
-                    loadResults(); loadJobs();
-                }
-            );
+            showConfirm(`Permanently delete Result #${result_id} and its job?`, async () => { await apiFetch(`/results/${result_id}`, { method: 'DELETE' }); loadResults(); loadJobs(); }, 'Delete');
         }
-        
-        async function clearAllHistory() {
-            showConfirm(
-                'Permanently delete ALL archived results and their jobs? This cannot be undone.',
-                async () => {
-                    const res = await apiFetch('/results/clear-all-history', { method: 'DELETE' });
-                    if (!res) return;
-                    const data = await res.json();
-                    alert(`Cleared ${data.deleted_results} result(s) and ${data.deleted_jobs} job(s).`);
-                    loadResults();
-                    loadJobs();
-                }
-            );
-        }
-
         async function loadResults() {
             const isHistory = resultTab === 'history';
-            const url = isHistory ? '/results?show_history=true' : '/results';
-            let res = await apiFetch(url);
+            const res = await apiFetch(isHistory ? '/results?show_history=true' : '/results');
             if (!res) return;
-            let data = await res.json();
-
-            if (!data.length) {
-                document.getElementById("results").innerHTML =
-                    `<p class="text-gray-500 text-sm">${isHistory ? 'No archived results.' : 'No results yet.'}</p>`;
-                return;
-            }
-
+            const data = await res.json();
+            if (!data.length) { document.getElementById("results").innerHTML = `<p class="text-gray-500 text-sm">${isHistory ? 'No archived results.' : 'No results yet.'}</p>`; return; }
             const html = data.slice().reverse().map(r => {
                 const out = r.output;
-
-                const nmapCount = out.nmap
-                    ? out.nmap.reduce((acc, h) => acc + (h.ports ? h.ports.filter(p => p.state === 'open').length : 0), 0)
-                    : 0;
-                const niktoCount = out.nikto
-                    ? Object.values(out.nikto).reduce((acc, v) => {
-                        if (v.error) return acc;
-                        if (v.raw) return acc + (v.raw.match(/^\\+ \\[/gm) || []).length;
-                        return acc + (v[0]?.vulnerabilities?.length || 0);
-                    }, 0)
-                    : 0;
+                const nmapCount = out.nmap ? out.nmap.reduce((a, h) => a + (h.ports || []).filter(p => p.state === 'open').length, 0) : 0;
+                const niktoCount = out.nikto ? Object.values(out.nikto).reduce((a, v) => { if (v.error) return a; if (v.raw) return a + (v.raw.match(/^\\+ \\[/gm) || []).length; return a + (v[0]?.vulnerabilities?.length || 0); }, 0) : 0;
                 const nseCount = out.nse ? (out.nse.findings || []).length : 0;
-
-                const summary = [
-                    out.nmap  ? `${nmapCount} open port(s)` : null,
-                    out.nikto ? `${niktoCount} web finding(s)` : null,
-                    out.nse   ? `${nseCount} NSE finding(s)` : null,
-                ].filter(Boolean).join(' · ') || 'No data';
-
+                const summary = [out.nmap ? `${nmapCount} open port(s)` : null, out.nikto ? `${niktoCount} web finding(s)` : null, out.nse ? `${nseCount} NSE finding(s)` : null].filter(Boolean).join(' · ') || 'No data';
                 const actions = isHistory
-                    ? `<div class="flex items-center gap-3">
-                        <input type="checkbox" class="result-checkbox accent-red-500" data-id="${r.id}">
-                        <a href="/report/${r.id}" target="_blank" class="text-xs text-cyan-400 hover:text-cyan-300 transition">Report</a>
-                        <button onclick="deleteResult(${r.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button>
-                       </div>`
-                    : `<div class="flex items-center gap-3">
-                        <input type="checkbox" class="result-checkbox accent-yellow-500" data-id="${r.id}">
-                        <a href="/report/${r.id}" target="_blank" class="text-xs text-cyan-400 hover:text-cyan-300 transition">Report</a>
-                        <button onclick="clearResult(${r.id})" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button>
-                       </div>`;
-
-                return `<div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
-                    <div class="flex items-center justify-between px-5 py-4 cursor-pointer hover:bg-gray-750 transition"
-                        onclick="toggleResult(${r.id})">
-                        <div class="flex items-center gap-4">
-                            <span class="text-sm font-semibold text-white">Result #${r.id}</span>
-                            <span class="text-xs text-gray-400">Job #${r.job_id}</span>
-                            <span class="text-xs text-gray-500">${summary}</span>
-                        </div>
-                        <div class="flex items-center gap-4" onclick="event.stopPropagation()">
-                            ${actions}
-                            <span id="result-arrow-${r.id}" class="text-gray-400 text-xs pointer-events-none">▼</span>
-                        </div>
-                    </div>
-                    <div id="result-body-${r.id}" class="hidden px-5 pb-5 border-t border-gray-700 pt-4">
-                        ${isHistory ? renderJobInfo(r.job_info) : ''}
-                        ${out.nmap ? `<div class="mb-4">
-                            <p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Nmap</p>
-                            ${renderNmapResult(out.nmap)}
-                        </div>` : ''}
-                        ${out.nikto ? `<div class="mb-4">
-                            <p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Nikto</p>
-                            ${renderNiktoResult(out.nikto)}
-                        </div>` : ''}
-                        ${out.nse ? `<div class="mb-4">
-                            <p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">NSE</p>
-                            ${renderNseResult(out.nse)}
-                        </div>` : ''}
-                        ${!out.nmap && !out.nikto && !out.nse ? `<pre class="text-xs text-gray-400 overflow-x-auto">${JSON.stringify(out, null, 2)}</pre>` : ''}
-                    </div>
-                </div>`;
+                    ? `<div class="flex items-center gap-3"><input type="checkbox" class="result-checkbox accent-red-500" data-id="${r.id}"><a href="/report/${r.id}" target="_blank" class="text-xs text-cyan-400 hover:text-cyan-300 transition">Report</a><button onclick="deleteResult(${r.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button></div>`
+                    : `<div class="flex items-center gap-3"><input type="checkbox" class="result-checkbox accent-yellow-500" data-id="${r.id}"><a href="/report/${r.id}" target="_blank" class="text-xs text-cyan-400 hover:text-cyan-300 transition">Report</a><button onclick="clearResult(${r.id})" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button></div>`;
+                return `<div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden"><div class="flex items-center justify-between px-5 py-4 cursor-pointer hover:bg-gray-750 transition" onclick="toggleResult(${r.id})"><div class="flex items-center gap-4"><span class="text-sm font-semibold text-white">Result #${r.id}</span><span class="text-xs text-gray-400">Job #${r.job_id}</span><span class="text-xs text-gray-500">${summary}</span></div><div class="flex items-center gap-4" onclick="event.stopPropagation()">${actions}<span id="result-arrow-${r.id}" class="text-gray-400 text-xs pointer-events-none">▼</span></div></div><div id="result-body-${r.id}" class="hidden px-5 pb-5 border-t border-gray-700 pt-4">${isHistory ? renderJobInfo(r.job_info) : ''}${out.nmap ? `<div class="mb-4"><p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Nmap</p>${renderNmapResult(out.nmap)}</div>` : ''}${out.nikto ? `<div class="mb-4"><p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Nikto</p>${renderNiktoResult(out.nikto)}</div>` : ''}${out.nse ? `<div class="mb-4"><p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">NSE</p>${renderNseResult(out.nse)}</div>` : ''}${!out.nmap && !out.nikto && !out.nse ? `<pre class="text-xs text-gray-400 overflow-x-auto">${JSON.stringify(out, null, 2)}</pre>` : ''}</div></div>`;
             }).join('');
-
             document.getElementById("results").innerHTML = html;
         }
 
-        // --- SCHEDULES ---
+        // ── DISCOVERY ──────────────────────────────────────────────────────
+        function dismissSweepStatus() { document.getElementById("sweepStatus").classList.add('hidden'); }
+        function dismissPingResults() { document.getElementById("pingResults").classList.add('hidden'); }
 
-        async function loadSchedules() {
-            const res = await apiFetch('/schedules');
-            if (!res) return;
-            const data = await res.json();
-
-            if (!data.length) {
-                document.getElementById("schedules").innerHTML =
-                    '<p class="text-gray-500 text-sm">No schedules yet.</p>';
-                return;
-            }
-
-            let html = `<table class="w-full text-sm">
-                <thead><tr class="text-left text-gray-400 border-b border-gray-800">
-                    <th class="pb-2 pr-3">Name</th>
-                    <th class="pb-2 pr-3">Type</th>
-                    <th class="pb-2 pr-3">Target</th>
-                    <th class="pb-2 pr-3">Profile</th>
-                    <th class="pb-2 pr-3">Every</th>
-                    <th class="pb-2 pr-3">Status</th>
-                    <th class="pb-2 pr-3">Last Run</th>
-                    <th class="pb-2 pr-3">Next Run</th>
-                    <th class="pb-2">Actions</th>
-                </tr></thead><tbody>`;
-
-            data.forEach(s => {
-                const statusBadge = s.paused
-                    ? '<span class="text-xs px-2 py-0.5 rounded-full bg-yellow-900 text-yellow-300 border border-yellow-700">paused</span>'
-                    : '<span class="text-xs px-2 py-0.5 rounded-full bg-green-900 text-green-300 border border-green-700">active</span>';
-
-                const toggleBtn = s.paused
-                    ? `<button onclick="resumeSchedule(${s.id})" class="text-xs text-blue-400 hover:text-blue-300 transition">Resume</button>`
-                    : `<button onclick="pauseSchedule(${s.id})" class="text-xs text-yellow-400 hover:text-yellow-300 transition">Pause</button>`;
-
-                html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition">
-                    <td class="py-2 pr-3 font-medium text-sm">${s.name}</td>
-                    <td class="py-2 pr-3 font-mono text-xs text-blue-300">${s.type}</td>
-                    <td class="py-2 pr-3 font-mono text-xs">${s.target}</td>
-                    <td class="py-2 pr-3 text-xs text-gray-300">${s.profile}</td>
-                    <td class="py-2 pr-3 text-xs text-gray-300">${s.interval_hours}h</td>
-                    <td class="py-2 pr-3">${statusBadge}</td>
-                    <td class="py-2 pr-3 text-xs text-gray-400">${formatTimestamp(s.last_run_at)}</td>
-                    <td class="py-2 pr-3 text-xs text-gray-400">${s.paused ? '—' : formatTimestamp(s.next_run_at)}</td>
-                    <td class="py-2 flex gap-3">
-                        ${toggleBtn}
-                        <button onclick="deleteSchedule(${s.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button>
-                    </td>
-                </tr>`;
-            });
-
-            html += '</tbody></table>';
-            document.getElementById("schedules").innerHTML = html;
+        function showSweepStatus(text, color = 'bg-cyan-400') {
+            const el = document.getElementById("sweepStatus");
+            const spinner = document.getElementById("sweepSpinner");
+            el.classList.remove('hidden');
+            spinner.className = `w-3 h-3 rounded-full flex-shrink-0 ${color}`;
+            document.getElementById("sweepStatusText").textContent = text;
         }
 
-        async function createSchedule() {
-            const name     = document.getElementById("sched_name").value.trim();
-            const target   = document.getElementById("sched_target").value.trim();
-            const type     = document.getElementById("sched_type").value;
-            const profile  = document.getElementById("sched_profile").value;
-            const mode     = document.getElementById("sched_mode").value;
-            const priority = document.getElementById("sched_priority").value;
-            const interval = document.getElementById("sched_interval").value.trim();
-
-            if (!name || !target || !interval) {
-                alert("Name, target, and interval are required.");
-                return;
-            }
-            if (parseInt(interval) < 1) {
-                alert("Interval must be at least 1 hour.");
-                return;
-            }
-
-            const res = await apiFetch('/schedules', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name, target, type, profile, mode, priority, interval_hours: parseInt(interval) })
-            });
-            if (!res) return;
-
-            if (res.status === 400) {
-                const err = await res.json();
-                alert(`Failed: ${err.detail}`);
-                return;
-            }
-
-            document.getElementById("sched_name").value = "";
-            document.getElementById("sched_target").value = "";
-            document.getElementById("sched_interval").value = "";
-            loadSchedules();
-        }
-
-        async function pauseSchedule(id) {
-            await apiFetch(`/schedules/${id}/pause`, { method: 'POST' });
-            loadSchedules();
-        }
-
-        async function resumeSchedule(id) {
-            await apiFetch(`/schedules/${id}/resume`, { method: 'POST' });
-            loadSchedules();
-        }
-
-        async function deleteSchedule(id) {
-            showConfirm(
-                'Delete this schedule? Any jobs already created will not be affected.',
-                async () => {
-                    await apiFetch(`/schedules/${id}`, { method: 'DELETE' });
-                    loadSchedules();
+        async function startPing() {
+            const subnet = document.getElementById("discoverSubnet").value.trim();
+            if (!subnet) { alert("Please enter a subnet in CIDR format (e.g. 192.168.1.0/24)"); return; }
+            const btn = document.getElementById("pingBtn");
+            btn.disabled = true;
+            btn.textContent = 'Pinging…';
+            dismissPingResults();
+            showSweepStatus(`Pinging ${subnet}…`, 'bg-cyan-400 animate-pulse');
+            try {
+                const res = await apiFetch('/discover/ping', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ subnet }) });
+                if (!res) return;
+                const data = await res.json();
+                showSweepStatus(`Ping complete — ${data.count} host(s) responded`, 'bg-green-400');
+                const listEl = document.getElementById("pingResultsList");
+                document.getElementById("pingResultsTitle").textContent = `${data.count} host(s) found in ${subnet}`;
+                if (data.hosts.length) {
+                    listEl.innerHTML = data.hosts.map(h => `<div class="flex items-center gap-3 text-xs py-1 border-b border-gray-700"><span class="font-mono text-green-400 w-36">${h.ip}</span><span class="text-gray-500">${h.hostname || ''}</span></div>`).join('');
+                } else {
+                    listEl.innerHTML = '<p class="text-xs text-gray-500">No hosts responded to ping.</p>';
                 }
-            );
+                document.getElementById("pingResults").classList.remove('hidden');
+            } catch(e) { showSweepStatus('Ping failed. Check server logs.', 'bg-red-500'); }
+            finally { btn.disabled = false; btn.textContent = '⬡ Ping'; }
         }
 
-        // --- DISCOVERY ---
-
-        let activeSweepId = null;
         let sweepPollInterval = null;
 
-        async function startDiscovery() {
+        async function startSweep() {
             const subnet = document.getElementById("discoverSubnet").value.trim();
-            const mode = document.getElementById("discoverMode").value;
+            const mode   = document.getElementById("discoverMode").value;
             const profile = document.getElementById("discoverProfile").value;
-
             if (!subnet) { alert("Please enter a subnet in CIDR format (e.g. 192.168.1.0/24)"); return; }
 
-            const res = await apiFetch('/discover', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ subnet, mode, profile })
-            });
-            if (!res) return;
+            // First ping to find hosts, then show confirmation dialog
+            const btn = document.getElementById("sweepBtn");
+            btn.disabled = true;
+            btn.textContent = 'Scanning…';
+            showSweepStatus(`Discovering hosts in ${subnet}…`, 'bg-cyan-400 animate-pulse');
 
-            const data = await res.json();
-            activeSweepId = data.sweep_id;
+            try {
+                const res = await apiFetch('/discover/ping', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ subnet }) });
+                if (!res) return;
+                const data = await res.json();
+                dismissSweepStatus();
 
-            document.getElementById("sweepStatus").classList.remove('hidden');
-            document.getElementById("sweepSpinner").classList.add('animate-pulse');
-            document.getElementById("sweepStatusText").textContent = `Sweeping ${subnet}...`;
+                if (!data.count) {
+                    showSweepStatus(`No hosts found in ${subnet}.`, 'bg-yellow-400');
+                    return;
+                }
 
-            sweepPollInterval = setInterval(() => pollSweep(activeSweepId), 3000);
+                // Show confirmation dialog
+                pendingSweepPayload = { subnet, mode, profile };
+                document.getElementById("sweepConfirmMsg").textContent = `${data.count} host(s) found in ${subnet}:`;
+                const hostListEl = document.getElementById("sweepHostList");
+                hostListEl.innerHTML = data.hosts.map(h => `<div class="flex items-center gap-3 text-xs py-1 border-b border-gray-700 last:border-0"><span class="font-mono text-green-400 w-36">${h.ip}</span><span class="text-gray-500">${h.hostname || ''}</span></div>`).join('');
+                document.getElementById("sweepConfirmDialog").classList.remove('hidden');
+
+            } catch(e) { showSweepStatus('Discovery failed. Check server logs.', 'bg-red-500'); }
+            finally { btn.disabled = false; btn.textContent = '⌖ Sweep'; }
         }
 
-        async function pollSweep(sweepId) {
-            const res = await apiFetch(`/discover/${sweepId}`);
+        function cancelSweepConfirm() {
+            document.getElementById("sweepConfirmDialog").classList.add('hidden');
+            pendingSweepPayload = null;
+        }
+
+        async function confirmSweep() {
+            document.getElementById("sweepConfirmDialog").classList.add('hidden');
+            if (!pendingSweepPayload) return;
+            const { subnet, mode, profile } = pendingSweepPayload;
+            pendingSweepPayload = null;
+
+            showSweepStatus(`Sweeping ${subnet} and assigning jobs…`, 'bg-cyan-400 animate-pulse');
+
+            const res = await apiFetch('/discover', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ subnet, mode, profile }) });
             if (!res) return;
             const data = await res.json();
 
-            if (data.status === 'done') {
-                clearInterval(sweepPollInterval);
-                sweepPollInterval = null;
-                document.getElementById("sweepSpinner").classList.remove('animate-pulse', 'bg-cyan-400');
-                document.getElementById("sweepSpinner").classList.add('bg-green-400');
-                document.getElementById("sweepStatusText").textContent =
-                    `Sweep complete — ${data.hosts_found} host(s) found, ${data.jobs_created} job(s) created`;
-                loadSweepHistory(); loadJobs();
-            } else if (data.status === 'failed') {
-                clearInterval(sweepPollInterval);
-                sweepPollInterval = null;
-                document.getElementById("sweepSpinner").classList.remove('bg-cyan-400');
-                document.getElementById("sweepSpinner").classList.add('bg-red-500');
-                document.getElementById("sweepStatusText").textContent = 'Sweep failed. Check server logs.';
-                loadSweepHistory();
-            }
+            sweepPollInterval = setInterval(async () => {
+                const r = await apiFetch(`/discover/${data.sweep_id}`);
+                if (!r) return;
+                const s = await r.json();
+                if (s.status === 'done') {
+                    clearInterval(sweepPollInterval);
+                    showSweepStatus(`Sweep complete — ${s.hosts_found} host(s) found, ${s.jobs_created} job(s) created`, 'bg-green-400');
+                    loadSweepHistory(); loadJobs();
+                } else if (s.status === 'failed') {
+                    clearInterval(sweepPollInterval);
+                    showSweepStatus('Sweep failed. Check server logs.', 'bg-red-500');
+                    loadSweepHistory();
+                }
+            }, 3000);
         }
 
         async function loadSweepHistory() {
             const res = await apiFetch('/discover');
             if (!res) return;
             const sweeps = await res.json();
-
-            if (!sweeps.length) {
-                document.getElementById("sweepHistory").innerHTML = '<p class="text-gray-600 text-xs">No sweeps yet.</p>';
-                return;
-            }
-
+            const el = document.getElementById("sweepHistory");
+            if (!sweeps.length) { el.innerHTML = '<p class="text-gray-600 text-xs">No sweeps yet.</p>'; return; }
             const statusColor = { running: 'text-blue-400', done: 'text-green-400', failed: 'text-red-400' };
-
-            const rows = sweeps.map(s => `
-                <tr class="border-b border-gray-800 hover:bg-gray-800 transition text-xs">
-                    <td class="py-2 pr-4 text-gray-400">#${s.id}</td>
-                    <td class="py-2 pr-4 font-mono">${s.subnet}</td>
-                    <td class="py-2 pr-4 ${statusColor[s.status] || 'text-gray-400'}">${s.status}</td>
-                    <td class="py-2 pr-4 text-gray-300">${s.hosts_found} host(s)</td>
-                    <td class="py-2 pr-4 text-gray-300">${s.jobs_created} job(s)</td>
-                    <td class="py-2 text-gray-500">${formatTimestamp(s.started_at)}</td>
-                </tr>`).join('');
-
-            document.getElementById("sweepHistory").innerHTML = `
-                <table class="w-full text-sm mt-2">
-                    <thead><tr class="text-left text-gray-500 border-b border-gray-800">
-                        <th class="pb-2 pr-4">ID</th><th class="pb-2 pr-4">Subnet</th>
-                        <th class="pb-2 pr-4">Status</th><th class="pb-2 pr-4">Hosts</th>
-                        <th class="pb-2 pr-4">Jobs</th><th class="pb-2">Started</th>
-                    </tr></thead>
-                    <tbody>${rows}</tbody>
-                </table>`;
+            const rows = sweeps.map(s => `<tr class="border-b border-gray-800 hover:bg-gray-800 transition text-xs"><td class="py-2 pr-4 text-gray-400">#${s.id}</td><td class="py-2 pr-4 font-mono">${s.subnet}</td><td class="py-2 pr-4 ${statusColor[s.status] || 'text-gray-400'}">${s.status}</td><td class="py-2 pr-4 text-gray-300">${s.hosts_found} host(s)</td><td class="py-2 pr-4 text-gray-300">${s.jobs_created} job(s)</td><td class="py-2 pr-4 text-gray-500">${formatTimestamp(s.started_at)}</td><td class="py-2"><button onclick="deleteSweep(${s.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button></td></tr>`).join('');
+            el.innerHTML = `<table class="w-full text-sm"><thead><tr class="text-left text-gray-500 border-b border-gray-800"><th class="pb-2 pr-4">ID</th><th class="pb-2 pr-4">Subnet</th><th class="pb-2 pr-4">Status</th><th class="pb-2 pr-4">Hosts</th><th class="pb-2 pr-4">Jobs</th><th class="pb-2 pr-4">Started</th><th class="pb-2">Action</th></tr></thead><tbody>${rows}</tbody></table>`;
         }
 
+        async function deleteSweep(sweep_id) {
+            showConfirm('Delete this sweep record?', async () => { await apiFetch(`/discover/${sweep_id}`, { method: 'DELETE' }); loadSweepHistory(); }, 'Delete');
+        }
+        async function clearAllSweeps() {
+            showConfirm('Delete all sweep history records?', async () => { await apiFetch('/discover', { method: 'DELETE' }); loadSweepHistory(); }, 'Clear All');
+        }
+
+        // ── SCHEDULES ──────────────────────────────────────────────────────
+        async function loadSchedules() {
+            const res = await apiFetch('/schedules');
+            if (!res) return;
+            const data = await res.json();
+            const el = document.getElementById("schedules");
+            if (!data.length) { el.innerHTML = '<p class="text-gray-500 text-sm">No schedules yet.</p>'; return; }
+            let html = `<table class="w-full text-sm"><thead><tr class="text-left text-gray-400 border-b border-gray-800"><th class="pb-2 pr-3">Name</th><th class="pb-2 pr-3">Type</th><th class="pb-2 pr-3">Target</th><th class="pb-2 pr-3">Profile</th><th class="pb-2 pr-3">Every</th><th class="pb-2 pr-3">Status</th><th class="pb-2 pr-3">Last Run</th><th class="pb-2 pr-3">Next Run</th><th class="pb-2">Actions</th></tr></thead><tbody>`;
+            data.forEach(s => {
+                const badge = s.paused ? '<span class="text-xs px-2 py-0.5 rounded-full bg-yellow-900 text-yellow-300 border border-yellow-700">paused</span>' : '<span class="text-xs px-2 py-0.5 rounded-full bg-green-900 text-green-300 border border-green-700">active</span>';
+                const toggle = s.paused ? `<button onclick="resumeSchedule(${s.id})" class="text-xs text-blue-400 hover:text-blue-300 transition">Resume</button>` : `<button onclick="pauseSchedule(${s.id})" class="text-xs text-yellow-400 hover:text-yellow-300 transition">Pause</button>`;
+                html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition"><td class="py-2 pr-3 font-medium text-sm">${s.name}</td><td class="py-2 pr-3 font-mono text-xs text-blue-300">${s.type}</td><td class="py-2 pr-3 font-mono text-xs">${s.target}</td><td class="py-2 pr-3 text-xs text-gray-300">${s.profile}</td><td class="py-2 pr-3 text-xs text-gray-300">${s.interval_hours}h</td><td class="py-2 pr-3">${badge}</td><td class="py-2 pr-3 text-xs text-gray-400">${formatTimestamp(s.last_run_at)}</td><td class="py-2 pr-3 text-xs text-gray-400">${s.paused ? '—' : formatTimestamp(s.next_run_at)}</td><td class="py-2 flex gap-3">${toggle}<button onclick="deleteSchedule(${s.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button></td></tr>`;
+            });
+            html += '</tbody></table>';
+            el.innerHTML = html;
+        }
+        async function createSchedule() {
+            const name = document.getElementById("sched_name").value.trim();
+            const target = document.getElementById("sched_target").value.trim();
+            const type = document.getElementById("sched_type").value;
+            const profile = document.getElementById("sched_profile").value;
+            const mode = document.getElementById("sched_mode").value;
+            const priority = document.getElementById("sched_priority").value;
+            const interval = document.getElementById("sched_interval").value.trim();
+            if (!name || !target || !interval) { alert("Name, target, and interval are required."); return; }
+            if (parseInt(interval) < 1) { alert("Interval must be at least 1 hour."); return; }
+            const res = await apiFetch('/schedules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, target, type, profile, mode, priority, interval_hours: parseInt(interval) }) });
+            if (!res) return;
+            if (res.status === 400) { const err = await res.json(); alert(`Failed: ${err.detail}`); return; }
+            document.getElementById("sched_name").value = "";
+            document.getElementById("sched_target").value = "";
+            document.getElementById("sched_interval").value = "";
+            loadSchedules();
+        }
+        async function pauseSchedule(id) { await apiFetch(`/schedules/${id}/pause`, { method: 'POST' }); loadSchedules(); }
+        async function resumeSchedule(id) { await apiFetch(`/schedules/${id}/resume`, { method: 'POST' }); loadSchedules(); }
+        async function deleteSchedule(id) {
+            showConfirm('Delete this schedule? Jobs already created are not affected.', async () => { await apiFetch(`/schedules/${id}`, { method: 'DELETE' }); loadSchedules(); }, 'Delete');
+        }
+
+        // ── AUTO POLL ──────────────────────────────────────────────────────
         setInterval(() => { loadAgents(); loadJobs(); }, 5000);
 
-        const _origLoadAll = loadAll;
-        loadAll = async function() {
-            await _origLoadAll();
-            loadSweepHistory();
-            loadSchedules();
-        };
         </script>
     </body>
     </html>
