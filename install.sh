@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh — VAPT Scanner Project installer
+# install.sh — Heimdall V-Scanner installer
 # Run as a user with sudo access, not as root directly
 
 set -e
@@ -22,13 +22,13 @@ section(){ echo -e "\n${BOLD}${CYAN}━━━ $1 ━━━${NC}"; }
 # ─── HEADER ───────────────────────────────────────────────────────────────────
 
 echo -e "${BOLD}${GREEN}"
-echo "  ██╗   ██╗ █████╗ ██████╗ ████████╗"
-echo "  ██║   ██║██╔══██╗██╔══██╗╚══██╔══╝"
-echo "  ██║   ██║███████║██████╔╝   ██║   "
-echo "  ╚██╗ ██╔╝██╔══██║██╔═══╝    ██║   "
-echo "   ╚████╔╝ ██║  ██║██║        ██║   "
-echo "    ╚═══╝  ╚═╝  ╚═╝╚═╝        ╚═╝   "
-echo -e "${NC}${BOLD}  Scanner Project — Installer${NC}"
+echo "  ██╗  ██╗███████╗██╗███╗   ███╗██████╗  █████╗ ██╗     ██╗     "
+echo "  ██║  ██║██╔════╝██║████╗ ████║██╔══██╗██╔══██╗██║     ██║     "
+echo "  ███████║█████╗  ██║██╔████╔██║██║  ██║███████║██║     ██║     "
+echo "  ██╔══██║██╔══╝  ██║██║╚██╔╝██║██║  ██║██╔══██║██║     ██║     "
+echo "  ██║  ██║███████╗██║██║ ╚═╝ ██║██████╔╝██║  ██║███████╗███████╗"
+echo "  ╚═╝  ╚═╝╚══════╝╚═╝╚═╝     ╚═╝╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝"
+echo -e "${NC}${BOLD}  V-Scanner — Installer${NC}"
 echo ""
 
 # ─── PREFLIGHT ────────────────────────────────────────────────────────────────
@@ -285,7 +285,7 @@ BEGIN
         ALTER TABLE jobs ADD COLUMN port INTEGER;
         RAISE NOTICE 'Added jobs.port';
     END IF;
-    
+
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name='jobs' AND column_name='ports'
@@ -293,15 +293,15 @@ BEGIN
         ALTER TABLE jobs ADD COLUMN ports VARCHAR;
         RAISE NOTICE 'Added jobs.ports';
     END IF;
-    
-     IF NOT EXISTS (
+
+    IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name='agents' AND column_name='is_stale'
     ) THEN
         ALTER TABLE agents ADD COLUMN is_stale BOOLEAN DEFAULT FALSE;
         RAISE NOTICE 'Added agents.is_stale';
     END IF;
-    
+
     -- schedules table (created by SQLAlchemy on fresh installs, manual migration for upgrades)
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.tables
@@ -328,6 +328,12 @@ END
 \$\$;
 EOF
 
+# Grant permissions on schedules table — must run outside DO block to access shell variable
+PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+    -c "GRANT ALL ON TABLE schedules TO ${DB_USER};" 2>/dev/null || true
+PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+    -c "GRANT USAGE, SELECT ON SEQUENCE schedules_id_seq TO ${DB_USER};" 2>/dev/null || true
+
 log "Migrations complete"
 
 # ─── SYSTEMD SERVICES ─────────────────────────────────────────────────────────
@@ -341,7 +347,7 @@ UVICORN_BIN="$INSTALL_DIR/venv/bin/uvicorn"
 # Server service
 cat > /tmp/vapt-server.service <<EOF
 [Unit]
-Description=VAPT Scanner Server
+Description=Heimdall V-Scanner — Server
 After=network.target postgresql.service
 Requires=postgresql.service
 
@@ -363,7 +369,7 @@ EOF
 # Scanner service
 cat > /tmp/vapt-scanner.service <<EOF
 [Unit]
-Description=VAPT Remote Scanner
+Description=Heimdall V-Scanner — Remote Scanner
 After=network.target vapt-server.service
 Wants=vapt-server.service
 
@@ -374,7 +380,7 @@ WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
 Environment=VAPT_AGENT_NAME=scanner-1
 Environment=VAPT_SERVER_URL=http://127.0.0.1:8000
-Environment=VAPT_CAPABILITIES=nmap_scan,nikto_scan
+Environment=VAPT_CAPABILITIES=nmap_scan,nikto_scan,nse_scan
 ExecStart=${PYTHON_BIN} ${INSTALL_DIR}/scanner.py
 Restart=on-failure
 RestartSec=10
@@ -446,8 +452,8 @@ echo -e "  ${BOLD}Dashboard:${NC}     http://${SERVER_IP}:8000/dashboard"
 echo -e "  ${BOLD}Username:${NC}      ${DASHBOARD_USERNAME}"
 echo -e "  ${BOLD}Logs:${NC}          journalctl -u vapt-server -f"
 echo ""
-echo -e "  ${BOLD}To run an agent on a workstation:${NC}"
-echo -e "  ${CYAN}VAPT_AGENT_NAME=pc-name VAPT_SERVER_URL=http://${SERVER_IP}:8000 python3 agent.py${NC}"
+echo -e "  ${BOLD}To run an agent on an endpoint:${NC}"
+echo -e "  ${CYAN}VAPT_AGENT_NAME=pc-name VAPT_SERVER_URL=http://${SERVER_IP}:8000 python3 agent/agent.py${NC}"
 echo ""
 echo -e "  ${BOLD}Service commands:${NC}"
 echo -e "  sudo systemctl status vapt-server"

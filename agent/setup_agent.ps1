@@ -1,5 +1,5 @@
 # setup_agent.ps1
-# VAPT Scanner — Windows Workstation Setup
+# Heimdall V-Scanner — Windows Endpoint Setup
 # Sets up the agent (background polling) and local scanner (on-demand UI)
 #
 # Run in PowerShell as Administrator:
@@ -19,20 +19,19 @@ function Write-Fail  { param($msg) Write-Host "  [✗] $msg" -ForegroundColor Re
 
 function Write-Banner {
     Write-Host ""
-    Write-Host "  ██╗   ██╗ █████╗ ██████╗ ████████╗" -ForegroundColor Green
-    Write-Host "  ██║   ██║██╔══██╗██╔══██╗╚══██╔══╝" -ForegroundColor Green
-    Write-Host "  ██║   ██║███████║██████╔╝   ██║   " -ForegroundColor Green
-    Write-Host "  ╚██╗ ██╔╝██╔══██║██╔═══╝    ██║   " -ForegroundColor Green
-    Write-Host "   ╚████╔╝ ██║  ██║██║        ██║   " -ForegroundColor Green
-    Write-Host "    ╚═══╝  ╚═╝  ╚═╝╚═╝        ╚═╝   " -ForegroundColor Green
-    Write-Host "  Windows Workstation Setup" -ForegroundColor White
+    Write-Host "  ██╗  ██╗███████╗██╗███╗   ███╗██████╗  █████╗ ██╗     ██╗     " -ForegroundColor Green
+    Write-Host "  ██║  ██║██╔════╝██║████╗ ████║██╔══██╗██╔══██╗██║     ██║     " -ForegroundColor Green
+    Write-Host "  ███████║█████╗  ██║██╔████╔██║██║  ██║███████║██║     ██║     " -ForegroundColor Green
+    Write-Host "  ██╔══██║██╔══╝  ██║██║╚██╔╝██║██║  ██║██╔══██║██║     ██║     " -ForegroundColor Green
+    Write-Host "  ██║  ██║███████╗██║██║ ╚═╝ ██║██████╔╝██║  ██║███████╗███████╗" -ForegroundColor Green
+    Write-Host "  ╚═╝  ╚═╝╚══════╝╚═╝╚═╝     ╚═╝╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝" -ForegroundColor Green
+    Write-Host "  V-Scanner — Windows Endpoint Setup" -ForegroundColor White
     Write-Host ""
 }
 
 # ── config ────────────────────────────────────────────────────────────────────
 
-$InstallDir = "$env:USERPROFILE\vapt-agent"
-$PythonDir  = "$InstallDir\python"
+$InstallDir = "$env:USERPROFILE\heimdall-agent"
 $VenvDir    = "$InstallDir\venv"
 $NmapDir    = "C:\Program Files (x86)\Nmap"
 
@@ -73,12 +72,10 @@ function Install-Python {
     if (Test-Winget) {
         Write-Step "Installing Python 3.12 via winget..."
         winget install --id Python.Python.3.12 --silent --accept-package-agreements --accept-source-agreements
-        # refresh PATH
         $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" +
                     [System.Environment]::GetEnvironmentVariable("PATH", "User")
         Write-Ok "Python installed"
     } else {
-        # Fall back to direct download
         Write-Step "Downloading Python 3.12 installer..."
         $installer = "$env:TEMP\python-installer.exe"
         $url = "https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe"
@@ -113,7 +110,6 @@ function Install-Nmap {
         Remove-Item $installer -Force
     }
 
-    # add to PATH for this session
     if (-not ($env:PATH -like "*Nmap*")) {
         $env:PATH += ";$NmapDir"
     }
@@ -156,7 +152,6 @@ function Install-PythonDeps {
 function Copy-Scripts {
     $scriptDir = Split-Path -Parent $MyInvocation.ScriptName
 
-    # agent.py
     $agentSrc = Join-Path $scriptDir "agent.py"
     if (Test-Path $agentSrc) {
         Copy-Item $agentSrc "$InstallDir\agent.py" -Force
@@ -165,7 +160,6 @@ function Copy-Scripts {
         Write-Warn "agent.py not found next to setup script — copy it manually to $InstallDir"
     }
 
-    # local_scanner.py
     $scannerSrc = Join-Path $scriptDir "local_scanner.py"
     if (Test-Path $scannerSrc) {
         Copy-Item $scannerSrc "$InstallDir\local_scanner.py" -Force
@@ -206,9 +200,9 @@ VAPT_CAPABILITIES=$capabilities
 "@ | Out-File -FilePath $envFile -Encoding utf8 -Force
 
     Write-Ok ".env written"
-    Write-Host "  Agent name : $agentName" -ForegroundColor Gray
-    Write-Host "  Server URL : $serverUrl" -ForegroundColor Gray
-    Write-Host "  Capabilities: $capabilities (nikto excluded — requires Perl on Windows)" -ForegroundColor Gray
+    Write-Host "  Agent name   : $agentName" -ForegroundColor Gray
+    Write-Host "  Server URL   : $serverUrl" -ForegroundColor Gray
+    Write-Host "  Capabilities : $capabilities (nikto excluded — requires Perl on Windows)" -ForegroundColor Gray
 }
 
 # ── shortcuts ─────────────────────────────────────────────────────────────────
@@ -236,20 +230,18 @@ function New-Shortcut {
 function New-Shortcuts {
     $python = "$VenvDir\Scripts\python.exe"
 
-    # Local Scanner shortcut — opens browser UI
     New-Shortcut `
-        -Name        "VAPT Local Scanner" `
+        -Name        "Heimdall Local Scanner" `
         -Target      $python `
         -Args        "`"$InstallDir\local_scanner.py`"" `
-        -Description "Run VAPT Local Scanner (browser UI)" `
+        -Description "Run Heimdall Local Scanner (browser UI)" `
         -WorkDir     $InstallDir
 
-    # Agent shortcut — runs background agent
     New-Shortcut `
-        -Name        "VAPT Agent" `
+        -Name        "Heimdall Agent" `
         -Target      $python `
         -Args        "`"$InstallDir\agent.py`"" `
-        -Description "Run VAPT Agent (connects to central server)" `
+        -Description "Run Heimdall Agent (connects to central server)" `
         -WorkDir     $InstallDir
 }
 
@@ -257,16 +249,14 @@ function New-Shortcuts {
 
 function Install-AgentService {
     Write-Host ""
-    $answer = Read-Host "  Install VAPT Agent as a Windows service (runs at startup)? [y/N]"
+    $answer = Read-Host "  Install Heimdall Agent as a Windows service (runs at startup)? [y/N]"
     if ($answer -notmatch "^[Yy]$") {
         Write-Step "Skipping service installation"
         return
     }
 
-    # Check if NSSM is available (Non-Sucking Service Manager)
     $nssm = Get-Command nssm -ErrorAction SilentlyContinue
     if (-not $nssm) {
-        # Try to get it via winget
         if (Test-Winget) {
             Write-Step "Installing NSSM (service wrapper) via winget..."
             winget install --id NSSM.NSSM --silent --accept-package-agreements --accept-source-agreements 2>$null
@@ -282,22 +272,21 @@ function Install-AgentService {
         return
     }
 
-    $svcName = "VAPTAgent"
+    $svcName = "HeimdallAgent"
 
-    # Remove existing service if present
     $existing = Get-Service -Name $svcName -ErrorAction SilentlyContinue
     if ($existing) {
-        Write-Step "Removing existing VAPT Agent service..."
+        Write-Step "Removing existing Heimdall Agent service..."
         Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
         nssm remove $svcName confirm | Out-Null
     }
 
-    Write-Step "Installing VAPT Agent as Windows service..."
+    Write-Step "Installing Heimdall Agent as Windows service..."
     nssm install $svcName "$VenvDir\Scripts\python.exe" | Out-Null
     nssm set $svcName AppParameters "`"$InstallDir\agent.py`"" | Out-Null
     nssm set $svcName AppDirectory $InstallDir | Out-Null
-    nssm set $svcName DisplayName "VAPT Agent" | Out-Null
-    nssm set $svcName Description "VAPT Scanner workstation agent — polls central server for scan jobs" | Out-Null
+    nssm set $svcName DisplayName "Heimdall Agent" | Out-Null
+    nssm set $svcName Description "Heimdall V-Scanner agent — polls central server for scan jobs" | Out-Null
     nssm set $svcName Start SERVICE_AUTO_START | Out-Null
     nssm set $svcName AppStdout "$InstallDir\logs\agent.log" | Out-Null
     nssm set $svcName AppStderr "$InstallDir\logs\agent.log" | Out-Null
@@ -308,7 +297,7 @@ function Install-AgentService {
 
     Start-Service -Name $svcName
     $status = (Get-Service -Name $svcName).Status
-    Write-Ok "VAPT Agent service installed and started (status: $status)"
+    Write-Ok "Heimdall Agent service installed and started (status: $status)"
 }
 
 # ── summary ───────────────────────────────────────────────────────────────────
@@ -330,8 +319,8 @@ function Write-Summary {
     Write-Host "  Central server    : $serverUrl" -ForegroundColor Gray
     Write-Host ""
     Write-Host "  Desktop shortcuts created:" -ForegroundColor White
-    Write-Host "    VAPT Local Scanner  — on-demand scans in your browser" -ForegroundColor Gray
-    Write-Host "    VAPT Agent          — connects to central dashboard" -ForegroundColor Gray
+    Write-Host "    Heimdall Local Scanner  — on-demand scans in your browser" -ForegroundColor Gray
+    Write-Host "    Heimdall Agent          — connects to central dashboard" -ForegroundColor Gray
     Write-Host ""
     Write-Host "  To edit agent config:" -ForegroundColor White
     Write-Host "    notepad $InstallDir\.env" -ForegroundColor Gray
