@@ -1922,12 +1922,14 @@ def dashboard():
         }
         function formatTimestamp(ts) {
             if (!ts) return '—';
-            const d = new Date(ts);
+            const normalized = ts.endsWith('Z') ? ts : ts + 'Z';
+            const d = new Date(normalized);
             return `${d.toISOString().split('T')[0]} at ${d.toTimeString().split(' ')[0]}`;
         }
         function elapsedDisplay(startedAt) {
             if (!startedAt) return 'running…';
-            const secs = Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000);
+            const ts = startedAt.endsWith('Z') ? startedAt : startedAt + 'Z';
+            const secs = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
             if (secs < 60) return `${secs}s elapsed`;
             return `${Math.floor(secs / 60)}m ${secs % 60}s elapsed`;
         }
