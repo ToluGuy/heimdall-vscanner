@@ -1494,6 +1494,13 @@ def dashboard():
                     <span class="text-red-400 text-sm mt-0.5">⚠</span>
                     <p class="text-xs text-red-300"><strong class="text-red-200">Full profile with NSE</strong> uses <span class="font-mono">--script vuln,exploit</span> — intrusive scripts that may disrupt services.</p>
                 </div>
+                <div id="nseExploitBanner" class="hidden mt-4 flex items-start justify-between gap-3 bg-red-950 border border-red-800 rounded-lg px-4 py-3">
+                    <div class="flex items-start gap-3">
+                        <span class="text-red-400 text-sm mt-0.5">⚠</span>
+                        <p class="text-xs text-red-300"><strong class="text-red-200">Full profile with NSE</strong> uses <span class="font-mono">--script vuln,exploit</span> — intrusive scripts that may disrupt services.</p>
+                    </div>
+                    <button onclick="dismissExploitBanner()" class="text-red-500 hover:text-red-300 transition text-sm leading-none flex-shrink-0">✕</button>
+                </div>
             </div>
 
             <!-- Agents -->
@@ -1703,6 +1710,7 @@ def dashboard():
         let exploitWarningCallback = null;
         let showStaleAgents = false;
         let activeTab = "dashboard";
+        let exploitBannerDismissed = false;
 
         // Tracks job statuses from last poll — used to detect completions
         let lastJobStatuses = {};
@@ -1787,12 +1795,20 @@ def dashboard():
             document.getElementById("portsField").style.display = type === "nse_scan" ? "flex" : "none";
             updateNseExploitBanner();
         }
+        function dismissExploitBanner() {
+            exploitBannerDismissed = true;
+            document.getElementById('nseExploitBanner').classList.add('hidden');
+        }
         function updateNseExploitBanner() {
             const type = document.getElementById("job_type").value;
             const profile = document.getElementById("profile").value;
-            document.getElementById("nseExploitBanner").classList.toggle("hidden", !(type === "nse_scan" && profile === "full"));
+            const should  = type === "nse_scan" && profile === "full";
+            if (!should || exploitBannerDismissed) {
+                document.getElementById('nseExploitBanner').classList.add('hidden');
+            } else {
+                document.getElementById('nseExploitBanner').classList.remove('hidden');
+            }
         }
-        document.getElementById("profile").addEventListener("change", updateNseExploitBanner);
 
         // ── JOB FILTERS ────────────────────────────────────────────────────
         function setJobFilter(filter) {
