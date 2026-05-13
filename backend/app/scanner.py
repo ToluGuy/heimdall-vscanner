@@ -229,12 +229,15 @@ def parse_nse_from_xml(xml_data: str) -> list:
         hostscript = host.find("hostscript")
         if hostscript is not None:
             for script in hostscript.findall("script"):
+                output = script.get("output", "").strip()
+                if output.startswith("ERROR: Script execution failed"):
+                    continue
                 findings.append({
                     "host": addr,
-                    "port": None,
-                    "service": None,
+                    "port": portid,
+                    "service": service,
                     "script_id": script.get("id"),
-                    "output": script.get("output", "").strip(),
+                    "output": output,
                 })
 
         # port-level scripts
@@ -252,12 +255,15 @@ def parse_nse_from_xml(xml_data: str) -> list:
             service = service_el.get("name", "unknown") if service_el is not None else "unknown"
 
             for script in port_el.findall("script"):
+                output = script.get("output", "").strip()
+                if output.startswith("ERROR: Script execution failed"):
+                    continue
                 findings.append({
                     "host": addr,
                     "port": portid,
                     "service": service,
                     "script_id": script.get("id"),
-                    "output": script.get("output", "").strip(),
+                    "output": output,
                 })
 
     return findings
