@@ -1438,7 +1438,7 @@ def dashboard():
                 <div class="flex flex-wrap gap-3 items-end">
                     <div class="flex flex-col gap-1">
                         <label class="text-xs text-gray-400">Target IP</label>
-                        <input id="target" placeholder="192.168.1.50"
+                        <input id="target" placeholder="127.0.0.1"
                             class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-44">
                     </div>
                     <div class="flex flex-col gap-1">
@@ -1940,8 +1940,10 @@ def dashboard():
             document.querySelectorAll('[id^="job-time-"]').forEach(cell => {
                 const startedAt = cell.dataset.startedAt;
                 if (!startedAt) return;
-                const badge = cell.closest('tr')?.querySelector('span');
-                if (badge && badge.textContent.trim() === 'running') cell.textContent = elapsedDisplay(startedAt);
+                const statusCell = cell.closest('tr')?.querySelector('td:nth-child(5) span');
+                if (statusCell && statusCell.textContent.trim() === 'running') {
+                    cell.textContent = elapsedDisplay(startedAt);
+                }
             });
         }, 1000);
 
@@ -1954,7 +1956,7 @@ def dashboard():
             data.sort((a, b) => a.id - b.id);
             let html = `<table class="w-full text-sm"><thead><tr class="text-left text-gray-400 border-b border-gray-800"><th class="pb-2 pr-4">ID</th><th class="pb-2 pr-4">Name</th><th class="pb-2 pr-4">Status</th><th class="pb-2 pr-4">Last Seen</th><th class="pb-2">Action</th></tr></thead><tbody>`;
             if (!data.length) html += `<tr><td colspan="5" class="py-4 text-gray-500 text-sm">No agents registered.</td></tr>`;
-            data.forEach(a => {
+            data.forEach((a, idx) => {
                 const isStale = a.is_stale;
                 const rowClass = isStale ? 'border-b border-gray-800 bg-gray-900 opacity-60' : 'border-b border-gray-800 hover:bg-gray-800 transition';
                 const dot = a.status === 'online' ? '<span class="inline-block w-2 h-2 rounded-full bg-green-400 mr-2"></span>' : '<span class="inline-block w-2 h-2 rounded-full bg-red-500 mr-2"></span>';
@@ -1962,7 +1964,7 @@ def dashboard():
                 const action = isStale
                     ? `<div class="flex gap-3"><button onclick="restoreAgent(${a.id})" class="text-xs text-blue-400 hover:text-blue-300 transition">Restore</button><button onclick="dismissAgent(${a.id})" class="text-xs text-red-400 hover:text-red-300 transition">Dismiss</button></div>`
                     : '<span class="text-xs text-gray-600">—</span>';
-                html += `<tr class="${rowClass}"><td class="py-2 pr-4 text-gray-400">#${a.id}</td><td class="py-2 pr-4 font-medium">${a.name}${staleTag}</td><td class="py-2 pr-4">${dot}${a.status}</td><td class="py-2 pr-4 text-gray-400 text-xs">${formatTimestamp(a.last_seen)}</td><td class="py-2">${action}</td></tr>`;
+                html += `<tr class="${rowClass}"><td class="py-2 pr-4 text-gray-400">#${idx + 1}</td><td class="py-2 pr-4 font-medium">${a.name}${staleTag}</td><td class="py-2 pr-4">${dot}${a.status}</td><td class="py-2 pr-4 text-gray-400 text-xs">${formatTimestamp(a.last_seen)}</td><td class="py-2">${action}</td></tr>`;
             });
             html += '</tbody></table>';
             document.getElementById("agents").innerHTML = html;
@@ -1978,6 +1980,7 @@ def dashboard():
             const res = await apiFetch(url);
             if (!res) return;
             const data = await res.json();
+            data.sort((a, b) => b.id - a.id);
 
             // Detect newly completed jobs — auto-refresh results if any finished
             let anyNewlyDone = false;
@@ -2108,7 +2111,7 @@ def dashboard():
             if (!res) return;
             const data = await res.json();
             if (!data.length) { document.getElementById("results").innerHTML = `<p class="text-gray-500 text-sm">${isHistory ? 'No archived results.' : 'No results yet.'}</p>`; return; }
-            const html = data.slice().reverse().map(r => {
+            const html = data.slice().sort((a, b) => b.id - a.id).map(r => {
                 const out = r.output;
                 const nmapCount = out.nmap ? out.nmap.reduce((a, h) => a + (h.ports || []).filter(p => p.state === 'open').length, 0) : 0;
                 const niktoCount = out.nikto ? Object.values(out.nikto).reduce((a, v) => { if (v.error) return a; if (v.raw) return a + (v.raw.match(/^\\+ \\[/gm) || []).length; return a + (v[0]?.vulnerabilities?.length || 0); }, 0) : 0;
