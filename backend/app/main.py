@@ -1490,10 +1490,6 @@ def dashboard():
                     </div>
                     <button onclick="createJob()" class="bg-green-600 hover:bg-green-500 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">+ Create</button>
                 </div>
-                <div id="nseExploitBanner" class="hidden mt-4 flex items-start gap-3 bg-red-950 border border-red-800 rounded-lg px-4 py-3">
-                    <span class="text-red-400 text-sm mt-0.5">⚠</span>
-                    <p class="text-xs text-red-300"><strong class="text-red-200">Full profile with NSE</strong> uses <span class="font-mono">--script vuln,exploit</span> — intrusive scripts that may disrupt services.</p>
-                </div>
                 <div id="nseExploitBanner" class="hidden mt-4 flex items-start justify-between gap-3 bg-red-950 border border-red-800 rounded-lg px-4 py-3">
                     <div class="flex items-start gap-3">
                         <span class="text-red-400 text-sm mt-0.5">⚠</span>
@@ -1940,7 +1936,7 @@ def dashboard():
             document.querySelectorAll('[id^="job-time-"]').forEach(cell => {
                 const startedAt = cell.dataset.startedAt;
                 if (!startedAt) return;
-                const statusCell = cell.closest('tr')?.querySelector('td:nth-child(5) span');
+                const statusCell = cell.closest('tr')?.querySelector('[data-field="status"] span');
                 if (statusCell && statusCell.textContent.trim() === 'running') {
                     cell.textContent = elapsedDisplay(startedAt);
                 }
@@ -2000,7 +1996,7 @@ def dashboard():
                 if (j.cleared) action = '<span class="text-xs text-gray-500 italic">archived</span>';
                 else if (j.status === 'pending' || j.status === 'failed') action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-red-500 hover:text-red-400 transition font-medium">Delete</button>`;
                 else action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button>`;
-                html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition"><td class="py-2 pr-3 text-gray-500 text-xs">${idx + 1}</td><td class="py-2 pr-3 text-gray-500 text-xs font-mono">${j.id}</td><td class="py-2 pr-3 font-mono text-xs text-blue-300">${j.type}</td><td class="py-2 pr-3 font-mono text-xs">${j.target}</td><td class="py-2 pr-3">${statusBadge(j.status)}</td><td class="py-2 pr-3">${priorityBadge(j.priority)}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.mode}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.profile}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.agent}</td><td class="py-2 pr-3 text-xs text-gray-400 tabular-nums" id="job-time-${j.id}" data-started-at="${j.started_at || ''}">${j.status === 'running' ? elapsedDisplay(j.started_at) : formatTimestamp(j.completed_at)}</td><td class="py-2">${action}</td></tr>`;
+                html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition"><td class="py-2 pr-3 text-gray-500 text-xs">${idx + 1}</td><td class="py-2 pr-3 text-gray-500 text-xs font-mono">${j.id}</td><td class="py-2 pr-3 font-mono text-xs text-blue-300">${j.type}</td><td class="py-2 pr-3 font-mono text-xs">${j.target}</td><td class="py-2 pr-3" data-field="status">${statusBadge(j.status)}</td><td class="py-2 pr-3">${priorityBadge(j.priority)}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.mode}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.profile}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.agent}</td><td class="py-2 pr-3 text-xs text-gray-400 tabular-nums" id="job-time-${j.id}" data-started-at="${j.started_at || ''}">${j.status === 'running' ? elapsedDisplay(j.started_at) : formatTimestamp(j.completed_at)}</td><td class="py-2">${action}</td></tr>`;
             });
             html += '</tbody></table>';
             document.getElementById("jobs").innerHTML = html;
