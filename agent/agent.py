@@ -8,6 +8,7 @@ import requests
 import subprocess
 import xml.etree.ElementTree as ET
 import tempfile
+import threading
 
 # --- LOGGING ---
 os.makedirs("logs", exist_ok=True)
@@ -441,6 +442,14 @@ def execute_job(job: dict, api_key: str):
         send_job_status(api_key, job_id, "failed")
 
 
+def heartbeat_loop(api_key):
+    """Sends heartbeats every 10 seconds regardless of scan activity."""
+    import time as _time
+    while True:
+        send_heartbeat(api_key)
+        _time.sleep(10)
+
+
 def main():
     api_key = load_api_key()
 
@@ -448,6 +457,9 @@ def main():
         api_key = register()
 
     logger.info(f"Starting job polling as '{AGENT_NAME}'...")
+    
+    hb_thread = threading.Thread(target=heartbeat_loop, args=(api_key,), daemon=True)
+    hb_thread.start()
 
     while True:
         try:
