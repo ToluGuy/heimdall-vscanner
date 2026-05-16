@@ -1357,6 +1357,8 @@ def generate_report(
     return HTMLResponse(content=html)
 
 
+# --- INSIGHTS ---
+
 @app.get("/insights")
 def get_insights(
     db: Session = Depends(get_db),
@@ -1364,6 +1366,166 @@ def get_insights(
     window: str = "7d",   # 24h | 7d | 30d | 3m
     host: str = None,     # optional — filter to a specific IP
 ):
+    # Compute cutoff timestamp from window param
+    window_map = {"24h": 1, "7d": 7, "30d": 30, "3m": 90}
+    days = window_map.get(window, 7)
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    # Base job query filtered by window
+    job_q = db.query(Job).filter(
+        Job.completed_at >= cutoff,
+        Job.status == "done"
+    )
+    if host:
+        job_q = job_q.filter(Job.target == host)
+
+    jobs = job_q.all()
+    job_ids = [j.id for j in jobs]
+    job_map = {j.id: j for j in jobs}
+
+    # Results for those jobs
+    results = db.query(Result).filter(Result.job_id.in_(job_ids)).all() if job_ids else []
+
+    # ── Aggregate stats ───────────────────────────────────────────────────────
+    total_scans = len(jobs)
+    unique_hosts = len(set(j.target for j in jobs))
+
+    # Count open ports and risk distribution across results
+    total_open_ports = 0
+    risk_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0, "UNANALYSED": 0}
+
+    for r in results:
+        try:
+            out = json.loads(r.output)
+        except Exception:
+            continue
+        # Count open ports
+        for h in out.get("nmap", []):
+            total_open_ports += len([p for p in h.get("ports", []) if p.get("state") == "open"])
+        # Parse AI risk level
+        if r.analysis:
+            import re
+            m = re.search(r"##\s*Risk Level\s*\n+(\w+)", r.analysis, re.IGNORECASE)
+            risk = m.group(1).upper() if m else "INFO"
+            if risk in risk_counts:
+                risk_counts[risk] += 1
+            else:
+                risk_counts["INFO"] += 1
+        else:
+            risk_counts["UNANALYSED"] += 1
+
+    # ── Scans per day (for bar chart) ─────────────────────────────────────────
+    scans_by_day = {}
+    for j in jobs:
+        if j.completed_at:
+            day = j.completed_at.strftime("%Y-%m-%d")
+            scans_by_day[day] = scans_by_day.get(day, 0) + 1
+
+    # Fill missing days in range with 0
+    days_list = []
+    for i in range(days - 1, -1, -1):
+        d = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
+        days_list.append(d)
+    scan_activity = [{"date": d, "count": scans_by_day.get(d, 0)} for d in days_list]
+
+    # ── Per-host summary (for host table + bar chart) ─────────────────────────
+    host_data = {}
+    for j in jobs:
+        ip = j.target
+        if ip not in host_data:
+            host_data[ip] = {
+                "ip": ip,
+                "scan_count": 0,
+                "open_ports": 0,
+                "findings": 0,
+                "last_scan": None,
+                "risk": "UNANALYSED",
+            }
+        host_data[ip]["scan_count"] += 1
+        if j.completed_at:
+            if host_data[ip]["last_scan"] is None or j.completed_at > host_data[ip]["last_scan"]:
+                host_data[ip]["last_scan"] = j.completed_at
+
+    for r in results:
+        j = job_map.get(r.job_id)
+        if not j:
+            continue
+        ip = j.target
+        if ip not in host_data:
+            continue
+        try:
+            out = json.loads(r.output)
+        except Exception:
+            continue
+        ports = sum(
+            len([p for p in h.get("ports", []) if p.get("state") == "open"])
+            for h in out.get("nmap", [])
+        )
+        nse = len(out.get("nse", {}).get("findings", []))
+        nikto = sum(
+            (len([l for l in v.get("raw", "").split("\n") if l.startswith("+ [")])
+             if v.get("raw") else len(v.get("vulnerabilities", [])))
+            for v in out.get("nikto", {}).values() if not v.get("error")
+        ) if out.get("nikto") else 0
+        host_data[ip]["open_ports"] += ports
+        host_data[ip]["findings"] += nse + nikto
+        # Update risk level if AI analysis present (use worst seen)
+        if r.analysis:
+            import re
+            m = re.search(r"##\s*Risk Level\s*\n+(\w+)", r.analysis, re.IGNORECASE)
+            risk = m.group(1).upper() if m else "INFO"
+            severity_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNANALYSED"]
+            current = host_data[ip]["risk"]
+            if severity_order.index(risk) < severity_order.index(current) if current in severity_order else True:
+                host_data[ip]["risk"] = risk
+
+    hosts_list = sorted(host_data.values(), key=lambda x: x["findings"], reverse=True)
+    for h in hosts_list:
+        if h["last_scan"]:
+            h["last_scan"] = h["last_scan"].isoformat()
+
+    # ── Per-host drilldown (scan history timeline) ────────────────────────────
+    scan_history = []
+    if host:
+        for j in sorted(jobs, key=lambda x: x.completed_at or datetime.min):
+            result_for_job = next((r for r in results if r.job_id == j.id), None)
+            entry = {
+                "date": j.completed_at.strftime("%Y-%m-%d") if j.completed_at else None,
+                "type": j.type,
+                "profile": j.profile,
+                "open_ports": 0,
+                "findings": 0,
+                "risk": "UNANALYSED",
+            }
+            if result_for_job:
+                try:
+                    out = json.loads(result_for_job.output)
+                    entry["open_ports"] = sum(
+                        len([p for p in h.get("ports", []) if p.get("state") == "open"])
+                        for h in out.get("nmap", [])
+                    )
+                    entry["findings"] = len(out.get("nse", {}).get("findings", []))
+                except Exception:
+                    pass
+                if result_for_job.analysis:
+                    import re
+                    m = re.search(r"##\s*Risk Level\s*\n+(\w+)", result_for_job.analysis, re.IGNORECASE)
+                    entry["risk"] = m.group(1).upper() if m else "INFO"
+            scan_history.append(entry)
+
+    return {
+        "window": window,
+        "host": host,
+        "stats": {
+            "total_scans": total_scans,
+            "unique_hosts": unique_hosts,
+            "total_open_ports": total_open_ports,
+            "risk_counts": risk_counts,
+        },
+        "scan_activity": scan_activity,
+        "hosts": hosts_list,
+        "scan_history": scan_history,  # only populated when host= is set
+    }
 
 
 # --- DASHBOARD ---
@@ -1485,6 +1647,10 @@ def dashboard():
                 <button onclick="switchTab('schedules')" id="nav-schedules"
                     class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
                     Schedules
+                </button>
+                <button onclick="switchTab('insights')" id="nav-insights"
+                    class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
+                    Insights
                 </button>
             </nav>
 
@@ -1758,6 +1924,82 @@ def dashboard():
         </div>
         </div>
 
+        <!-- ── TAB: INSIGHTS ───────────────────────────────────────────── -->
+        <div id="tab-insights" class="tab-panel">
+        <div class="max-w-screen-xl mx-auto px-6 py-8 space-y-6">
+
+            <!-- Controls row -->
+            <div class="flex items-center justify-between flex-wrap gap-4">
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-gray-500 mr-1">Window:</span>
+                    <button onclick="setInsightWindow('24h')" id="iw-24h"
+                        class="insight-win text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">24h</button>
+                    <button onclick="setInsightWindow('7d')" id="iw-7d"
+                        class="insight-win text-xs px-3 py-1.5 rounded-lg border border-green-500 bg-green-500 bg-opacity-10 text-green-400 transition">7d</button>
+                    <button onclick="setInsightWindow('30d')" id="iw-30d"
+                        class="insight-win text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">30d</button>
+                    <button onclick="setInsightWindow('3m')" id="iw-3m"
+                        class="insight-win text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">3m</button>
+                </div>
+                <div id="insightHostBreadcrumb" class="hidden flex items-center gap-2">
+                    <button onclick="clearInsightHost()" class="text-xs text-gray-500 hover:text-gray-300 transition">← All Hosts</button>
+                    <span class="text-xs text-gray-600">|</span>
+                    <span id="insightHostLabel" class="text-xs font-mono text-green-400"></span>
+                </div>
+                <button onclick="loadInsights()" class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-400 transition">↻ Refresh</button>
+            </div>
+
+            <!-- Stat cards -->
+            <div id="insightStats" class="grid grid-cols-2 md:grid-cols-4 gap-4"></div>
+
+            <!-- Scan activity chart -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Scan Activity</h3>
+                <div class="relative h-48">
+                    <canvas id="chartActivity"></canvas>
+                </div>
+            </div>
+
+            <!-- Risk + Top Hosts side by side -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                    <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Risk Distribution</h3>
+                    <div class="relative h-48 flex items-center justify-center">
+                        <canvas id="chartRisk"></canvas>
+                    </div>
+                </div>
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                    <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4" id="topHostsTitle">Top Hosts by Findings</h3>
+                    <div class="relative h-48">
+                        <canvas id="chartTopHosts"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Host table (aggregate) or scan timeline (per-host) -->
+            <div id="insightHostTable" class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Scanned Hosts</h3>
+                <div id="insightHostTableBody"></div>
+            </div>
+
+            <!-- Per-host scan history (only visible in drilldown) -->
+            <div id="insightScanHistory" class="hidden bg-gray-900 rounded-xl border border-gray-800 p-5">
+                <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Scan History</h3>
+                <div class="relative h-48 mb-6">
+                    <canvas id="chartScanHistory"></canvas>
+                </div>
+                <div id="insightScanHistoryTable"></div>
+            </div>
+
+            <!-- Empty state -->
+            <div id="insightEmpty" class="hidden text-center py-16">
+                <p class="text-gray-600 text-sm">No scan data in the selected window.</p>
+                <p class="text-gray-700 text-xs mt-1">Run some scans and come back here to see analytics.</p>
+            </div>
+
+        </div>
+        </div>
+
         <!-- ── SCRIPTS ──────────────────────────────────────────────────── -->
         <script>
         // ── STATE ──────────────────────────────────────────────────────────
@@ -1787,6 +2029,7 @@ def dashboard():
 
             if (tab === 'discovery') { loadSweepHistory(); }
             if (tab === 'schedules') { loadSchedules(); }
+            if (tab === 'insights') { loadInsights(); }
         }
 
         // ── AUTH ───────────────────────────────────────────────────────────
@@ -2236,7 +2479,7 @@ def dashboard():
                 <div class="flex items-center gap-4">
                 <span class="text-sm font-semibold text-white">Result #${r.id}</span>
                 <span class="text-xs text-gray-400">Job #${r.job_id}</span>
-                <span class="text-xs text-gray-500">${summary}</span></div><div class="flex items-center gap-4" onclick="event.stopPropagation()">${actions}<span id="result-arrow-${r.id}" class="text-gray-400 text-xs pointer-events-none">▼</span></div></div><div id="result-body-${r.id}" class="hidden px-5 pb-5 border-t border-gray-700 pt-4">${isHistory ? renderJobInfo(r.job_info) : ''}${out.nmap ? `<div class="mb-4"><p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Nmap</p>${renderNmapResult(out.nmap)}</div>` : ''}${out.nikto ? `<div class="mb-4"><p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Nikto</p>${renderNiktoResult(out.nikto)}</div>` : ''}${out.nse ? `<div class="mb-4"><p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">NSE</p>${renderNseResult(out.nse)}</div>` : ''}${!out.nmap && !out.nikto && !out.nse ? `<pre class="text-xs text-gray-400 overflow-x-auto">${JSON.stringify(out, null, 2)}</pre>` : ''}${r.analysis ? `<div class="mb-4">${renderAnalysis(r.analysis)}</div>` : `<div class="mb-2 flex items-center gap-3"><span class="text-xs text-gray-600 italic">Analysis pending - Click Analyse above to generate</span></div>`}</div></div>`;
+                <span class="text-xs text-gray-500">${summary}</span></div><div class="flex items-center gap-4" onclick="event.stopPropagation()">${actions}<span id="result-arrow-${r.id}" class="text-gray-400 text-xs pointer-events-none">▼</span></div></div><div id="result-body-${r.id}" class="hidden px-5 pb-5 border-t border-gray-700 pt-4">${isHistory ? renderJobInfo(r.job_info) : ''}${out.nmap ? `<div class="mb-4"><p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Nmap</p>${renderNmapResult(out.nmap)}</div>` : ''}${out.nikto ? `<div class="mb-4"><p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Nikto</p>${renderNiktoResult(out.nikto)}</div>` : ''}${out.nse ? `<div class="mb-4"><p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">NSE</p>${renderNseResult(out.nse)}</div>` : ''}${!out.nmap && !out.nikto && !out.nse ? `<pre class="text-xs text-gray-400 overflow-x-auto">${JSON.stringify(out, null, 2)}</pre>` : ''}${r.analysis ? `<div class="mb-4">${renderAnalysis(r.analysis)}</div>` : `<div class="mb-2 flex items-center gap-3"><span class="text-xs text-gray-600 italic">Analysis pending…</span><button onclick="triggerAnalysis(${r.id})" class="text-xs text-purple-400 hover:text-purple-300 transition">Run now</button></div>`}</div></div>`;
             }).join('');
             document.getElementById("results").innerHTML = html;
         }
@@ -2452,7 +2695,266 @@ def dashboard():
             showConfirm('Delete this schedule? Jobs already created are not affected.', async () => { await apiFetch(`/schedules/${id}`, { method: 'DELETE' }); loadSchedules(); }, 'Delete');
         }
 
-        // ── AUTO POLL ──────────────────────────────────────────────────────
+        // ── INSIGHTS ───────────────────────────────────────────────────────
+        let insightWindow = '7d';
+        let insightHost = null;
+        let chartActivity = null, chartRisk = null, chartTopHosts = null, chartScanHistory = null;
+
+        function setInsightWindow(w) {
+            insightWindow = w;
+            document.querySelectorAll('.insight-win').forEach(b => {
+                b.classList.remove('border-green-500', 'bg-opacity-10', 'text-green-400');
+                b.classList.add('border-gray-700', 'text-gray-400');
+                // remove bg-green-500 bg-opacity-10 explicitly
+                b.style.background = '';
+            });
+            const active = document.getElementById('iw-' + w);
+            if (active) {
+                active.classList.remove('border-gray-700', 'text-gray-400');
+                active.classList.add('border-green-500', 'text-green-400');
+                active.style.background = 'rgba(74,222,128,0.1)';
+            }
+            loadInsights();
+        }
+
+        function clearInsightHost() {
+            insightHost = null;
+            document.getElementById('insightHostBreadcrumb').classList.add('hidden');
+            document.getElementById('insightScanHistory').classList.add('hidden');
+            document.getElementById('insightHostTable').classList.remove('hidden');
+            loadInsights();
+        }
+
+        function drillIntoHost(ip) {
+            insightHost = ip;
+            document.getElementById('insightHostLabel').textContent = ip;
+            document.getElementById('insightHostBreadcrumb').classList.remove('hidden');
+            document.getElementById('insightScanHistory').classList.remove('hidden');
+            document.getElementById('insightHostTable').classList.add('hidden');
+            loadInsights();
+        }
+
+        function riskColour(risk) {
+            return {CRITICAL:'#ef4444',HIGH:'#f97316',MEDIUM:'#eab308',LOW:'#3b82f6',INFO:'#6b7280',UNANALYSED:'#374151'}[risk] || '#6b7280';
+        }
+        function riskBadgeHtml(risk) {
+            const cls = {CRITICAL:'bg-red-900 text-red-300 border-red-700',HIGH:'bg-orange-900 text-orange-300 border-orange-700',MEDIUM:'bg-yellow-900 text-yellow-300 border-yellow-700',LOW:'bg-blue-900 text-blue-300 border-blue-700',INFO:'bg-gray-800 text-gray-400 border-gray-600',UNANALYSED:'bg-gray-900 text-gray-600 border-gray-700'}[risk] || 'bg-gray-900 text-gray-600 border-gray-700';
+            return `<span class="text-xs px-2 py-0.5 rounded-full border font-semibold ${cls}">${risk}</span>`;
+        }
+
+        function destroyChart(ref) { if (ref) { ref.destroy(); } return null; }
+
+        async function loadInsights() {
+            let url = `/insights?window=${insightWindow}`;
+            if (insightHost) url += `&host=${encodeURIComponent(insightHost)}`;
+            const res = await apiFetch(url);
+            if (!res) return;
+            const data = await res.json();
+
+            const isEmpty = data.stats.total_scans === 0;
+            document.getElementById('insightEmpty').classList.toggle('hidden', !isEmpty);
+
+            // ── Stat cards ────────────────────────────────────────────────
+            const riskSummary = ['CRITICAL','HIGH','MEDIUM','LOW'].map(r =>
+                data.stats.risk_counts[r] > 0
+                    ? `<span style="color:${riskColour(r)}" class="font-semibold">${data.stats.risk_counts[r]} ${r}</span>`
+                    : null
+            ).filter(Boolean).join(' · ') || '<span class="text-gray-600">None analysed</span>';
+
+            document.getElementById('insightStats').innerHTML = [
+                ['Total Scans', data.stats.total_scans, 'text-green-400'],
+                [insightHost ? 'Scan Count' : 'Unique Hosts', insightHost ? data.stats.total_scans : data.stats.unique_hosts, 'text-blue-400'],
+                ['Open Ports Found', data.stats.total_open_ports, 'text-orange-400'],
+            ].map(([label, val, cls]) => `
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-4 text-center">
+                    <div class="text-2xl font-bold ${cls}">${val}</div>
+                    <div class="text-xs text-gray-500 mt-1 uppercase tracking-wider">${label}</div>
+                </div>
+            `).join('') + `
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-4 text-center">
+                    <div class="text-xs mt-2 leading-relaxed">${riskSummary}</div>
+                    <div class="text-xs text-gray-500 mt-1 uppercase tracking-wider">AI Risk Summary</div>
+                </div>`;
+
+            // ── Scan activity bar chart ───────────────────────────────────
+            chartActivity = destroyChart(chartActivity);
+            const actCtx = document.getElementById('chartActivity').getContext('2d');
+            const labels = data.scan_activity.map(d => {
+                const parts = d.date.split('-');
+                return `${parts[1]}/${parts[2]}`;
+            });
+            chartActivity = new Chart(actCtx, {
+                type: 'bar',
+                data: {
+                    labels,
+                    datasets: [{
+                        label: 'Scans',
+                        data: data.scan_activity.map(d => d.count),
+                        backgroundColor: 'rgba(74,222,128,0.5)',
+                        borderColor: '#4ade80',
+                        borderWidth: 1,
+                        borderRadius: 3,
+                    }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { ticks: { color: '#6b7280', font: { size: 10 } }, grid: { color: '#1f2937' } },
+                        y: { ticks: { color: '#6b7280', font: { size: 10 }, stepSize: 1 }, grid: { color: '#1f2937' }, beginAtZero: true }
+                    }
+                }
+            });
+
+            // ── Risk doughnut chart ───────────────────────────────────────
+            chartRisk = destroyChart(chartRisk);
+            const riskCtx = document.getElementById('chartRisk').getContext('2d');
+            const riskKeys = ['CRITICAL','HIGH','MEDIUM','LOW','INFO','UNANALYSED'];
+            const riskVals = riskKeys.map(k => data.stats.risk_counts[k] || 0);
+            const hasRiskData = riskVals.some(v => v > 0);
+            chartRisk = new Chart(riskCtx, {
+                type: 'doughnut',
+                data: {
+                    labels: riskKeys,
+                    datasets: [{
+                        data: hasRiskData ? riskVals : [1],
+                        backgroundColor: hasRiskData ? riskKeys.map(riskColour) : ['#1f2937'],
+                        borderWidth: 0,
+                    }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'right', labels: { color: '#9ca3af', font: { size: 10 }, boxWidth: 12, padding: 8 } },
+                        tooltip: { enabled: hasRiskData }
+                    },
+                    cutout: '65%'
+                }
+            });
+
+            // ── Top hosts bar chart ───────────────────────────────────────
+            chartTopHosts = destroyChart(chartTopHosts);
+            const topCtx = document.getElementById('chartTopHosts').getContext('2d');
+            const topHosts = data.hosts.slice(0, 8);
+            chartTopHosts = new Chart(topCtx, {
+                type: 'bar',
+                data: {
+                    labels: topHosts.map(h => h.ip),
+                    datasets: [{
+                        label: 'Findings',
+                        data: topHosts.map(h => h.findings),
+                        backgroundColor: topHosts.map(h => riskColour(h.risk) + '99'),
+                        borderColor: topHosts.map(h => riskColour(h.risk)),
+                        borderWidth: 1,
+                        borderRadius: 3,
+                    }]
+                },
+                options: {
+                    indexAxis: 'y',
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { ticks: { color: '#6b7280', font: { size: 10 }, stepSize: 1 }, grid: { color: '#1f2937' }, beginAtZero: true },
+                        y: { ticks: { color: '#9ca3af', font: { size: 10 } }, grid: { display: false } }
+                    }
+                }
+            });
+
+            // ── Host table ────────────────────────────────────────────────
+            if (!insightHost) {
+                const tbody = document.getElementById('insightHostTableBody');
+                if (!data.hosts.length) {
+                    tbody.innerHTML = '<p class="text-xs text-gray-600">No hosts found in this window.</p>';
+                } else {
+                    tbody.innerHTML = `<table class="w-full text-sm">
+                        <thead><tr class="text-left text-gray-500 border-b border-gray-800 text-xs">
+                            <th class="pb-2 pr-4">Host IP</th>
+                            <th class="pb-2 pr-4">Scans</th>
+                            <th class="pb-2 pr-4">Open Ports</th>
+                            <th class="pb-2 pr-4">Findings</th>
+                            <th class="pb-2 pr-4">AI Risk</th>
+                            <th class="pb-2 pr-4">Last Scan</th>
+                            <th class="pb-2">Action</th>
+                        </tr></thead>
+                        <tbody>${data.hosts.map(h => `
+                            <tr class="border-b border-gray-800 hover:bg-gray-800 transition cursor-pointer" onclick="drillIntoHost('${h.ip}')">
+                                <td class="py-2 pr-4 font-mono text-green-400 text-xs">${h.ip}</td>
+                                <td class="py-2 pr-4 text-xs text-gray-300">${h.scan_count}</td>
+                                <td class="py-2 pr-4 text-xs text-gray-300">${h.open_ports}</td>
+                                <td class="py-2 pr-4 text-xs text-gray-300">${h.findings}</td>
+                                <td class="py-2 pr-4">${riskBadgeHtml(h.risk)}</td>
+                                <td class="py-2 pr-4 text-xs text-gray-500">${h.last_scan ? h.last_scan.split('T')[0] : '—'}</td>
+                                <td class="py-2 text-xs text-blue-400 hover:text-blue-300">Drill in →</td>
+                            </tr>`).join('')}
+                        </tbody></table>`;
+                }
+            }
+
+            // ── Per-host scan history ─────────────────────────────────────
+            if (insightHost && data.scan_history.length) {
+                // Line chart: open ports over time
+                chartScanHistory = destroyChart(chartScanHistory);
+                const histCtx = document.getElementById('chartScanHistory').getContext('2d');
+                const histLabels = data.scan_history.map(e => e.date || '?');
+                chartScanHistory = new Chart(histCtx, {
+                    type: 'line',
+                    data: {
+                        labels: histLabels,
+                        datasets: [
+                            {
+                                label: 'Open Ports',
+                                data: data.scan_history.map(e => e.open_ports),
+                                borderColor: '#4ade80',
+                                backgroundColor: 'rgba(74,222,128,0.1)',
+                                tension: 0.3, fill: true, pointRadius: 4,
+                            },
+                            {
+                                label: 'Findings',
+                                data: data.scan_history.map(e => e.findings),
+                                borderColor: '#f97316',
+                                backgroundColor: 'rgba(249,115,22,0.05)',
+                                tension: 0.3, fill: true, pointRadius: 4,
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true, maintainAspectRatio: false,
+                        plugins: { legend: { labels: { color: '#9ca3af', font: { size: 10 }, boxWidth: 12 } } },
+                        scales: {
+                            x: { ticks: { color: '#6b7280', font: { size: 10 } }, grid: { color: '#1f2937' } },
+                            y: { ticks: { color: '#6b7280', font: { size: 10 }, stepSize: 1 }, grid: { color: '#1f2937' }, beginAtZero: true }
+                        }
+                    }
+                });
+
+                // History table
+                document.getElementById('insightScanHistoryTable').innerHTML = `
+                    <table class="w-full text-sm">
+                        <thead><tr class="text-left text-gray-500 border-b border-gray-800 text-xs">
+                            <th class="pb-2 pr-4">Date</th>
+                            <th class="pb-2 pr-4">Type</th>
+                            <th class="pb-2 pr-4">Profile</th>
+                            <th class="pb-2 pr-4">Open Ports</th>
+                            <th class="pb-2 pr-4">Findings</th>
+                            <th class="pb-2">Risk</th>
+                        </tr></thead>
+                        <tbody>${data.scan_history.map(e => `
+                            <tr class="border-b border-gray-800 text-xs">
+                                <td class="py-2 pr-4 text-gray-400">${e.date || '—'}</td>
+                                <td class="py-2 pr-4 font-mono text-blue-300">${e.type}</td>
+                                <td class="py-2 pr-4 text-gray-400">${e.profile}</td>
+                                <td class="py-2 pr-4 text-gray-300">${e.open_ports}</td>
+                                <td class="py-2 pr-4 text-gray-300">${e.findings}</td>
+                                <td class="py-2">${riskBadgeHtml(e.risk)}</td>
+                            </tr>`).join('')}
+                        </tbody></table>`;
+            } else if (insightHost) {
+                document.getElementById('insightScanHistoryTable').innerHTML = '<p class="text-xs text-gray-600">No scan history for this host in the selected window.</p>';
+                chartScanHistory = destroyChart(chartScanHistory);
+            }
+        }
+
+        
         setInterval(() => { loadAgents(); loadJobs(); }, 5000);
         
         const AI_PROVIDER = '__AI_PROVIDER__';
@@ -2463,4 +2965,3 @@ def dashboard():
     """
     html = html.replace("__AI_PROVIDER__", ai_provider_name)
     return html
-    
