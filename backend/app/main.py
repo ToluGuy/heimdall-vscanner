@@ -173,6 +173,51 @@ def get_agent_by_api_key(api_key: str, db: Session):
     return agent
 
 
+def find_or_create_host(db: Session, ip: str, mac: str = None, hostname: str = None,
+                        agent_id: int = None, os_fingerprint: str = None):
+    """
+    Finds an existing Host record using priority matching, or creates a new one.
+    Priority: agent_id > MAC > hostname > IP.
+    Updates metadata and logs IP changes.
+    """
+    from .models import Host
+    now = datetime.utcnow()
+    host = None
+
+    if agent_id:
+        host = db.query(Host).filter(Host.agent_id == agent_id).first()
+    if not host and mac:
+        host = db.query(Host).filter(Host.mac == mac).first()
+    if not host and hostname:
+        host = db.query(Host).filter(Host.hostname == hostname).first()
+    if not host:
+        host = db.query(Host).filter(Host.ip == ip).first()
+
+    if host:
+        if host.ip != ip:
+            host.last_ip = host.ip
+            host.ip_changed_at = now
+            logger.info(f"Host #{host.id} IP changed: {host.ip} -> {ip}")
+        host.ip = ip
+        if mac:
+            host.mac = mac
+        if hostname:
+            host.hostname = hostname
+        if agent_id and not host.agent_id:
+            host.agent_id = agent_id
+        if os_fingerprint and not host.os_fingerprint:
+            host.os_fingerprint = os_fingerprint
+        host.last_seen = now
+    else:
+        host = Host(ip=ip, mac=mac, hostname=hostname, agent_id=agent_id,
+                    os_fingerprint=os_fingerprint, first_seen=now, last_seen=now)
+        db.add(host)
+        db.flush()
+        logger.info(f"New host: {ip} mac={mac} hostname={hostname}")
+
+    return host
+
+
 def run_ai_analysis(result_id: int, output: dict):
     """Background task: generates AI analysis and stores it on the result."""
     db = SessionLocal()
@@ -198,13 +243,46 @@ def submit_result(
 ):
     agent = get_agent_by_api_key(x_api_key, db)
 
+    parsed_output = json.loads(result.output)
+    job = db.query(Job).filter(Job.id == result.job_id).first()
+    target_ip = job.target if job else None
+
+    # Extract identity signals from Nmap output
+    mac = None
+    hostname = None
+    os_fingerprint = None
+    if target_ip and parsed_output.get("nmap"):
+        for h in parsed_output["nmap"]:
+            if h.get("host") == target_ip:
+                mac = h.get("mac")
+                hostname = h.get("hostname")
+                os_fingerprint = h.get("os")
+                break
+        if not mac and not hostname and parsed_output["nmap"]:
+            first = parsed_output["nmap"][0]
+            mac = first.get("mac")
+            hostname = first.get("hostname")
+            os_fingerprint = first.get("os")
+
+    # Link agent identity only for agent-mode jobs
+    linked_agent_id = agent.id if (job and job.mode == "agent") else None
+
+    # Resolve host record
+    host = None
+    if target_ip:
+        try:
+            host = find_or_create_host(db, ip=target_ip, mac=mac, hostname=hostname,
+                                       agent_id=linked_agent_id, os_fingerprint=os_fingerprint)
+        except Exception as e:
+            logger.error(f"Host resolution failed for {target_ip}: {e}")
+
     new_result = Result(
         job_id=result.job_id,
+        host_id=host.id if host else None,
         output=result.output,
     )
     db.add(new_result)
 
-    job = db.query(Job).filter(Job.id == result.job_id).first()
     if job:
         job.status = "done"
         job.completed_at = datetime.utcnow()
@@ -215,7 +293,6 @@ def submit_result(
     # Trigger AI analysis in background if enabled
     if AI_AUTO_ANALYSE:
         result_id = new_result.id
-        parsed_output = json.loads(result.output)
         thread = threading.Thread(
             target=run_ai_analysis,
             args=(result_id, parsed_output),
@@ -358,6 +435,35 @@ def delete_result(
 
     db.commit()
     return {"ok": True}
+
+
+# --- HOSTS ---
+
+@app.get("/hosts")
+def get_hosts(db: Session = Depends(get_db), username: str = Depends(require_auth)):
+    from .models import Host
+    hosts = db.query(Host).order_by(Host.last_seen.desc()).all()
+    out = []
+    for h in hosts:
+        agent_name = None
+        if h.agent_id:
+            a = db.query(Agent).filter(Agent.id == h.agent_id).first()
+            if a:
+                agent_name = a.name
+        out.append({
+            "id": h.id,
+            "ip": h.ip,
+            "mac": h.mac,
+            "hostname": h.hostname,
+            "os": h.os_fingerprint,
+            "agent_id": h.agent_id,
+            "agent_name": agent_name,
+            "first_seen": h.first_seen.isoformat() if h.first_seen else None,
+            "last_seen": h.last_seen.isoformat() if h.last_seen else None,
+            "last_ip": h.last_ip,
+            "ip_changed_at": h.ip_changed_at.isoformat() if h.ip_changed_at else None,
+        })
+    return out
 
 
 # --- EXPORT ---
@@ -2785,7 +2891,7 @@ def dashboard():
             `).join('') + `
                 <div class="bg-gray-900 rounded-xl border border-gray-800 p-4 text-center">
                     <div class="text-xs mt-2 leading-relaxed">${riskSummary}</div>
-                    <div class="text-xs text-gray-500 mt-1 uppercase tracking-wider">AI Risk Summary</div>
+                    <div class="text-xs text-gray-500 mt-1 uppercase tracking-wider">Risk Summary</div>
                 </div>`;
 
             // ── Scan activity bar chart ───────────────────────────────────
@@ -2874,31 +2980,40 @@ def dashboard():
 
             // ── Host table ────────────────────────────────────────────────
             if (!insightHost) {
-                const tbody = document.getElementById('insightHostTableBody');
+                var tbody = document.getElementById('insightHostTableBody');
                 if (!data.hosts.length) {
                     tbody.innerHTML = '<p class="text-xs text-gray-600">No hosts found in this window.</p>';
                 } else {
-                    tbody.innerHTML = `<table class="w-full text-sm">
-                        <thead><tr class="text-left text-gray-500 border-b border-gray-800 text-xs">
-                            <th class="pb-2 pr-4">Host IP</th>
-                            <th class="pb-2 pr-4">Scans</th>
-                            <th class="pb-2 pr-4">Open Ports</th>
-                            <th class="pb-2 pr-4">Findings</th>
-                            <th class="pb-2 pr-4">AI Risk</th>
-                            <th class="pb-2 pr-4">Last Scan</th>
-                            <th class="pb-2">Action</th>
-                        </tr></thead>
-                        <tbody>${data.hosts.map(h => `
-                            <tr class="border-b border-gray-800 hover:bg-gray-800 transition cursor-pointer" onclick="drillIntoHost('${h.ip}')">
-                                <td class="py-2 pr-4 font-mono text-green-400 text-xs">${h.ip}</td>
-                                <td class="py-2 pr-4 text-xs text-gray-300">${h.scan_count}</td>
-                                <td class="py-2 pr-4 text-xs text-gray-300">${h.open_ports}</td>
-                                <td class="py-2 pr-4 text-xs text-gray-300">${h.findings}</td>
-                                <td class="py-2 pr-4">${riskBadgeHtml(h.risk)}</td>
-                                <td class="py-2 pr-4 text-xs text-gray-500">${h.last_scan ? h.last_scan.split('T')[0] : '—'}</td>
-                                <td class="py-2 text-xs text-blue-400 hover:text-blue-300">Drill in →</td>
-                            </tr>`).join('')}
-                        </tbody></table>`;
+                    var hostRows = '';
+                    for (var hi = 0; hi < data.hosts.length; hi++) {
+                        var h = data.hosts[hi];
+                        var nameCell = h.hostname
+                            ? '<span class="text-gray-300">' + h.hostname + '</span>'
+                            : (h.agent_name
+                                ? '<span class="text-blue-400">agent: ' + h.agent_name + '</span>'
+                                : '<span class="text-gray-700 italic">unknown</span>');
+                        var macCell = h.mac ? '<div class="text-gray-600 font-mono text-xs">' + h.mac + '</div>' : '';
+                        var osCell = h.os ? '<div class="text-gray-600 text-xs">' + h.os + '</div>' : '';
+                        var ipWarn = h.ip_changed ? ' <span class="text-yellow-500" title="IP changed from ' + (h.previous_ip || '') + '">\u26a0</span>' : '';
+                        var lastScan = h.last_scan ? h.last_scan.split('T')[0] : '\u2014';
+                        hostRows += '<tr class="border-b border-gray-800 hover:bg-gray-800 transition cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">'
+                            + '<td class="py-2 pr-4"><div class="font-mono text-green-400 text-xs">' + h.ip + ipWarn + '</div>' + osCell + '</td>'
+                            + '<td class="py-2 pr-4"><div class="text-xs">' + nameCell + '</div>' + macCell + '</td>'
+                            + '<td class="py-2 pr-4 text-xs text-gray-300">' + h.scan_count + '</td>'
+                            + '<td class="py-2 pr-4 text-xs text-gray-300">' + h.open_ports + '</td>'
+                            + '<td class="py-2 pr-4 text-xs text-gray-300">' + h.findings + '</td>'
+                            + '<td class="py-2 pr-4">' + riskBadgeHtml(h.risk) + '</td>'
+                            + '<td class="py-2 pr-4 text-xs text-gray-500">' + lastScan + '</td>'
+                            + '<td class="py-2 text-xs text-blue-400">Drill in \u2192</td>'
+                            + '</tr>';
+                    }
+                    tbody.innerHTML = '<table class="w-full text-sm">'
+                        + '<thead><tr class="text-left text-gray-500 border-b border-gray-800 text-xs">'
+                        + '<th class="pb-2 pr-4">Host</th><th class="pb-2 pr-4">Identity</th>'
+                        + '<th class="pb-2 pr-4">Scans</th><th class="pb-2 pr-4">Open Ports</th>'
+                        + '<th class="pb-2 pr-4">Findings</th><th class="pb-2 pr-4">Risk</th>'
+                        + '<th class="pb-2 pr-4">Last Scan</th><th class="pb-2">Action</th>'
+                        + '</tr></thead><tbody>' + hostRows + '</tbody></table>';
                 }
             }
 
@@ -2939,27 +3054,26 @@ def dashboard():
                     }
                 });
 
-                // History table
-                document.getElementById('insightScanHistoryTable').innerHTML = `
-                    <table class="w-full text-sm">
-                        <thead><tr class="text-left text-gray-500 border-b border-gray-800 text-xs">
-                            <th class="pb-2 pr-4">Date</th>
-                            <th class="pb-2 pr-4">Type</th>
-                            <th class="pb-2 pr-4">Profile</th>
-                            <th class="pb-2 pr-4">Open Ports</th>
-                            <th class="pb-2 pr-4">Findings</th>
-                            <th class="pb-2">Risk</th>
-                        </tr></thead>
-                        <tbody>${data.scan_history.map(e => `
-                            <tr class="border-b border-gray-800 text-xs">
-                                <td class="py-2 pr-4 text-gray-400">${e.date || '—'}</td>
-                                <td class="py-2 pr-4 font-mono text-blue-300">${e.type}</td>
-                                <td class="py-2 pr-4 text-gray-400">${e.profile}</td>
-                                <td class="py-2 pr-4 text-gray-300">${e.open_ports}</td>
-                                <td class="py-2 pr-4 text-gray-300">${e.findings}</td>
-                                <td class="py-2">${riskBadgeHtml(e.risk)}</td>
-                            </tr>`).join('')}
-                        </tbody></table>`;
+                // History table — no backticks
+                var histRows = '';
+                for (var si = 0; si < data.scan_history.length; si++) {
+                    var e = data.scan_history[si];
+                    histRows += '<tr class="border-b border-gray-800 text-xs">'
+                        + '<td class="py-2 pr-4 text-gray-400">' + (e.date || '\u2014') + '</td>'
+                        + '<td class="py-2 pr-4 font-mono text-blue-300">' + e.type + '</td>'
+                        + '<td class="py-2 pr-4 text-gray-400">' + e.profile + '</td>'
+                        + '<td class="py-2 pr-4 text-gray-300">' + e.open_ports + '</td>'
+                        + '<td class="py-2 pr-4 text-gray-300">' + e.findings + '</td>'
+                        + '<td class="py-2">' + riskBadgeHtml(e.risk) + '</td>'
+                        + '</tr>';
+                }
+                document.getElementById('insightScanHistoryTable').innerHTML =
+                    '<table class="w-full text-sm">'
+                    + '<thead><tr class="text-left text-gray-500 border-b border-gray-800 text-xs">'
+                    + '<th class="pb-2 pr-4">Date</th><th class="pb-2 pr-4">Type</th>'
+                    + '<th class="pb-2 pr-4">Profile</th><th class="pb-2 pr-4">Open Ports</th>'
+                    + '<th class="pb-2 pr-4">Findings</th><th class="pb-2">Risk</th>'
+                    + '</tr></thead><tbody>' + histRows + '</tbody></table>';
             } else if (insightHost) {
                 document.getElementById('insightScanHistoryTable').innerHTML = '<p class="text-xs text-gray-600">No scan history for this host in the selected window.</p>';
                 chartScanHistory = destroyChart(chartScanHistory);

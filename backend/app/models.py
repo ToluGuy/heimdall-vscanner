@@ -46,11 +46,27 @@ class Job(Base):
     cleared = Column(Boolean, default=False)
 
 
+class Host(Base):
+    __tablename__ = "hosts"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    ip           = Column(String, nullable=False, index=True)
+    mac          = Column(String, nullable=True, index=True)
+    hostname     = Column(String, nullable=True)
+    agent_id     = Column(Integer, ForeignKey("agents.id"), nullable=True)
+    os_fingerprint = Column(String, nullable=True)
+    first_seen   = Column(DateTime, default=datetime.utcnow)
+    last_seen    = Column(DateTime, default=datetime.utcnow)
+    last_ip      = Column(String, nullable=True)       # previous IP if it changed
+    ip_changed_at = Column(DateTime, nullable=True)    # when the IP last changed
+
+
 class Result(Base):
     __tablename__ = "results"
 
     id = Column(Integer, primary_key=True, index=True)
     job_id = Column(Integer, nullable=False)
+    host_id = Column(Integer, ForeignKey("hosts.id"), nullable=True)
     output = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     cleared = Column(Boolean, default=False)

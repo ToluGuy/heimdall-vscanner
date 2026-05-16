@@ -131,20 +131,44 @@ def send_heartbeat(api_key):
 
 def parse_nmap_xml(xml_data):
     root = ET.fromstring(xml_data)
-
     hosts = []
 
     for host in root.findall("host"):
-        addr = host.find("address").get("addr")
+        ip = None
+        mac = None
+        vendor = None
+        for addr_el in host.findall("address"):
+            atype = addr_el.get("addrtype", "")
+            if atype in ("ipv4", "ipv6"):
+                ip = addr_el.get("addr")
+            elif atype == "mac":
+                mac = addr_el.get("addr")
+                vendor = addr_el.get("vendor")
+        if not ip:
+            continue
+
+        hostname = None
+        hostnames_el = host.find("hostnames")
+        if hostnames_el is not None:
+            for hn in hostnames_el.findall("hostname"):
+                if hn.get("type") in ("PTR", "user"):
+                    hostname = hn.get("name")
+                    break
+
+        os_name = None
+        os_el = host.find("os")
+        if os_el is not None:
+            match = os_el.find("osmatch")
+            if match is not None:
+                os_name = match.get("name")
 
         ports_data = []
-
         ports = host.find("ports")
         if ports:
             for port in ports.findall("port"):
                 state = port.find("state").get("state")
-                service = port.find("service").get("name", "unknown")
-
+                svc_el = port.find("service")
+                service = svc_el.get("name", "unknown") if svc_el is not None else "unknown"
                 ports_data.append({
                     "port": int(port.get("portid")),
                     "state": state,
@@ -152,8 +176,12 @@ def parse_nmap_xml(xml_data):
                 })
 
         hosts.append({
-            "host": addr,
-            "ports": ports_data
+            "host": ip,
+            "mac": mac,
+            "vendor": vendor,
+            "hostname": hostname,
+            "os": os_name,
+            "ports": ports_data,
         })
 
     return hosts
@@ -227,8 +255,8 @@ def parse_nse_from_xml(xml_data: str) -> list:
                     continue
                 findings.append({
                     "host": addr,
-                    "port": portid,
-                    "service": service,
+                    "port": None,
+                    "service": None,
                     "script_id": script.get("id"),
                     "output": output,
                 })
