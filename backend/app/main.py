@@ -1935,7 +1935,7 @@ def dashboard():
                     <button onclick="setInsightWindow('24h')" id="iw-24h"
                         class="insight-win text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">24h</button>
                     <button onclick="setInsightWindow('7d')" id="iw-7d"
-                        class="insight-win text-xs px-3 py-1.5 rounded-lg border border-green-500 bg-green-500 bg-opacity-10 text-green-400 transition">7d</button>
+                        class="insight-win text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">7d</button>
                     <button onclick="setInsightWindow('30d')" id="iw-30d"
                         class="insight-win text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">30d</button>
                     <button onclick="setInsightWindow('3m')" id="iw-3m"
@@ -2703,15 +2703,14 @@ def dashboard():
         function setInsightWindow(w) {
             insightWindow = w;
             document.querySelectorAll('.insight-win').forEach(b => {
-                b.classList.remove('border-green-500', 'bg-opacity-10', 'text-green-400');
-                b.classList.add('border-gray-700', 'text-gray-400');
-                // remove bg-green-500 bg-opacity-10 explicitly
+                b.style.borderColor = '#374151';
+                b.style.color = '#9ca3af';
                 b.style.background = '';
             });
             const active = document.getElementById('iw-' + w);
             if (active) {
-                active.classList.remove('border-gray-700', 'text-gray-400');
-                active.classList.add('border-green-500', 'text-green-400');
+                active.style.borderColor = '#4ade80';
+                active.style.color = '#4ade80';
                 active.style.background = 'rgba(74,222,128,0.1)';
             }
             loadInsights();
@@ -2745,6 +2744,19 @@ def dashboard():
         function destroyChart(ref) { if (ref) { ref.destroy(); } return null; }
 
         async function loadInsights() {
+            // Always sync the active window button styling
+            document.querySelectorAll('.insight-win').forEach(b => {
+                b.style.borderColor = '#374151';
+                b.style.color = '#9ca3af';
+                b.style.background = '';
+            });
+            const activeBtn = document.getElementById('iw-' + insightWindow);
+            if (activeBtn) {
+                activeBtn.style.borderColor = '#4ade80';
+                activeBtn.style.color = '#4ade80';
+                activeBtn.style.background = 'rgba(74,222,128,0.1)';
+            }
+
             let url = `/insights?window=${insightWindow}`;
             if (insightHost) url += `&host=${encodeURIComponent(insightHost)}`;
             const res = await apiFetch(url);
