@@ -1357,6 +1357,15 @@ def generate_report(
     return HTMLResponse(content=html)
 
 
+@app.get("/insights")
+def get_insights(
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+    window: str = "7d",   # 24h | 7d | 30d | 3m
+    host: str = None,     # optional — filter to a specific IP
+):
+
+
 # --- DASHBOARD ---
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -1370,6 +1379,7 @@ def dashboard():
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <script src="https://cdn.tailwindcss.com"></script>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
         <style>
             .nav-tab { transition: all 0.15s ease; }
             .nav-tab.active {
