@@ -11,15 +11,16 @@ from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
-
 from typing import List
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from .db import Base, engine, get_db, SessionLocal
 from .models import Agent, Job, Result, DiscoverySweep, Schedule
 from .schemas import AgentCreate, AgentResponse, JobResponse, ResultCreate, ResultResponse, JobCreate
-from dotenv import load_dotenv
 from .logger import get_logger
-
-load_dotenv()
+from .ai_analysis import analyse_scan, AI_AUTO_ANALYSE, AI_PROVIDER
 
 logger = get_logger("vapt.server", "server.log")
 
@@ -172,6 +173,23 @@ def get_agent_by_api_key(api_key: str, db: Session):
     return agent
 
 
+def run_ai_analysis(result_id: int, output: dict):
+    """Background task: generates AI analysis and stores it on the result."""
+    db = SessionLocal()
+    try:
+        analysis = analyse_scan(output)
+        if analysis:
+            result = db.query(Result).filter(Result.id == result_id).first()
+            if result:
+                result.analysis = analysis
+                db.commit()
+                logger.info(f"AI analysis stored for result #{result_id}")
+    except Exception as e:
+        logger.error(f"AI analysis background task failed for result #{result_id}: {e}")
+    finally:
+        db.close()
+
+
 @app.post("/agents/results")
 def submit_result(
     result: ResultCreate,
@@ -192,6 +210,19 @@ def submit_result(
         job.completed_at = datetime.utcnow()
 
     db.commit()
+    db.refresh(new_result)
+
+    # Trigger AI analysis in background if enabled
+    if AI_AUTO_ANALYSE:
+        result_id = new_result.id
+        parsed_output = json.loads(result.output)
+        thread = threading.Thread(
+            target=run_ai_analysis,
+            args=(result_id, parsed_output),
+            daemon=True
+        )
+        thread.start()
+
     return {"message": "Result stored"}
 
 
@@ -232,7 +263,8 @@ def get_results(
             "job_id": r.job_id,
             "output": parsed_output,
             "cleared": r.cleared,
-            "job_info": job_info
+            "job_info": job_info,
+            "analysis": r.analysis,
         })
 
     return response
@@ -682,6 +714,26 @@ def clear_job(job_id: int, db: Session = Depends(get_db)):
     job.cleared = True
     db.commit()
     return {"ok": True, "action": "archived"}
+
+
+@app.post("/results/{result_id}/analyse")
+def trigger_analysis(
+    result_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    result = db.query(Result).filter(Result.id == result_id).first()
+    if not result:
+        raise HTTPException(status_code=404, detail="Result not found")
+
+    parsed_output = json.loads(result.output)
+    thread = threading.Thread(
+        target=run_ai_analysis,
+        args=(result_id, parsed_output),
+        daemon=True
+    )
+    thread.start()
+    return {"ok": True, "message": "Analysis started"}
 
 
 # --- SCHEDULES ---
@@ -1309,7 +1361,8 @@ def generate_report(
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    return """
+    ai_provider_name = AI_PROVIDER or "none"
+    html = """
     <!DOCTYPE html>
     <html lang="en">
     <head>
@@ -2095,6 +2148,47 @@ def dashboard():
             }).join('');
             return `${warningHtml}<p class="text-xs text-gray-400 mb-2">${findings.length} NSE finding(s):</p><div class="space-y-2">${rows}</div>`;
         }
+        function renderAnalysis(analysis) {
+            if (!analysis) return '';
+
+            // Parse risk level for badge colour
+            const riskMatch = analysis.match(/##\\s*Risk Level\\s*\\n+(\\w+)/i);
+            const risk = riskMatch ? riskMatch[1].toUpperCase() : null;
+            const riskColour = {
+                CRITICAL: 'bg-red-900 text-red-200 border-red-700',
+                HIGH:     'bg-orange-900 text-orange-200 border-orange-700',
+                MEDIUM:   'bg-yellow-900 text-yellow-200 border-yellow-700',
+                LOW:      'bg-blue-900 text-blue-200 border-blue-700',
+                INFO:     'bg-gray-800 text-gray-300 border-gray-600',
+            }[risk] || 'bg-gray-800 text-gray-300 border-gray-600';
+
+            // Convert markdown to simple HTML
+            const html = analysis
+                .replace(/^## (.+)$/gm, '<h4 class="text-xs font-bold uppercase tracking-wider text-gray-400 mt-4 mb-2 border-b border-gray-700 pb-1">$1</h4>')
+                .replace(/^\\*\\*(CRITICAL|HIGH|MEDIUM|LOW|INFO)\\*\\* (.+)$/gm, (_, sev, rest) => {
+                    const c = {CRITICAL:'text-red-400',HIGH:'text-orange-400',MEDIUM:'text-yellow-400',LOW:'text-blue-400',INFO:'text-gray-400'}[sev] || 'text-gray-400';
+                    return `<p class="text-xs mt-2"><span class="font-bold ${c}">[${sev}]</span> <span class="text-gray-200 font-semibold">${rest}</span></p>`;
+                })
+                .replace(/^\\*\\*(.+?)\\*\\*/gm, '<strong class="text-gray-200">$1</strong>')
+                .replace(/^(\\d+\\.) (.+)$/gm, '<div class="flex gap-2 text-xs mt-1"><span class="text-gray-500 flex-shrink-0">$1</span><span class="text-gray-300">$2</span></div>')
+                .replace(/^- (.+)$/gm, '<div class="flex gap-2 text-xs mt-1"><span class="text-gray-500 flex-shrink-0">•</span><span class="text-gray-300">$1</span></div>')
+                .replace(/\\n\\n/g, '<div class="mt-2"></div>')
+                .replace(/\\n/g, ' ');
+
+            return `
+            <div class="mt-2 bg-gray-900 rounded-lg border border-gray-700 overflow-hidden">
+                <div class="flex items-center gap-3 px-4 py-3 border-b border-gray-700">
+                    <span class="text-xs font-bold uppercase tracking-wider text-purple-400">Analysis</span>
+                    ${risk ? `<span class="text-xs px-2 py-0.5 rounded-full border font-semibold ${riskColour}">${risk}</span>` : ''}
+                    <span class="text-xs text-gray-600 ml-auto">Powered by ${AI_PROVIDER}</span>
+                </div>
+                <div class="px-4 py-3 text-xs text-gray-300 leading-relaxed">${html}</div>
+            </div>`;
+        }
+        async function triggerAnalysis(result_id) {
+            await apiFetch(`/results/${result_id}/analyse`, { method: 'POST' });
+            setTimeout(() => loadResults(), 4000);
+        }
         function renderJobInfo(job_info) {
             if (!job_info) return '';
             return `<div class="mb-4 bg-gray-900 rounded-lg p-3 border border-gray-700"><p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">Associated Job</p><div class="grid grid-cols-2 gap-x-6 gap-y-1 text-xs"><div><span class="text-gray-500">Job ID:</span> <span class="text-gray-200 font-mono">#${job_info.id}</span></div><div><span class="text-gray-500">Target:</span> <span class="text-gray-200 font-mono">${job_info.target}</span></div><div><span class="text-gray-500">Type:</span> <span class="text-gray-200">${job_info.type}</span></div><div><span class="text-gray-500">Mode:</span> <span class="text-gray-200">${job_info.mode}</span></div><div><span class="text-gray-500">Profile:</span> <span class="text-gray-200">${job_info.profile}</span></div><div><span class="text-gray-500">Priority:</span> <span class="text-gray-200">${job_info.priority}</span></div><div class="col-span-2"><span class="text-gray-500">Completed:</span> <span class="text-gray-200">${formatTimestamp(job_info.completed_at)}</span></div></div></div>`;
@@ -2116,9 +2210,23 @@ def dashboard():
                 const nseCount = out.nse ? (out.nse.findings || []).length : 0;
                 const summary = [out.nmap ? `${nmapCount} open port(s)` : null, out.nikto ? `${niktoCount} web finding(s)` : null, out.nse ? `${nseCount} NSE finding(s)` : null].filter(Boolean).join(' · ') || 'No data';
                 const actions = isHistory
-                    ? `<div class="flex items-center gap-3"><input type="checkbox" class="result-checkbox accent-red-500" data-id="${r.id}"><a href="/report/${r.id}" target="_blank" class="text-xs text-cyan-400 hover:text-cyan-300 transition">Report</a><button onclick="deleteResult(${r.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button></div>`
-                    : `<div class="flex items-center gap-3"><input type="checkbox" class="result-checkbox accent-yellow-500" data-id="${r.id}"><a href="/report/${r.id}" target="_blank" class="text-xs text-cyan-400 hover:text-cyan-300 transition">Report</a><button onclick="clearResult(${r.id})" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button></div>`;
-                return `<div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden"><div class="flex items-center justify-between px-5 py-4 cursor-pointer hover:bg-gray-750 transition" onclick="toggleResult(${r.id})"><div class="flex items-center gap-4"><span class="text-sm font-semibold text-white">Result #${r.id}</span><span class="text-xs text-gray-400">Job #${r.job_id}</span><span class="text-xs text-gray-500">${summary}</span></div><div class="flex items-center gap-4" onclick="event.stopPropagation()">${actions}<span id="result-arrow-${r.id}" class="text-gray-400 text-xs pointer-events-none">▼</span></div></div><div id="result-body-${r.id}" class="hidden px-5 pb-5 border-t border-gray-700 pt-4">${isHistory ? renderJobInfo(r.job_info) : ''}${out.nmap ? `<div class="mb-4"><p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Nmap</p>${renderNmapResult(out.nmap)}</div>` : ''}${out.nikto ? `<div class="mb-4"><p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Nikto</p>${renderNiktoResult(out.nikto)}</div>` : ''}${out.nse ? `<div class="mb-4"><p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">NSE</p>${renderNseResult(out.nse)}</div>` : ''}${!out.nmap && !out.nikto && !out.nse ? `<pre class="text-xs text-gray-400 overflow-x-auto">${JSON.stringify(out, null, 2)}</pre>` : ''}</div></div>`;
+                    ? `<div class="flex items-center gap-3">
+                    <input type="checkbox" class="result-checkbox accent-red-500" data-id="${r.id}">
+                    <a href="/report/${r.id}" target="_blank" class="text-xs text-cyan-400 hover:text-cyan-300 transition">Report</a>
+                    <button onclick="deleteResult(${r.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button>
+                    </div>`
+                    : `<div class="flex items-center gap-3">
+                    <input type="checkbox" class="result-checkbox accent-yellow-500" data-id="${r.id}">
+                    <a href="/report/${r.id}" target="_blank" class="text-xs text-cyan-400 hover:text-cyan-300 transition">Report</a>
+                    <button onclick="triggerAnalysis(${r.id})" class="text-xs text-purple-400 hover:text-purple-300 transition">Analyse</button>
+                    <button onclick="clearResult(${r.id})" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button></div>`;
+                return `<div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+                <div class="flex items-center justify-between px-5 py-4 cursor-pointer hover:bg-gray-750 transition" 
+                onclick="toggleResult(${r.id})">
+                <div class="flex items-center gap-4">
+                <span class="text-sm font-semibold text-white">Result #${r.id}</span>
+                <span class="text-xs text-gray-400">Job #${r.job_id}</span>
+                <span class="text-xs text-gray-500">${summary}</span></div><div class="flex items-center gap-4" onclick="event.stopPropagation()">${actions}<span id="result-arrow-${r.id}" class="text-gray-400 text-xs pointer-events-none">▼</span></div></div><div id="result-body-${r.id}" class="hidden px-5 pb-5 border-t border-gray-700 pt-4">${isHistory ? renderJobInfo(r.job_info) : ''}${out.nmap ? `<div class="mb-4"><p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Nmap</p>${renderNmapResult(out.nmap)}</div>` : ''}${out.nikto ? `<div class="mb-4"><p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Nikto</p>${renderNiktoResult(out.nikto)}</div>` : ''}${out.nse ? `<div class="mb-4"><p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">NSE</p>${renderNseResult(out.nse)}</div>` : ''}${!out.nmap && !out.nikto && !out.nse ? `<pre class="text-xs text-gray-400 overflow-x-auto">${JSON.stringify(out, null, 2)}</pre>` : ''}${r.analysis ? `<div class="mb-4">${renderAnalysis(r.analysis)}</div>` : `<div class="mb-2 flex items-center gap-3"><span class="text-xs text-gray-600 italic">Analysis pending - Click Analyse above to generate</span></div>`}</div></div>`;
             }).join('');
             document.getElementById("results").innerHTML = html;
         }
@@ -2236,8 +2344,19 @@ def dashboard():
             const el = document.getElementById("sweepHistory");
             if (!sweeps.length) { el.innerHTML = '<p class="text-gray-600 text-xs">No sweeps yet.</p>'; return; }
             const statusColor = { running: 'text-blue-400', done: 'text-green-400', failed: 'text-red-400' };
-            const rows = sweeps.map(s => `<tr class="border-b border-gray-800 hover:bg-gray-800 transition text-xs"><td class="py-2 pr-4 text-gray-400">#${s.id}</td><td class="py-2 pr-4 font-mono">${s.subnet}</td><td class="py-2 pr-4 ${statusColor[s.status] || 'text-gray-400'}">${s.status}</td><td class="py-2 pr-4 text-gray-300">${s.hosts_found} host(s)</td><td class="py-2 pr-4 text-gray-300">${s.jobs_created} job(s)</td><td class="py-2 pr-4 text-gray-500">${formatTimestamp(s.started_at)}</td><td class="py-2"><button onclick="deleteSweep(${s.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button></td></tr>`).join('');
-            el.innerHTML = `<table class="w-full text-sm"><thead><tr class="text-left text-gray-500 border-b border-gray-800"><th class="pb-2 pr-4">ID</th><th class="pb-2 pr-4">Subnet</th><th class="pb-2 pr-4">Status</th><th class="pb-2 pr-4">Hosts</th><th class="pb-2 pr-4">Jobs</th><th class="pb-2 pr-4">Started</th><th class="pb-2">Action</th></tr></thead><tbody>${rows}</tbody></table>`;
+            const rows = sweeps.map(s => `<tr class="border-b border-gray-800 hover:bg-gray-800 transition text-xs">
+            <td class="py-2 pr-4 text-gray-400">#${s.id}</td>
+            <td class="py-2 pr-4 font-mono">${s.subnet}</td>
+            <td class="py-2 pr-4 ${statusColor[s.status] || 'text-gray-400'}">${s.status}</td>
+            <td class="py-2 pr-4 text-gray-300">${s.hosts_found} host(s)</td>
+            <td class="py-2 pr-4 text-gray-300">${s.jobs_created} job(s)</td>
+            <td class="py-2 pr-4 text-gray-500">${formatTimestamp(s.started_at)}</td>
+            <td class="py-2"><button onclick="deleteSweep(${s.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button></td></tr>`).join('');
+            el.innerHTML = `<table class="w-full text-sm"><thead>
+            <tr class="text-left text-gray-500 border-b border-gray-800">
+            <th class="pb-2 pr-4">ID</th><th class="pb-2 pr-4">Subnet</th><th class="pb-2 pr-4">Status</th><th class="pb-2 pr-4">Hosts</th>
+            <th class="pb-2 pr-4">Jobs</th><th class="pb-2 pr-4">Started</th>
+            <th class="pb-2">Action</th></tr></thead><tbody>${rows}</tbody></table>`;
         }
 
         async function deleteSweep(sweep_id) {
@@ -2254,11 +2373,39 @@ def dashboard():
             const data = await res.json();
             const el = document.getElementById("schedules");
             if (!data.length) { el.innerHTML = '<p class="text-gray-500 text-sm">No schedules yet.</p>'; return; }
-            let html = `<table class="w-full text-sm"><thead><tr class="text-left text-gray-400 border-b border-gray-800"><th class="pb-2 pr-3">Name</th><th class="pb-2 pr-3">Type</th><th class="pb-2 pr-3">Target</th><th class="pb-2 pr-3">Profile</th><th class="pb-2 pr-3">Every</th><th class="pb-2 pr-3">Status</th><th class="pb-2 pr-3">Last Run</th><th class="pb-2 pr-3">Next Run</th><th class="pb-2">Actions</th></tr></thead><tbody>`;
+            let html = `<table class="w-full text-sm">
+            <thead><tr class="text-left text-gray-400 border-b border-gray-800">
+            <th class="pb-2 pr-3">Name</th>
+            <th class="pb-2 pr-3">Type</th>
+            <th class="pb-2 pr-3">Target</th>
+            <th class="pb-2 pr-3">Profile</th>
+            <th class="pb-2 pr-3">Every</th>
+            <th class="pb-2 pr-3">Status</th>
+            <th class="pb-2 pr-3">Last Run</th>
+            <th class="pb-2 pr-3">Next Run</th>
+            <th class="pb-2">Actions</th>
+            </tr></thead><tbody>`;
+            
             data.forEach(s => {
-                const badge = s.paused ? '<span class="text-xs px-2 py-0.5 rounded-full bg-yellow-900 text-yellow-300 border border-yellow-700">paused</span>' : '<span class="text-xs px-2 py-0.5 rounded-full bg-green-900 text-green-300 border border-green-700">active</span>';
-                const toggle = s.paused ? `<button onclick="resumeSchedule(${s.id})" class="text-xs text-blue-400 hover:text-blue-300 transition">Resume</button>` : `<button onclick="pauseSchedule(${s.id})" class="text-xs text-yellow-400 hover:text-yellow-300 transition">Pause</button>`;
-                html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition"><td class="py-2 pr-3 font-medium text-sm">${s.name}</td><td class="py-2 pr-3 font-mono text-xs text-blue-300">${s.type}</td><td class="py-2 pr-3 font-mono text-xs">${s.target}</td><td class="py-2 pr-3 text-xs text-gray-300">${s.profile}</td><td class="py-2 pr-3 text-xs text-gray-300">${s.interval_hours}h</td><td class="py-2 pr-3">${badge}</td><td class="py-2 pr-3 text-xs text-gray-400">${formatTimestamp(s.last_run_at)}</td><td class="py-2 pr-3 text-xs text-gray-400">${s.paused ? '—' : formatTimestamp(s.next_run_at)}</td><td class="py-2 flex gap-3">${toggle}<button onclick="deleteSchedule(${s.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button></td></tr>`;
+                const badge = s.paused 
+                ? '<span class="text-xs px-2 py-0.5 rounded-full bg-yellow-900 text-yellow-300 border border-yellow-700">paused</span>' 
+                : '<span class="text-xs px-2 py-0.5 rounded-full bg-green-900 text-green-300 border border-green-700">active</span>';
+                
+                const toggle = s.paused 
+                ? `<button onclick="resumeSchedule(${s.id})" class="text-xs text-blue-400 hover:text-blue-300 transition">Resume</button>` 
+                : `<button onclick="pauseSchedule(${s.id})" class="text-xs text-yellow-400 hover:text-yellow-300 transition">Pause</button>`;
+                html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition">
+                <td class="py-2 pr-3 font-medium text-sm">${s.name}</td>
+                <td class="py-2 pr-3 font-mono text-xs text-blue-300">${s.type}</td>
+                <td class="py-2 pr-3 font-mono text-xs">${s.target}</td>
+                <td class="py-2 pr-3 text-xs text-gray-300">${s.profile}</td>
+                <td class="py-2 pr-3 text-xs text-gray-300">${s.interval_hours}h</td>
+                <td class="py-2 pr-3">${badge}</td>
+                <td class="py-2 pr-3 text-xs text-gray-400">${formatTimestamp(s.last_run_at)}</td>
+                <td class="py-2 pr-3 text-xs text-gray-400">${s.paused ? '—' : formatTimestamp(s.next_run_at)}</td>
+                <td class="py-2 flex gap-3">
+                ${toggle}
+                <button onclick="deleteSchedule(${s.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button></td></tr>`;
             });
             html += '</tbody></table>';
             el.innerHTML = html;
@@ -2271,10 +2418,18 @@ def dashboard():
             const mode = document.getElementById("sched_mode").value;
             const priority = document.getElementById("sched_priority").value;
             const interval = document.getElementById("sched_interval").value.trim();
+            
             if (!name || !target || !interval) { alert("Name, target, and interval are required."); return; }
             if (parseInt(interval) < 1) { alert("Interval must be at least 1 hour."); return; }
-            const res = await apiFetch('/schedules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, target, type, profile, mode, priority, interval_hours: parseInt(interval) }) });
+            
+            const res = await apiFetch('/schedules', { 
+            method: 'POST', 
+            headers: { 'Content-Type': 'application/json' }, 
+            body: JSON.stringify({ name, target, type, profile, mode, priority, interval_hours: parseInt(interval) }) 
+            });
+            
             if (!res) return;
+            
             if (res.status === 400) { const err = await res.json(); alert(`Failed: ${err.detail}`); return; }
             document.getElementById("sched_name").value = "";
             document.getElementById("sched_target").value = "";
@@ -2289,8 +2444,13 @@ def dashboard():
 
         // ── AUTO POLL ──────────────────────────────────────────────────────
         setInterval(() => { loadAgents(); loadJobs(); }, 5000);
+        
+        const AI_PROVIDER = '__AI_PROVIDER__';
 
         </script>
     </body>
     </html>
     """
+    html = html.replace("__AI_PROVIDER__", ai_provider_name)
+    return html
+    

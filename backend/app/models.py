@@ -54,6 +54,7 @@ class Result(Base):
     output = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     cleared = Column(Boolean, default=False)
+    analysis = Column(Text, nullable=True)
 
 
 class DiscoverySweep(Base):

@@ -36,6 +36,7 @@ class ResultResponse(BaseModel):
     output: Any
     cleared: bool = False
     job_info: Optional[Any] = None
+    analysis: Optional[str] = None
 
     class Config:
         from_attributes = True
