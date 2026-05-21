@@ -389,18 +389,26 @@ def run_nikto(target: str, port: int, profile: str = "standard"):
         logger.debug(f"Nikto returncode: {result.returncode}")
         logger.debug(f"Nikto stderr: {result.stderr[:200] if result.stderr else 'none'}")
 
+        # returncode 124 means `timeout` killed the process — treat as timeout
+        if result.returncode == 124:
+            logger.warning(f"Nikto timed out on {target}:{port}")
+            return {"error": "Nikto timed out"}
+
         if os.path.exists(tmp_path):
-            with open(tmp_path, "r") as f:
+            with open(tmp_path, "r", errors="replace") as f:
                 content = f.read().strip()
             if content:
                 try:
                     return json.loads(content)
                 except json.JSONDecodeError:
-                    return {"raw": content}
+                    # Truncate raw output to avoid sending huge/corrupt payloads
+                    safe = content[:4000] if len(content) > 4000 else content
+                    return {"raw": safe}
 
-        return {"raw": result.stdout or result.stderr or "no output"}
+        return {"raw": result.stdout[:4000] if result.stdout else (result.stderr[:1000] if result.stderr else "no output")}
 
     except subprocess.TimeoutExpired:
+        logger.warning(f"Nikto subprocess timeout on {target}:{port}")
         return {"error": "Nikto timed out"}
     finally:
         if os.path.exists(tmp_path):

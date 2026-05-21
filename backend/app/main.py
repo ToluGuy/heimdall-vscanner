@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from .db import Base, engine, get_db, SessionLocal
-from .models import Agent, Job, Result, DiscoverySweep, Schedule
+from .models import Agent, Job, Result, DiscoverySweep, Schedule, Host
 from .schemas import AgentCreate, AgentResponse, JobResponse, ResultCreate, ResultResponse, JobCreate
 from .logger import get_logger
 from .ai_analysis import analyse_scan, AI_AUTO_ANALYSE, AI_PROVIDER
@@ -180,7 +180,6 @@ def find_or_create_host(db: Session, ip: str, mac: str = None, hostname: str = N
     Priority: agent_id > MAC > hostname > IP.
     Updates metadata and logs IP changes.
     """
-    from .models import Host
     now = datetime.utcnow()
     host = None
 
@@ -441,7 +440,6 @@ def delete_result(
 
 @app.get("/hosts")
 def get_hosts(db: Session = Depends(get_db), username: str = Depends(require_auth)):
-    from .models import Host
     hosts = db.query(Host).order_by(Host.last_seen.desc()).all()
     out = []
     for h in hosts:
@@ -464,6 +462,24 @@ def get_hosts(db: Session = Depends(get_db), username: str = Depends(require_aut
             "ip_changed_at": h.ip_changed_at.isoformat() if h.ip_changed_at else None,
         })
     return out
+
+
+@app.delete("/hosts/{host_id}")
+def delete_host(
+    host_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    """Permanently removes a host from the registry. Does not delete its scan results."""
+    host = db.query(Host).filter(Host.id == host_id).first()
+    if not host:
+        raise HTTPException(status_code=404, detail="Host not found")
+    # Unlink results so they don't reference a deleted host
+    db.query(Result).filter(Result.host_id == host_id).update({"host_id": None})
+    db.delete(host)
+    db.commit()
+    logger.info(f"Host #{host_id} ({host.ip}) removed from registry")
+    return {"ok": True}
 
 
 # --- EXPORT ---
@@ -1463,6 +1479,123 @@ def generate_report(
     return HTMLResponse(content=html)
 
 
+# --- TOPOLOGY ---
+
+@app.get("/topology")
+def get_topology(
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    """
+    Returns Cytoscape-format graph data for the network topology map.
+
+    Nodes: every known host from the hosts table, enriched with latest risk level.
+    Edges (two layers):
+      1. Subnet edges — hosts sharing a /24 subnet are connected to the inferred gateway (.1)
+      2. Sweep edges — hosts discovered together in the same sweep are connected to each other
+    """
+    import re as _re
+
+    # ── Gather all hosts ──────────────────────────────────────────────────────
+    hosts = db.query(Host).all()
+    if not hosts:
+        return {"nodes": [], "edges": []}
+
+    # For each host, find its latest result to get risk + port count
+    host_meta = {}  # ip -> {risk, open_ports, scan_count, hostname, agent_name, os}
+    for h in hosts:
+        # Get latest result via most recent job for this IP
+        latest_job = (
+            db.query(Job)
+            .filter(Job.target == h.ip, Job.status == "done")
+            .order_by(Job.completed_at.desc())
+            .first()
+        )
+        risk = "UNANALYSED"
+        open_ports = 0
+        scan_count = db.query(Job).filter(Job.target == h.ip, Job.status == "done").count()
+
+        if latest_job:
+            result = db.query(Result).filter(Result.job_id == latest_job.id).first()
+            if result:
+                if result.analysis:
+                    m = _re.search(r"##\s*Risk Level\s*\n+(\w+)", result.analysis, _re.IGNORECASE)
+                    risk = m.group(1).upper() if m else "INFO"
+                try:
+                    out = json.loads(result.output)
+                    for nh in out.get("nmap", []):
+                        open_ports += len([p for p in nh.get("ports", []) if p.get("state") == "open"])
+                except Exception:
+                    pass
+
+        agent_name = None
+        if h.agent_id:
+            agent = db.query(Agent).filter(Agent.id == h.agent_id).first()
+            if agent:
+                agent_name = agent.name
+
+        host_meta[h.ip] = {
+            "id": h.ip,
+            "db_id": h.id,
+            "hostname": h.hostname or "",
+            "agent_name": agent_name or "",
+            "os": h.os_fingerprint or "",
+            "mac": h.mac or "",
+            "risk": risk,
+            "open_ports": open_ports,
+            "scan_count": scan_count,
+            "has_agent": h.agent_id is not None,
+        }
+
+    # ── Build nodes ───────────────────────────────────────────────────────────
+    nodes = [{"data": meta} for meta in host_meta.values()]
+
+    # ── Build edges ───────────────────────────────────────────────────────────
+    edges = []
+    seen_edges = set()
+
+    def add_edge(src, tgt, etype):
+        key = tuple(sorted([src, tgt])) + (etype,)
+        if key not in seen_edges and src != tgt:
+            seen_edges.add(key)
+            edges.append({"data": {"source": src, "target": tgt, "type": etype}})
+
+    # Layer 1 — subnet edges: each host connects to its inferred gateway (x.x.x.1)
+    all_ips = list(host_meta.keys())
+    for ip in all_ips:
+        parts = ip.split(".")
+        if len(parts) == 4:
+            gateway = parts[0] + "." + parts[1] + "." + parts[2] + ".1"
+            if gateway in host_meta and gateway != ip:
+                add_edge(gateway, ip, "subnet")
+
+    # Layer 2 — sweep edges: hosts found in the same discovery sweep
+    sweeps = db.query(DiscoverySweep).filter(DiscoverySweep.status == "done").all()
+    for sweep in sweeps:
+        if not sweep.result:
+            continue
+        try:
+            sweep_hosts = json.loads(sweep.result)  # list of IP strings
+        except Exception:
+            continue
+        # Only include IPs we have in our host registry
+        known = [ip for ip in sweep_hosts if ip in host_meta]
+        # Infer gateway from subnet
+        parts = sweep.subnet.split("/")[0].split(".")
+        gateway = parts[0] + "." + parts[1] + "." + parts[2] + ".1" if len(parts) == 4 else None
+        for ip in known:
+            if gateway and gateway in host_meta and ip != gateway:
+                add_edge(gateway, ip, "sweep")
+            # Connect non-gateway hosts to each other only if small sweep (<=10 hosts)
+            # to avoid a fully-connected hairball on large networks
+            if len(known) <= 10:
+                for other in known:
+                    if other != ip:
+                        add_edge(ip, other, "sweep")
+
+    return {"nodes": nodes, "edges": edges}
+
+
 # --- INSIGHTS ---
 
 @app.get("/insights")
@@ -1648,6 +1781,7 @@ def dashboard():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <script src="https://cdn.tailwindcss.com"></script>
         <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
         <style>
             .nav-tab { transition: all 0.15s ease; }
             .nav-tab.active {
@@ -1757,6 +1891,10 @@ def dashboard():
                 <button onclick="switchTab('insights')" id="nav-insights"
                     class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
                     Insights
+                </button>
+                <button onclick="switchTab('topology')" id="nav-topology"
+                    class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
+                    Topology
                 </button>
             </nav>
 
@@ -2106,6 +2244,90 @@ def dashboard():
         </div>
         </div>
 
+        <!-- ── TAB: TOPOLOGY ───────────────────────────────────────────── -->
+        <div id="tab-topology" class="tab-panel">
+        <div class="max-w-screen-xl mx-auto px-6 py-8">
+
+            <!-- Controls row -->
+            <div class="flex items-center justify-between flex-wrap gap-4 mb-5">
+                <div class="flex items-center gap-3 flex-wrap">
+                    <span class="text-xs text-gray-500">Layout:</span>
+                    <button onclick="setTopoLayout('cose')" id="tl-cose"
+                        class="topo-layout text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">Force</button>
+                    <button onclick="setTopoLayout('grid')" id="tl-grid"
+                        class="topo-layout text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">Grid</button>
+                    <button onclick="setTopoLayout('concentric')" id="tl-concentric"
+                        class="topo-layout text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">Concentric</button>
+                    <span class="text-gray-700 mx-1">|</span>
+                    <span class="text-xs text-gray-500">Filter:</span>
+                    <button onclick="setTopoFilter('all')" id="tf-all"
+                        class="topo-filter text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">All</button>
+                    <button onclick="setTopoFilter('CRITICAL')" id="tf-CRITICAL"
+                        class="topo-filter text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-red-500 hover:text-red-300 transition">Critical</button>
+                    <button onclick="setTopoFilter('HIGH')" id="tf-HIGH"
+                        class="topo-filter text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-orange-400 hover:text-orange-200 transition">High</button>
+                    <button onclick="setTopoFilter('MEDIUM')" id="tf-MEDIUM"
+                        class="topo-filter text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-yellow-400 hover:text-yellow-200 transition">Medium</button>
+                </div>
+                <div class="flex items-center gap-2">
+                    <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
+                        <input type="checkbox" id="topoShowLabels" checked onchange="refreshTopoStyles()" class="accent-green-500"> Labels
+                    </label>
+                    <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
+                        <input type="checkbox" id="topoShowSweepEdges" checked onchange="applyTopoFilter()" class="accent-green-500"> Sweep edges
+                    </label>
+                    <button onclick="loadTopology()" class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-400 transition ml-2">↻ Refresh</button>
+                    <button onclick="topoFitView()" class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-400 transition">Fit</button>
+                </div>
+            </div>
+
+            <!-- Legend -->
+            <div class="flex items-center gap-5 mb-4 flex-wrap">
+                <span class="text-xs text-gray-600">Risk:</span>
+                <span class="flex items-center gap-1.5 text-xs text-red-400"><span class="w-3 h-3 rounded-full bg-red-500 inline-block"></span>Critical</span>
+                <span class="flex items-center gap-1.5 text-xs text-orange-400"><span class="w-3 h-3 rounded-full bg-orange-500 inline-block"></span>High</span>
+                <span class="flex items-center gap-1.5 text-xs text-yellow-400"><span class="w-3 h-3 rounded-full bg-yellow-500 inline-block"></span>Medium</span>
+                <span class="flex items-center gap-1.5 text-xs text-blue-400"><span class="w-3 h-3 rounded-full bg-blue-500 inline-block"></span>Low</span>
+                <span class="flex items-center gap-1.5 text-xs text-gray-400"><span class="w-3 h-3 rounded-full bg-gray-500 inline-block"></span>Info/Unanalysed</span>
+                <span class="flex items-center gap-1.5 text-xs text-green-400"><span class="w-3 h-3 rounded-full border-2 border-green-400 inline-block"></span>Has Agent</span>
+                <span class="text-gray-700 mx-1">|</span>
+                <span class="text-xs text-gray-600">Edges:</span>
+                <span class="flex items-center gap-1.5 text-xs text-gray-400"><span class="inline-block w-6 border-t border-gray-500"></span>Subnet</span>
+                <span class="flex items-center gap-1.5 text-xs text-cyan-500"><span class="inline-block w-6 border-t border-dashed border-cyan-500"></span>Sweep</span>
+            </div>
+
+            <!-- Map canvas -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 relative" style="height: 600px;">
+                <div id="topoContainer" style="width:100%;height:100%;border-radius:0.75rem;"></div>
+                <div id="topoEmpty" class="hidden absolute inset-0 flex items-center justify-center">
+                    <div class="text-center">
+                        <p class="text-gray-600 text-sm">No hosts in the registry yet.</p>
+                        <p class="text-gray-700 text-xs mt-1">Run scans to start building the topology map.</p>
+                    </div>
+                </div>
+                <div id="topoLoading" class="absolute inset-0 flex items-center justify-center">
+                    <div class="text-center">
+                        <div class="w-5 h-5 rounded-full bg-green-400 animate-pulse mx-auto mb-3"></div>
+                        <p class="text-gray-500 text-xs">Loading topology...</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Node detail panel -->
+            <div id="topoDetail" class="hidden mt-4 bg-gray-900 rounded-xl border border-gray-800 p-5">
+                <div class="flex items-start justify-between mb-3">
+                    <h3 class="text-sm font-semibold text-green-400" id="topoDetailTitle">Host</h3>
+                    <div class="flex items-center gap-3">
+                        <button id="topoDetailDeleteBtn" onclick="deleteTopoHost()" class="text-xs text-red-500 hover:text-red-300 transition">Remove from registry</button>
+                        <button onclick="document.getElementById('topoDetail').classList.add('hidden')" class="text-gray-600 hover:text-gray-400 transition text-sm">✕</button>
+                    </div>
+                </div>
+                <div id="topoDetailBody" class="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs"></div>
+            </div>
+
+        </div>
+        </div>
+
         <!-- ── SCRIPTS ──────────────────────────────────────────────────── -->
         <script>
         // ── STATE ──────────────────────────────────────────────────────────
@@ -2136,6 +2358,7 @@ def dashboard():
             if (tab === 'discovery') { loadSweepHistory(); }
             if (tab === 'schedules') { loadSchedules(); }
             if (tab === 'insights') { loadInsights(); }
+            if (tab === 'topology') { loadTopology(); }
         }
 
         // ── AUTH ───────────────────────────────────────────────────────────
@@ -3080,7 +3303,252 @@ def dashboard():
             }
         }
 
-        
+        // ── TOPOLOGY ───────────────────────────────────────────────────────
+        let cyInstance = null;
+        let topoData = null;
+        let topoLayout = 'cose';
+        let topoFilter = 'all';
+
+        const RISK_COLOR = {
+            CRITICAL:   '#ef4444',
+            HIGH:       '#f97316',
+            MEDIUM:     '#eab308',
+            LOW:        '#3b82f6',
+            INFO:       '#6b7280',
+            UNANALYSED: '#374151',
+        };
+
+        function riskNodeColor(risk) {
+            return RISK_COLOR[risk] || RISK_COLOR.UNANALYSED;
+        }
+
+        function setTopoLayout(l) {
+            topoLayout = l;
+            document.querySelectorAll('.topo-layout').forEach(function(b) {
+                b.style.borderColor = '#374151';
+                b.style.color = '#9ca3af';
+                b.style.background = '';
+            });
+            var btn = document.getElementById('tl-' + l);
+            if (btn) {
+                btn.style.borderColor = '#4ade80';
+                btn.style.color = '#4ade80';
+                btn.style.background = 'rgba(74,222,128,0.1)';
+            }
+            if (cyInstance) {
+                cyInstance.layout({ name: topoLayout, animate: true, animationDuration: 400, padding: 40 }).run();
+            }
+        }
+
+        function setTopoFilter(f) {
+            topoFilter = f;
+            document.querySelectorAll('.topo-filter').forEach(function(b) {
+                b.style.borderColor = '#374151';
+                b.style.background = '';
+                b.style.fontWeight = '';
+            });
+            var btn = document.getElementById('tf-' + f);
+            if (btn) {
+                btn.style.borderColor = '#4ade80';
+                btn.style.background = 'rgba(74,222,128,0.1)';
+                btn.style.fontWeight = '600';
+            }
+            applyTopoFilter();
+        }
+
+        function applyTopoFilter() {
+            if (!cyInstance) return;
+            var showSweep = document.getElementById('topoShowSweepEdges').checked;
+            cyInstance.elements().show();
+            if (!showSweep) {
+                cyInstance.edges('[type = "sweep"]').hide();
+            }
+            if (topoFilter !== 'all') {
+                cyInstance.nodes().forEach(function(n) {
+                    if (n.data('risk') !== topoFilter) {
+                        n.hide();
+                        n.connectedEdges().hide();
+                    }
+                });
+            }
+        }
+
+        function refreshTopoStyles() {
+            if (!cyInstance) return;
+            var showLabels = document.getElementById('topoShowLabels').checked;
+            cyInstance.style()
+                .selector('node')
+                .style('label', showLabels ? 'data(label)' : '')
+                .update();
+        }
+
+        function topoFitView() {
+            if (cyInstance) cyInstance.fit(40);
+        }
+
+        function initCytoscape(elements) {
+            if (cyInstance) { cyInstance.destroy(); cyInstance = null; }
+            var showLabels = document.getElementById('topoShowLabels').checked;
+
+            cyInstance = cytoscape({
+                container: document.getElementById('topoContainer'),
+                elements: elements,
+                style: [
+                    {
+                        selector: 'node',
+                        style: {
+                            'background-color': 'data(color)',
+                            'border-width': 0,
+                            'width': 36,
+                            'height': 36,
+                            'label': showLabels ? 'data(label)' : '',
+                            'color': '#e5e7eb',
+                            'font-size': '9px',
+                            'text-valign': 'bottom',
+                            'text-halign': 'center',
+                            'text-margin-y': '4px',
+                            'text-outline-color': '#030712',
+                            'text-outline-width': '2px',
+                        }
+                    },
+                    {
+                        selector: 'node[has_agent = 1]',
+                        style: {
+                            'border-width': 3,
+                            'border-color': '#4ade80',
+                        }
+                    },
+                    {
+                        selector: 'node:selected',
+                        style: {
+                            'border-width': 3,
+                            'border-color': '#ffffff',
+                        }
+                    },
+                    {
+                        selector: 'edge[type = "subnet"]',
+                        style: {
+                            'width': 1.5,
+                            'line-color': '#4b5563',
+                            'curve-style': 'bezier',
+                            'opacity': 0.7,
+                        }
+                    },
+                    {
+                        selector: 'edge[type = "sweep"]',
+                        style: {
+                            'width': 1,
+                            'line-color': '#0891b2',
+                            'line-style': 'dashed',
+                            'line-dash-pattern': [6, 4],
+                            'curve-style': 'bezier',
+                            'opacity': 0.5,
+                        }
+                    },
+                ],
+                layout: { name: topoLayout, animate: false, padding: 40 },
+                userZoomingEnabled: true,
+                userPanningEnabled: true,
+                boxSelectionEnabled: false,
+                minZoom: 0.2,
+                maxZoom: 4,
+            });
+
+            cyInstance.on('tap', 'node', function(evt) {
+                var d = evt.target.data();
+                document.getElementById('topoDetail').classList.remove('hidden');
+                document.getElementById('topoDetailTitle').textContent = d.hostname || d.agent_name || d.id;
+                document.getElementById('topoDetailDeleteBtn').dataset.hostIp = d.id;
+                document.getElementById('topoDetailDeleteBtn').dataset.hostDbId = d.db_id || '';
+                var fields = [
+                    ['IP', d.id],
+                    ['Hostname', d.hostname || '\u2014'],
+                    ['Agent', d.agent_name || '\u2014'],
+                    ['OS', d.os || '\u2014'],
+                    ['MAC', d.mac || '\u2014'],
+                    ['Risk', d.risk],
+                    ['Open Ports', d.open_ports],
+                    ['Scans', d.scan_count],
+                ];
+                var html = '';
+                for (var i = 0; i < fields.length; i++) {
+                    html += '<div class="bg-gray-800 rounded-lg p-3">'
+                        + '<div class="text-gray-500 uppercase tracking-wider text-xs mb-1">' + fields[i][0] + '</div>'
+                        + '<div class="text-gray-200 font-mono text-xs break-all">' + fields[i][1] + '</div>'
+                        + '</div>';
+                }
+                document.getElementById('topoDetailBody').innerHTML = html;
+            });
+
+            cyInstance.on('tap', function(evt) {
+                if (evt.target === cyInstance) {
+                    document.getElementById('topoDetail').classList.add('hidden');
+                }
+            });
+
+            applyTopoFilter();
+        }
+
+        async function deleteTopoHost() {
+            var btn = document.getElementById('topoDetailDeleteBtn');
+            var dbId = btn.dataset.hostDbId;
+            var ip = btn.dataset.hostIp;
+            if (!dbId) { alert('Host DB ID not found — try refreshing the topology.'); return; }
+            showConfirm('Remove ' + ip + ' from the host registry? Its scan results are kept but it will disappear from the topology map.', async function() {
+                var res = await apiFetch('/hosts/' + dbId, { method: 'DELETE' });
+                if (!res) return;
+                document.getElementById('topoDetail').classList.add('hidden');
+                loadTopology();
+            }, 'Remove');
+        }
+
+        async function loadTopology() {
+            document.getElementById('topoLoading').classList.remove('hidden');
+            document.getElementById('topoEmpty').classList.add('hidden');
+            document.getElementById('topoDetail').classList.add('hidden');
+
+            var res = await apiFetch('/topology');
+            if (!res) { document.getElementById('topoLoading').classList.add('hidden'); return; }
+
+            var topoRaw;
+            try {
+                topoRaw = await res.text();
+                topoData = JSON.parse(topoRaw);
+            } catch(e) {
+                document.getElementById('topoLoading').classList.add('hidden');
+                document.getElementById('topoEmpty').classList.remove('hidden');
+                document.getElementById('topoEmpty').innerHTML = '<div class="text-center py-16">'
+                    + '<p class="text-red-500 text-sm">Topology endpoint error</p>'
+                    + '<p class="text-gray-600 text-xs mt-2 font-mono max-w-lg mx-auto break-all">' + (topoRaw ? topoRaw.substring(0, 300) : e.toString()) + '</p>'
+                    + '</div>';
+                return;
+            }
+
+            document.getElementById('topoLoading').classList.add('hidden');
+
+            if (!topoData.nodes.length) {
+                document.getElementById('topoEmpty').classList.remove('hidden');
+                return;
+            }
+
+            var elements = [];
+            for (var i = 0; i < topoData.nodes.length; i++) {
+                var n = topoData.nodes[i];
+                var d = Object.assign({}, n.data);
+                d.color = riskNodeColor(d.risk);
+                d.label = d.hostname || d.agent_name || d.id;
+                d.has_agent = d.has_agent ? 1 : 0;
+                elements.push({ data: d });
+            }
+            for (var j = 0; j < topoData.edges.length; j++) {
+                elements.push(topoData.edges[j]);
+            }
+
+            initCytoscape(elements);
+            setTopoLayout(topoLayout);
+            setTopoFilter(topoFilter);
+        }
+
         setInterval(() => { loadAgents(); loadJobs(); }, 5000);
         
         const AI_PROVIDER = '__AI_PROVIDER__';
