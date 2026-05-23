@@ -38,6 +38,11 @@ API_KEY_FILE = os.environ.get("VAPT_KEY_FILE", f"{AGENT_NAME}_key.txt")
 # Web ports are Nikto's domain — NSE skips these automatically
 WEB_PORTS = {80, 443, 8080, 8443, 8000, 8888}
 
+# Ports that are recognised as web ports but should NOT be auto-scanned by Nikto.
+# Port 8000 is excluded because it is typically the Heimdall backend itself —
+# scanning it with Nikto is meaningless and reliably times out.
+NIKTO_SKIP_PORTS = {8000}
+
 
 # --- AUTH ---
 
@@ -148,44 +153,20 @@ def get_nmap_flags(profile: str) -> list:
 
 def parse_nmap_xml(xml_data):
     root = ET.fromstring(xml_data)
+
     hosts = []
 
     for host in root.findall("host"):
-        ip = None
-        mac = None
-        vendor = None
-        for addr_el in host.findall("address"):
-            atype = addr_el.get("addrtype", "")
-            if atype in ("ipv4", "ipv6"):
-                ip = addr_el.get("addr")
-            elif atype == "mac":
-                mac = addr_el.get("addr")
-                vendor = addr_el.get("vendor")
-        if not ip:
-            continue
-
-        hostname = None
-        hostnames_el = host.find("hostnames")
-        if hostnames_el is not None:
-            for hn in hostnames_el.findall("hostname"):
-                if hn.get("type") in ("PTR", "user"):
-                    hostname = hn.get("name")
-                    break
-
-        os_name = None
-        os_el = host.find("os")
-        if os_el is not None:
-            match = os_el.find("osmatch")
-            if match is not None:
-                os_name = match.get("name")
+        addr = host.find("address").get("addr")
 
         ports_data = []
+
         ports = host.find("ports")
         if ports:
             for port in ports.findall("port"):
                 state = port.find("state").get("state")
-                svc_el = port.find("service")
-                service = svc_el.get("name", "unknown") if svc_el is not None else "unknown"
+                service = port.find("service").get("name", "unknown")
+
                 ports_data.append({
                     "port": int(port.get("portid")),
                     "state": state,
@@ -193,12 +174,8 @@ def parse_nmap_xml(xml_data):
                 })
 
         hosts.append({
-            "host": ip,
-            "mac": mac,
-            "vendor": vendor,
-            "hostname": hostname,
-            "os": os_name,
-            "ports": ports_data,
+            "host": addr,
+            "ports": ports_data
         })
 
     return hosts
@@ -263,8 +240,8 @@ def parse_nse_from_xml(xml_data: str) -> list:
                     continue
                 findings.append({
                     "host": addr,
-                    "port": None,
-                    "service": None,
+                    "port": portid,
+                    "service": service,
                     "script_id": script.get("id"),
                     "output": output,
                 })
@@ -397,25 +374,18 @@ def run_nikto(target: str, port: int, profile: str = "standard"):
         logger.debug(f"Nikto returncode: {result.returncode}")
         logger.debug(f"Nikto stderr: {result.stderr[:200] if result.stderr else 'none'}")
 
-        # returncode 124 means `timeout` killed the process — treat as timeout
-        if result.returncode == 124:
-            logger.warning(f"Nikto timed out on {target}:{port}")
-            return {"error": "Nikto timed out"}
-
         if os.path.exists(tmp_path):
-            with open(tmp_path, "r", errors="replace") as f:
+            with open(tmp_path, "r") as f:
                 content = f.read().strip()
             if content:
                 try:
                     return json.loads(content)
                 except json.JSONDecodeError:
-                    safe = content[:4000] if len(content) > 4000 else content
-                    return {"raw": safe}
+                    return {"raw": content}
 
-        return {"raw": result.stdout[:4000] if result.stdout else (result.stderr[:1000] if result.stderr else "no output")}
+        return {"raw": result.stdout or result.stderr or "no output"}
 
     except subprocess.TimeoutExpired:
-        logger.warning(f"Nikto subprocess timeout on {target}:{port}")
         return {"error": "Nikto timed out"}
     finally:
         if os.path.exists(tmp_path):
@@ -457,11 +427,15 @@ def execute_job(job: dict, api_key: str):
                 logger.info(f"Web ports found: {web_ports} — running Nikto")
                 nikto_results = {}
                 for wp in web_ports:
+                    if wp in NIKTO_SKIP_PORTS:
+                        logger.info(f"Port {wp} in skip list — omitting from Nikto")
+                        continue
                     try:
                         nikto_results[str(wp)] = run_nikto(target, wp, profile)
                     except Exception as e:
                         nikto_results[str(wp)] = {"error": str(e)}
-                output["nikto"] = nikto_results
+                if nikto_results:
+                    output["nikto"] = nikto_results
             else:
                 logger.debug(f"No web ports found on {target}, skipping Nikto")
 
