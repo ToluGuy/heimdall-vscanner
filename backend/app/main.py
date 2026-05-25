@@ -1636,6 +1636,156 @@ def get_insights(
     }
 
 
+# ── TOPOLOGY ──────────────────────────────────────────────────────────────────
+
+@app.get("/topology")
+def get_topology(
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    """
+    Returns a network topology graph for the frontend map.
+
+    Nodes: every host in the hosts table, enriched with:
+      - latest scan result (open ports, services)
+      - AI risk level (from latest result with analysis)
+      - linked agent name
+      - subnet group (first 3 octets of IP)
+
+    Edges: hosts in the same /24 subnet are connected to a
+    virtual subnet-gateway node, giving the cluster layout
+    something to anchor against.
+    """
+    import re as _re
+
+    hosts = db.query(Host).order_by(Host.last_seen.desc()).all()
+
+    nodes = []
+    edges = []
+    subnet_set = set()
+
+    for host in hosts:
+        # Agent name
+        agent_name = None
+        if host.agent_id:
+            agent = db.query(Agent).filter(Agent.id == host.agent_id).first()
+            if agent:
+                agent_name = agent.name
+
+        # Latest scan result for this host
+        latest_result = (
+            db.query(Result)
+            .join(Job, Job.id == Result.job_id)
+            .filter(Job.target == host.ip, Result.cleared == False)
+            .order_by(Result.id.desc())
+            .first()
+        )
+
+        open_ports = []
+        risk = "UNSCANNED"
+        last_scan_at = None
+
+        if latest_result:
+            try:
+                out = json.loads(latest_result.output)
+                for h in out.get("nmap", []):
+                    for p in h.get("ports", []):
+                        if p.get("state") == "open":
+                            open_ports.append({
+                                "port": p["port"],
+                                "service": p.get("service", "unknown"),
+                            })
+
+                # NSE findings count
+                nse_count = len(out.get("nse", {}).get("findings", [])) if out.get("nse") else 0
+
+                # Nikto findings count
+                nikto_count = 0
+                for v in out.get("nikto", {}).values():
+                    if v.get("raw"):
+                        nikto_count += len([l for l in v["raw"].split("\n") if l.startswith("+ [")])
+                    elif isinstance(v, list) and v:
+                        nikto_count += len(v[0].get("vulnerabilities", []))
+
+            except Exception:
+                nse_count = 0
+                nikto_count = 0
+
+            # Risk from AI analysis
+            if latest_result.analysis:
+                m = _re.search(r"##\s*Risk Level\s*\n+(\w+)", latest_result.analysis, _re.IGNORECASE)
+                risk = m.group(1).upper() if m else "INFO"
+            else:
+                risk = "UNANALYSED"
+
+            job = db.query(Job).filter(Job.id == latest_result.job_id).first()
+            if job and job.completed_at:
+                last_scan_at = job.completed_at.isoformat()
+        else:
+            nse_count = 0
+            nikto_count = 0
+
+        # Subnet group — first 3 octets
+        parts = host.ip.split(".")
+        subnet = ".".join(parts[:3]) + ".0/24" if len(parts) == 4 else "unknown"
+        subnet_set.add(subnet)
+
+        nodes.append({
+            "id": f"host-{host.id}",
+            "type": "host",
+            "ip": host.ip,
+            "hostname": host.hostname,
+            "mac": host.mac,
+            "os": host.os_fingerprint,
+            "agent_name": agent_name,
+            "is_agent": agent_name is not None,
+            "subnet": subnet,
+            "risk": risk,
+            "open_ports": open_ports,
+            "port_count": len(open_ports),
+            "nse_findings": nse_count,
+            "nikto_findings": nikto_count,
+            "last_seen": host.last_seen.isoformat() if host.last_seen else None,
+            "last_scan_at": last_scan_at,
+            "result_id": latest_result.id if latest_result else None,
+        })
+
+        # Edge: host → subnet gateway node
+        edges.append({
+            "source": f"host-{host.id}",
+            "target": f"subnet-{subnet}",
+        })
+
+    # Subnet gateway nodes (virtual — anchor for clustering)
+    for subnet in subnet_set:
+        nodes.append({
+            "id": f"subnet-{subnet}",
+            "type": "subnet",
+            "label": subnet,
+            "subnet": subnet,
+        })
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "subnets": sorted(subnet_set),
+        "stats": {
+            "total_hosts": len([n for n in nodes if n["type"] == "host"]),
+            "total_subnets": len(subnet_set),
+            "risk_counts": _count_risks(nodes),
+        }
+    }
+
+
+def _count_risks(nodes):
+    counts = {}
+    for n in nodes:
+        if n.get("type") == "host":
+            risk = n.get("risk", "UNSCANNED")
+            counts[risk] = counts.get(risk, 0) + 1
+    return counts
+
+
 # --- DASHBOARD ---
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -1650,6 +1800,7 @@ def dashboard():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <script src="https://cdn.tailwindcss.com"></script>
         <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
         <style>
             .nav-tab { transition: all 0.15s ease; }
             .nav-tab.active {
@@ -1759,6 +1910,10 @@ def dashboard():
                 <button onclick="switchTab('insights')" id="nav-insights"
                     class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
                     Insights
+                </button>
+                <button onclick="switchTab('topology')" id="nav-topology"
+                    class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
+                    Topology
                 </button>
             </nav>
 
@@ -2107,6 +2262,84 @@ def dashboard():
 
         </div>
         </div>
+        
+        <!-- ── TAB: TOPOLOGY ──────────────────────────────────────────── -->
+        <div id="tab-topology" class="tab-panel">
+        <div class="max-w-screen-xl mx-auto px-6 py-8">
+ 
+            <!-- Top bar: stats + controls -->
+            <div class="flex items-center justify-between mb-6 flex-wrap gap-4">
+                <div id="topoStats" class="flex gap-4 flex-wrap"></div>
+                <div class="flex items-center gap-3">
+                    <div class="flex items-center gap-1 bg-gray-900 border border-gray-800 rounded-lg p-1">
+                        <button onclick="setTopoFilter('all')" id="tf-all"
+                            class="topo-filter text-xs px-3 py-1 rounded-md transition font-medium bg-gray-700 text-white">All</button>
+                        <button onclick="setTopoFilter('CRITICAL')" id="tf-CRITICAL"
+                            class="topo-filter text-xs px-3 py-1 rounded-md transition font-medium text-gray-400 hover:text-white">Critical</button>
+                        <button onclick="setTopoFilter('HIGH')" id="tf-HIGH"
+                            class="topo-filter text-xs px-3 py-1 rounded-md transition font-medium text-gray-400 hover:text-white">High</button>
+                        <button onclick="setTopoFilter('MEDIUM')" id="tf-MEDIUM"
+                            class="topo-filter text-xs px-3 py-1 rounded-md transition font-medium text-gray-400 hover:text-white">Medium</button>
+                        <button onclick="setTopoFilter('UNANALYSED')" id="tf-UNANALYSED"
+                            class="topo-filter text-xs px-3 py-1 rounded-md transition font-medium text-gray-400 hover:text-white">Unanalysed</button>
+                    </div>
+                    <button onclick="resetTopoZoom()" class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-400 transition">⊙ Reset</button>
+                    <button onclick="loadTopology()" class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-400 transition">↻ Refresh</button>
+                </div>
+            </div>
+ 
+            <!-- Map + side panel -->
+            <div class="flex gap-4" style="height: 680px;">
+ 
+                <!-- D3 canvas -->
+                <div class="flex-1 bg-gray-900 rounded-xl border border-gray-800 relative overflow-hidden" id="topoCanvasWrap">
+                    <div id="topoEmpty" class="absolute inset-0 flex items-center justify-center hidden">
+                        <div class="text-center">
+                            <p class="text-gray-600 text-sm">No hosts discovered yet.</p>
+                            <p class="text-gray-700 text-xs mt-1">Run a discovery sweep or scan some hosts first.</p>
+                        </div>
+                    </div>
+                    <svg id="topoSvg" class="w-full h-full">
+                        <defs>
+                            <filter id="glow">
+                                <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+                                <feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge>
+                            </filter>
+                            <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+                                <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1f2937" stroke-width="0.5"/>
+                            </pattern>
+                        </defs>
+                        <rect width="100%" height="100%" fill="url(#grid)"/>
+                        <g id="topoG"></g>
+                    </svg>
+                    <div class="absolute bottom-3 left-3 text-xs text-gray-700 select-none pointer-events-none">
+                        Scroll to zoom · Drag to pan · Click host to inspect
+                    </div>
+                    <div class="absolute top-3 left-3 bg-gray-950 bg-opacity-80 border border-gray-800 rounded-lg px-3 py-2 text-xs space-y-1">
+                        <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-red-500 inline-block"></span><span class="text-gray-400">Critical</span></div>
+                        <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-orange-500 inline-block"></span><span class="text-gray-400">High</span></div>
+                        <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-yellow-400 inline-block"></span><span class="text-gray-400">Medium</span></div>
+                        <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-blue-500 inline-block"></span><span class="text-gray-400">Low</span></div>
+                        <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-gray-500 inline-block"></span><span class="text-gray-400">Info / Unanalysed</span></div>
+                        <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-green-400 inline-block"></span><span class="text-gray-400">Unscanned</span></div>
+                        <hr class="border-gray-800 my-1">
+                        <div class="flex items-center gap-2"><span class="w-3 h-3 rounded border border-gray-500 inline-block"></span><span class="text-gray-400">Subnet</span></div>
+                        <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full border-2 border-green-400 inline-block"></span><span class="text-gray-400">Agent host</span></div>
+                    </div>
+                </div>
+ 
+                <!-- Side panel -->
+                <div id="topoPanel" class="w-72 bg-gray-900 rounded-xl border border-gray-800 flex-shrink-0 overflow-y-auto hidden">
+                    <div class="p-4 border-b border-gray-800 flex items-center justify-between">
+                        <span class="text-xs font-bold uppercase tracking-wider text-gray-400">Host Details</span>
+                        <button onclick="closeTopoPanel()" class="text-gray-600 hover:text-gray-300 transition text-sm">✕</button>
+                    </div>
+                    <div id="topoPanelContent" class="p-4"></div>
+                </div>
+ 
+            </div>
+        </div>
+        </div>
 
         <!-- ── SCRIPTS ──────────────────────────────────────────────────── -->
         <script>
@@ -2120,6 +2353,11 @@ def dashboard():
         let showStaleAgents = false;
         let activeTab = "dashboard";
         let exploitBannerDismissed = false;
+        let topoData = null;
+        let topoSimulation = null;
+        let topoZoom = null;
+        let topoFilter = 'all';
+        let topoSelectedNode = null;
 
         // Tracks job statuses from last poll — used to detect completions
         let lastJobStatuses = {};
@@ -2138,6 +2376,7 @@ def dashboard():
             if (tab === 'discovery') { loadSweepHistory(); }
             if (tab === 'schedules') { loadSchedules(); }
             if (tab === 'insights') { loadInsights(); }
+            if (tab === 'topology') { loadTopology(); }
         }
 
         // ── AUTH ───────────────────────────────────────────────────────────
@@ -3081,7 +3320,408 @@ def dashboard():
                 chartScanHistory = destroyChart(chartScanHistory);
             }
         }
-
+        
+        const RISK_COLOR = {
+    CRITICAL:   '#ef4444',
+    HIGH:       '#f97316',
+    MEDIUM:     '#eab308',
+    LOW:        '#3b82f6',
+    INFO:       '#6b7280',
+    UNANALYSED: '#4b5563',
+    UNSCANNED:  '#4ade80',
+};
+ 
+const RISK_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO', 'UNANALYSED', 'UNSCANNED'];
+ 
+function riskColor(risk) {
+    return RISK_COLOR[risk] || RISK_COLOR.UNANALYSED;
+}
+ 
+function setTopoFilter(f) {
+    topoFilter = f;
+    document.querySelectorAll('.topo-filter').forEach(b => {
+        b.classList.remove('bg-gray-700', 'text-white');
+        b.classList.add('text-gray-400');
+    });
+    const active = document.getElementById('tf-' + f);
+    if (active) {
+        active.classList.add('bg-gray-700', 'text-white');
+        active.classList.remove('text-gray-400');
+    }
+    if (topoData) renderTopology(topoData);
+}
+ 
+function resetTopoZoom() {
+    const svg = d3.select('#topoSvg');
+    svg.transition().duration(500).call(
+        topoZoom.transform,
+        d3.zoomIdentity.translate(
+            document.getElementById('topoSvg').clientWidth / 2,
+            document.getElementById('topoSvg').clientHeight / 2
+        ).scale(0.85)
+    );
+}
+ 
+function closeTopoPanel() {
+    document.getElementById('topoPanel').classList.add('hidden');
+    topoSelectedNode = null;
+    // deselect all nodes
+    d3.selectAll('.topo-host-node').attr('stroke', d => d.is_agent ? '#4ade80' : 'none').attr('stroke-width', d => d.is_agent ? 2 : 0);
+}
+ 
+async function loadTopology() {
+    const res = await apiFetch('/topology');
+    if (!res) return;
+    topoData = await res.json();
+ 
+    // Stats bar
+    const s = topoData.stats;
+    const riskParts = RISK_ORDER
+        .filter(r => s.risk_counts[r] > 0)
+        .map(r => `<span class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full inline-block" style="background:${riskColor(r)}"></span><span class="text-gray-300 text-xs">${s.risk_counts[r]} ${r}</span></span>`)
+        .join('');
+ 
+    document.getElementById('topoStats').innerHTML = `
+        <div class="flex items-center gap-1.5 bg-gray-900 border border-gray-800 rounded-lg px-3 py-1.5">
+            <span class="text-xs text-gray-500">Hosts</span>
+            <span class="text-xs font-bold text-green-400">${s.total_hosts}</span>
+        </div>
+        <div class="flex items-center gap-1.5 bg-gray-900 border border-gray-800 rounded-lg px-3 py-1.5">
+            <span class="text-xs text-gray-500">Subnets</span>
+            <span class="text-xs font-bold text-blue-400">${s.total_subnets}</span>
+        </div>
+        <div class="flex items-center gap-2 bg-gray-900 border border-gray-800 rounded-lg px-3 py-1.5 flex-wrap">
+            ${riskParts || '<span class="text-xs text-gray-600">No scan data</span>'}
+        </div>`;
+ 
+    if (s.total_hosts === 0) {
+        document.getElementById('topoEmpty').classList.remove('hidden');
+        document.getElementById('topoG').innerHTML = '';
+        return;
+    }
+    document.getElementById('topoEmpty').classList.add('hidden');
+ 
+    renderTopology(topoData);
+}
+ 
+function renderTopology(data) {
+    const wrap = document.getElementById('topoCanvasWrap');
+    const W = wrap.clientWidth;
+    const H = wrap.clientHeight;
+ 
+    const svg = d3.select('#topoSvg');
+    const g   = d3.select('#topoG');
+    g.selectAll('*').remove();
+ 
+    // Apply filter
+    let visibleHosts = data.nodes.filter(n => n.type === 'host');
+    if (topoFilter !== 'all') {
+        visibleHosts = visibleHosts.filter(n => n.risk === topoFilter);
+    }
+    const visibleHostIds = new Set(visibleHosts.map(n => n.id));
+ 
+    // Only include subnets that have at least one visible host
+    const relevantSubnets = new Set(visibleHosts.map(n => n.subnet));
+    const subnetNodes = data.nodes.filter(n => n.type === 'subnet' && relevantSubnets.has(n.label));
+ 
+    const nodes = [...visibleHosts, ...subnetNodes];
+    const nodeIds = new Set(nodes.map(n => n.id));
+    const edges = data.edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
+ 
+    // Clone for D3 mutation
+    const simNodes = nodes.map(n => ({ ...n }));
+    const simEdges = edges.map(e => ({ ...e }));
+ 
+    // Group subnets into clusters using a subnet-center attraction
+    const subnetCenters = {};
+    const subnetsArr = [...relevantSubnets];
+    const cols = Math.ceil(Math.sqrt(subnetsArr.length));
+    subnetsArr.forEach((subnet, i) => {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        subnetCenters[subnet] = {
+            x: (W / (cols + 1)) * (col + 1),
+            y: (H / (Math.ceil(subnetsArr.length / cols) + 1)) * (row + 1),
+        };
+    });
+ 
+    // Pre-position subnet nodes
+    simNodes.forEach(n => {
+        if (n.type === 'subnet' && subnetCenters[n.label]) {
+            n.fx = subnetCenters[n.label].x;
+            n.fy = subnetCenters[n.label].y;
+        }
+        if (n.type === 'host' && subnetCenters[n.subnet]) {
+            n.x = subnetCenters[n.subnet].x + (Math.random() - 0.5) * 120;
+            n.y = subnetCenters[n.subnet].y + (Math.random() - 0.5) * 120;
+        }
+    });
+ 
+    // Force simulation
+    if (topoSimulation) topoSimulation.stop();
+ 
+    topoSimulation = d3.forceSimulation(simNodes)
+        .force('link', d3.forceLink(simEdges).id(d => d.id).distance(d => {
+            if (d.target.type === 'subnet') return 90;
+            return 60;
+        }).strength(0.6))
+        .force('charge', d3.forceManyBody().strength(d => d.type === 'subnet' ? -300 : -180))
+        .force('collide', d3.forceCollide().radius(d => d.type === 'subnet' ? 40 : 22))
+        .alphaDecay(0.03);
+ 
+    // Edges
+    const link = g.append('g').attr('class', 'topo-links')
+        .selectAll('line')
+        .data(simEdges)
+        .enter().append('line')
+        .attr('stroke', '#1f2937')
+        .attr('stroke-width', 1.5)
+        .attr('stroke-dasharray', d => d.target.type === 'subnet' ? '4,3' : 'none')
+        .attr('opacity', 0.7);
+ 
+    // Subnet nodes (rectangles)
+    const subnetGroup = g.append('g').attr('class', 'topo-subnets')
+        .selectAll('g')
+        .data(simNodes.filter(n => n.type === 'subnet'))
+        .enter().append('g')
+        .attr('class', 'topo-subnet-node');
+ 
+    subnetGroup.append('rect')
+        .attr('width', 100).attr('height', 28)
+        .attr('x', -50).attr('y', -14)
+        .attr('rx', 6)
+        .attr('fill', '#111827')
+        .attr('stroke', '#374151')
+        .attr('stroke-width', 1.5);
+ 
+    subnetGroup.append('text')
+        .text(d => d.label)
+        .attr('text-anchor', 'middle')
+        .attr('dy', '0.35em')
+        .attr('fill', '#6b7280')
+        .attr('font-family', 'IBM Plex Mono, monospace')
+        .attr('font-size', 10);
+ 
+    // Host nodes
+    const hostGroup = g.append('g').attr('class', 'topo-hosts')
+        .selectAll('g')
+        .data(simNodes.filter(n => n.type === 'host'))
+        .enter().append('g')
+        .attr('class', 'topo-host-node-group')
+        .style('cursor', 'pointer')
+        .on('click', (event, d) => {
+            event.stopPropagation();
+            selectTopoHost(d);
+        })
+        .call(d3.drag()
+            .on('start', (event, d) => {
+                if (!event.active) topoSimulation.alphaTarget(0.3).restart();
+                d.fx = d.x; d.fy = d.y;
+            })
+            .on('drag', (event, d) => { d.fx = event.x; d.fy = event.y; })
+            .on('end', (event, d) => {
+                if (!event.active) topoSimulation.alphaTarget(0);
+                d.fx = null; d.fy = null;
+            })
+        );
+ 
+    // Outer ring for agent hosts
+    hostGroup.filter(d => d.is_agent)
+        .append('circle')
+        .attr('r', 20)
+        .attr('fill', 'none')
+        .attr('stroke', '#4ade80')
+        .attr('stroke-width', 1.5)
+        .attr('stroke-dasharray', '3,2')
+        .attr('opacity', 0.6);
+ 
+    // Main circle
+    hostGroup.append('circle')
+        .attr('class', 'topo-host-node')
+        .attr('r', d => {
+            // Size by port count
+            const base = 14;
+            return base + Math.min(d.port_count, 10);
+        })
+        .attr('fill', d => riskColor(d.risk))
+        .attr('fill-opacity', 0.15)
+        .attr('stroke', d => riskColor(d.risk))
+        .attr('stroke-width', 2)
+        .attr('filter', d => ['CRITICAL', 'HIGH'].includes(d.risk) ? 'url(#glow)' : null);
+ 
+    // IP label
+    hostGroup.append('text')
+        .text(d => d.ip)
+        .attr('text-anchor', 'middle')
+        .attr('dy', '0.35em')
+        .attr('fill', d => riskColor(d.risk))
+        .attr('font-family', 'IBM Plex Mono, monospace')
+        .attr('font-size', 9)
+        .attr('font-weight', '600');
+ 
+    // Port count badge (top-right of node)
+    hostGroup.filter(d => d.port_count > 0)
+        .append('text')
+        .text(d => d.port_count)
+        .attr('x', d => 14 + Math.min(d.port_count, 10) - 4)
+        .attr('y', d => -(14 + Math.min(d.port_count, 10) - 4))
+        .attr('text-anchor', 'middle')
+        .attr('fill', '#9ca3af')
+        .attr('font-size', 8)
+        .attr('font-family', 'IBM Plex Mono, monospace');
+ 
+    // Pulse animation for CRITICAL nodes
+    hostGroup.filter(d => d.risk === 'CRITICAL')
+        .append('circle')
+        .attr('r', d => 14 + Math.min(d.port_count, 10))
+        .attr('fill', 'none')
+        .attr('stroke', '#ef4444')
+        .attr('stroke-width', 1)
+        .attr('opacity', 0)
+        .each(function pulse() {
+            d3.select(this)
+                .transition().duration(1500)
+                .attr('r', d => (14 + Math.min(d.port_count, 10)) + 12)
+                .attr('opacity', 0)
+                .on('end', function() {
+                    d3.select(this).attr('r', d => 14 + Math.min(d.port_count, 10)).attr('opacity', 0.5);
+                    pulse.call(this);
+                });
+        });
+ 
+    // Tick
+    topoSimulation.on('tick', () => {
+        link
+            .attr('x1', d => d.source.x)
+            .attr('y1', d => d.source.y)
+            .attr('x2', d => d.target.x)
+            .attr('y2', d => d.target.y);
+ 
+        subnetGroup.attr('transform', d => `translate(${d.x},${d.y})`);
+        hostGroup.attr('transform', d => `translate(${d.x},${d.y})`);
+    });
+ 
+    // Zoom + pan
+    topoZoom = d3.zoom()
+        .scaleExtent([0.2, 4])
+        .on('zoom', (event) => {
+            g.attr('transform', event.transform);
+        });
+ 
+    svg.call(topoZoom);
+ 
+    // Initial centering transform
+    svg.call(topoZoom.transform, d3.zoomIdentity
+        .translate(W / 2, H / 2)
+        .scale(0.85));
+ 
+    // Click on background → deselect
+    svg.on('click', () => closeTopoPanel());
+}
+ 
+function selectTopoHost(d) {
+    topoSelectedNode = d.id;
+ 
+    // Highlight selected
+    d3.selectAll('.topo-host-node')
+        .attr('stroke-width', n => n.id === d.id ? 3 : 2)
+        .attr('fill-opacity', n => n.id === d.id ? 0.35 : 0.15);
+ 
+    // Show panel
+    const panel = document.getElementById('topoPanel');
+    panel.classList.remove('hidden');
+ 
+    const riskCls = {
+        CRITICAL: 'text-red-400', HIGH: 'text-orange-400',
+        MEDIUM: 'text-yellow-400', LOW: 'text-blue-400',
+        INFO: 'text-gray-400', UNANALYSED: 'text-gray-500', UNSCANNED: 'text-green-400',
+    }[d.risk] || 'text-gray-400';
+ 
+    const portRows = d.open_ports.length
+        ? d.open_ports.map(p => `
+            <tr class="border-b border-gray-800">
+                <td class="py-1 pr-3 font-mono text-blue-300 text-xs">${p.port}</td>
+                <td class="py-1 text-gray-300 text-xs">${p.service}</td>
+            </tr>`).join('')
+        : '<tr><td colspan="2" class="py-2 text-gray-600 text-xs italic">No open ports found</td></tr>';
+ 
+    const lastScan = d.last_scan_at
+        ? new Date(d.last_scan_at + (d.last_scan_at.endsWith('Z') ? '' : 'Z')).toLocaleString()
+        : 'Never';
+ 
+    document.getElementById('topoPanelContent').innerHTML = `
+        <!-- IP + risk -->
+        <div class="mb-4">
+            <div class="font-mono text-lg font-bold text-white mb-1">${d.ip}</div>
+            <span class="text-xs font-semibold ${riskCls} uppercase tracking-wider">${d.risk}</span>
+            ${d.is_agent ? '<span class="ml-2 text-xs px-2 py-0.5 rounded-full bg-green-900 text-green-300 border border-green-700">agent</span>' : ''}
+        </div>
+ 
+        <!-- Identity -->
+        <div class="mb-4 space-y-1">
+            ${d.hostname ? `<div class="flex gap-2 text-xs"><span class="text-gray-500 w-20">Hostname</span><span class="text-gray-200 font-mono">${d.hostname}</span></div>` : ''}
+            ${d.mac ? `<div class="flex gap-2 text-xs"><span class="text-gray-500 w-20">MAC</span><span class="text-gray-400 font-mono">${d.mac}</span></div>` : ''}
+            ${d.os ? `<div class="flex gap-2 text-xs"><span class="text-gray-500 w-20">OS</span><span class="text-gray-300">${d.os}</span></div>` : ''}
+            ${d.agent_name ? `<div class="flex gap-2 text-xs"><span class="text-gray-500 w-20">Agent</span><span class="text-green-400">${d.agent_name}</span></div>` : ''}
+            <div class="flex gap-2 text-xs"><span class="text-gray-500 w-20">Subnet</span><span class="text-gray-400 font-mono">${d.subnet}</span></div>
+            <div class="flex gap-2 text-xs"><span class="text-gray-500 w-20">Last scan</span><span class="text-gray-400">${lastScan}</span></div>
+        </div>
+ 
+        <!-- Findings summary -->
+        <div class="mb-4 grid grid-cols-3 gap-2">
+            <div class="bg-gray-800 rounded-lg p-2 text-center">
+                <div class="text-sm font-bold text-blue-400">${d.port_count}</div>
+                <div class="text-xs text-gray-500">Ports</div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-2 text-center">
+                <div class="text-sm font-bold text-purple-400">${d.nse_findings}</div>
+                <div class="text-xs text-gray-500">NSE</div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-2 text-center">
+                <div class="text-sm font-bold text-orange-400">${d.nikto_findings}</div>
+                <div class="text-xs text-gray-500">Nikto</div>
+            </div>
+        </div>
+ 
+        <!-- Open ports -->
+        <div class="mb-4">
+            <p class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">Open Ports</p>
+            <table class="w-full">
+                <thead><tr>
+                    <th class="text-left text-xs text-gray-600 pb-1 pr-3">Port</th>
+                    <th class="text-left text-xs text-gray-600 pb-1">Service</th>
+                </tr></thead>
+                <tbody>${portRows}</tbody>
+            </table>
+        </div>
+ 
+        <!-- Actions -->
+        <div class="flex flex-col gap-2">
+            ${d.result_id ? `
+            <a href="/report/${d.result_id}" target="_blank"
+                class="text-xs text-center px-3 py-2 rounded-lg bg-cyan-900 hover:bg-cyan-800 text-cyan-200 border border-cyan-700 transition font-medium">
+                View Report
+            </a>
+            <button onclick="createJobFromTopo('${d.ip}')"
+                class="text-xs px-3 py-2 rounded-lg bg-green-900 hover:bg-green-800 text-green-200 border border-green-700 transition font-medium">
+                + New Scan Job
+            </button>` : `
+            <button onclick="createJobFromTopo('${d.ip}')"
+                class="text-xs px-3 py-2 rounded-lg bg-green-900 hover:bg-green-800 text-green-200 border border-green-700 transition font-medium">
+                + Scan This Host
+            </button>`}
+        </div>`;
+}
+ 
+function createJobFromTopo(ip) {
+    // Switch to dashboard tab, pre-fill target
+    switchTab('dashboard');
+    document.getElementById('target').value = ip;
+    document.getElementById('target').focus();
+    // Brief highlight
+    document.getElementById('target').style.borderColor = '#4ade80';
+    setTimeout(() => document.getElementById('target').style.borderColor = '', 1500);
+}
         
         setInterval(() => { loadAgents(); loadJobs(); }, 5000);
         
