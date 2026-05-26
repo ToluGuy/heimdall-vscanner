@@ -136,20 +136,58 @@ def send_heartbeat(api_key):
 
 def parse_nmap_xml(xml_data):
     root = ET.fromstring(xml_data)
-
     hosts = []
 
     for host in root.findall("host"):
-        addr = host.find("address").get("addr")
+        # ── IP address ────────────────────────────────────────────────────
+        ip = None
+        mac = None
+        for addr_el in host.findall("address"):
+            atype = addr_el.get("addrtype", "")
+            if atype == "ipv4" or atype == "ipv6":
+                ip = addr_el.get("addr")
+            elif atype == "mac":
+                mac = addr_el.get("addr")
 
+        if ip is None:
+            continue  # skip hosts with no IP (shouldn't happen but be safe)
+
+        # ── Hostname ──────────────────────────────────────────────────────
+        hostname = None
+        hostnames_el = host.find("hostnames")
+        if hostnames_el is not None:
+            for hn in hostnames_el.findall("hostname"):
+                name = hn.get("name", "").strip()
+                if name:
+                    hostname = name
+                    break  # take the first non-empty one
+
+        # ── OS fingerprint ────────────────────────────────────────────────
+        os_guess = None
+        os_el = host.find("os")
+        if os_el is not None:
+            best_match = None
+            best_accuracy = -1
+            for osmatch in os_el.findall("osmatch"):
+                try:
+                    accuracy = int(osmatch.get("accuracy", "0"))
+                except ValueError:
+                    accuracy = 0
+                if accuracy > best_accuracy:
+                    best_accuracy = accuracy
+                    best_match = osmatch.get("name", "").strip()
+            if best_match:
+                os_guess = best_match
+
+        # ── Ports ─────────────────────────────────────────────────────────
         ports_data = []
-
-        ports = host.find("ports")
-        if ports:
-            for port in ports.findall("port"):
-                state = port.find("state").get("state")
-                service = port.find("service").get("name", "unknown")
-
+        ports_el = host.find("ports")
+        if ports_el:
+            for port in ports_el.findall("port"):
+                state_el = port.find("state")
+                service_el = port.find("service")
+                state = state_el.get("state") if state_el is not None else "unknown"
+                service = service_el.get("name", "unknown") if service_el is not None else "unknown"
                 ports_data.append({
                     "port": int(port.get("portid")),
                     "state": state,
@@ -157,8 +195,11 @@ def parse_nmap_xml(xml_data):
                 })
 
         hosts.append({
-            "host": addr,
-            "ports": ports_data
+            "host": ip,
+            "mac": mac,
+            "hostname": hostname,
+            "os": os_guess,
+            "ports": ports_data,
         })
 
     return hosts

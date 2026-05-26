@@ -1471,49 +1471,50 @@ def generate_report(
 def get_insights(
     db: Session = Depends(get_db),
     username: str = Depends(require_auth),
-    window: str = "7d",   # 24h | 7d | 30d | 3m
-    host: str = None,     # optional — filter to a specific IP
+    window: str = "7d",
+    host: str = None,
 ):
-    # Compute cutoff timestamp from window param
+    import re
+ 
     window_map = {"24h": 1, "7d": 7, "30d": 30, "3m": 90}
-    days = window_map.get(window, 7)
+    days   = window_map.get(window, 7)
     cutoff = datetime.utcnow() - timedelta(days=days)
-
-    # Base job query filtered by window
+ 
     job_q = db.query(Job).filter(
         Job.completed_at >= cutoff,
         Job.status == "done"
     )
     if host:
         job_q = job_q.filter(Job.target == host)
-
-    jobs = job_q.all()
+ 
+    jobs    = job_q.all()
     job_ids = [j.id for j in jobs]
     job_map = {j.id: j for j in jobs}
-
-    # Results for those jobs
+ 
     results = db.query(Result).filter(Result.job_id.in_(job_ids)).all() if job_ids else []
-
+ 
     # ── Aggregate stats ───────────────────────────────────────────────────────
-    total_scans = len(jobs)
+    total_scans  = len(jobs)
     unique_hosts = len(set(j.target for j in jobs))
-
-    # Count open ports and risk distribution across results
-    total_open_ports = 0
+ 
+    # Deduplicated open ports: unique (host_ip, port) pairs across the window
+    unique_open_ports: set = set()
     risk_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0, "UNANALYSED": 0}
-
+ 
     for r in results:
         try:
             out = json.loads(r.output)
         except Exception:
             continue
-        # Count open ports
+        j_ref = job_map.get(r.job_id)
+        target_ip = j_ref.target if j_ref else None
         for h in out.get("nmap", []):
-            total_open_ports += len([p for p in h.get("ports", []) if p.get("state") == "open"])
-        # Parse AI risk level
+            host_ip = h.get("host") or target_ip or ""
+            for p in h.get("ports", []):
+                if p.get("state") == "open":
+                    unique_open_ports.add((host_ip, p["port"]))
         if r.analysis:
-            import re
-            m = re.search(r"##\s*Risk Level\s*\n+(\w+)", r.analysis, re.IGNORECASE)
+            m = re.search(r"##\\s*Risk Level\\s*\\n+(\\w+)", r.analysis, re.IGNORECASE)
             risk = m.group(1).upper() if m else "INFO"
             if risk in risk_counts:
                 risk_counts[risk] += 1
@@ -1521,39 +1522,45 @@ def get_insights(
                 risk_counts["INFO"] += 1
         else:
             risk_counts["UNANALYSED"] += 1
-
-    # ── Scans per day (for bar chart) ─────────────────────────────────────────
+ 
+    total_open_ports = len(unique_open_ports)
+ 
+    # ── Scans per day ─────────────────────────────────────────────────────────
     scans_by_day = {}
     for j in jobs:
         if j.completed_at:
             day = j.completed_at.strftime("%Y-%m-%d")
             scans_by_day[day] = scans_by_day.get(day, 0) + 1
-
-    # Fill missing days in range with 0
+ 
     days_list = []
     for i in range(days - 1, -1, -1):
         d = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
         days_list.append(d)
     scan_activity = [{"date": d, "count": scans_by_day.get(d, 0)} for d in days_list]
-
-    # ── Per-host summary (for host table + bar chart) ─────────────────────────
-    host_data = {}
+ 
+    # ── Per-host summary ──────────────────────────────────────────────────────
+    severity_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNANALYSED"]
+    host_data: dict = {}
+ 
     for j in jobs:
         ip = j.target
         if ip not in host_data:
             host_data[ip] = {
-                "ip": ip,
-                "scan_count": 0,
-                "open_ports": 0,
-                "findings": 0,
-                "last_scan": None,
-                "risk": "UNANALYSED",
+                "ip":              ip,
+                "scan_count":      0,
+                "open_ports_set":  set(),   # (host_ip, port) — deduplicated
+                "findings":        0,
+                "last_scan":       None,
+                "risk":            "UNANALYSED",
+                "result_id":       None,
+                "latest_result_ts": None,
             }
         host_data[ip]["scan_count"] += 1
         if j.completed_at:
-            if host_data[ip]["last_scan"] is None or j.completed_at > host_data[ip]["last_scan"]:
+            cur = host_data[ip]["last_scan"]
+            if cur is None or j.completed_at > cur:
                 host_data[ip]["last_scan"] = j.completed_at
-
+ 
     for r in results:
         j = job_map.get(r.job_id)
         if not j:
@@ -1565,74 +1572,110 @@ def get_insights(
             out = json.loads(r.output)
         except Exception:
             continue
-        ports = sum(
-            len([p for p in h.get("ports", []) if p.get("state") == "open"])
-            for h in out.get("nmap", [])
-        )
-        nse = len(out.get("nse", {}).get("findings", []))
-        nikto = sum(
-            (len([l for l in v.get("raw", "").split("\n") if l.startswith("+ [")])
-             if v.get("raw") else len(v.get("vulnerabilities", [])))
-            for v in out.get("nikto", {}).values() if not v.get("error")
-        ) if out.get("nikto") else 0
-        host_data[ip]["open_ports"] += ports
-        host_data[ip]["findings"] += nse + nikto
-        # Update risk level if AI analysis present (use worst seen)
+ 
+        # Deduplicated open ports per host
+        for h in out.get("nmap", []):
+            host_ip = h.get("host") or ip
+            for p in h.get("ports", []):
+                if p.get("state") == "open":
+                    host_data[ip]["open_ports_set"].add((host_ip, p["port"]))
+ 
+        # Findings from the latest result only (avoids inflation on rescan)
+        result_ts = j.completed_at or datetime.min
+        if host_data[ip]["latest_result_ts"] is None or result_ts > host_data[ip]["latest_result_ts"]:
+            host_data[ip]["latest_result_ts"] = result_ts
+            host_data[ip]["result_id"]        = r.id
+ 
+            nse_count = len(out.get("nse", {}).get("findings", [])) if out.get("nse") else 0
+ 
+            nikto_count = 0
+            for v in out.get("nikto", {}).values():
+                if v.get("error"):
+                    continue
+                if v.get("raw"):
+                    nikto_count += len([l for l in v["raw"].split("\\n") if l.startswith("+ [")])
+                elif isinstance(v, list) and v:
+                    nikto_count += len(v[0].get("vulnerabilities", []))
+ 
+            host_data[ip]["findings"] = nse_count + nikto_count
+ 
+        # Risk: worst seen across all results for this host
         if r.analysis:
-            import re
-            m = re.search(r"##\s*Risk Level\s*\n+(\w+)", r.analysis, re.IGNORECASE)
-            risk = m.group(1).upper() if m else "INFO"
-            severity_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNANALYSED"]
+            m = re.search(r"##\\s*Risk Level\\s*\\n+(\\w+)", r.analysis, re.IGNORECASE)
+            risk    = m.group(1).upper() if m else "INFO"
             current = host_data[ip]["risk"]
-            if severity_order.index(risk) < severity_order.index(current) if current in severity_order else True:
-                host_data[ip]["risk"] = risk
-
-    hosts_list = sorted(host_data.values(), key=lambda x: x["findings"], reverse=True)
-    for h in hosts_list:
-        if h["last_scan"]:
-            h["last_scan"] = h["last_scan"].isoformat()
-
-    # ── Per-host drilldown (scan history timeline) ────────────────────────────
+            try:
+                if severity_order.index(risk) < severity_order.index(current):
+                    host_data[ip]["risk"] = risk
+            except ValueError:
+                pass
+ 
+    hosts_list = []
+    for ip, d in host_data.items():
+        hosts_list.append({
+            "ip":         d["ip"],
+            "scan_count": d["scan_count"],
+            "open_ports": len(d["open_ports_set"]),
+            "findings":   d["findings"],
+            "last_scan":  d["last_scan"].isoformat() if d["last_scan"] else None,
+            "risk":       d["risk"],
+            "result_id":  d["result_id"],
+        })
+    hosts_list.sort(key=lambda x: x["findings"], reverse=True)
+ 
+    # ── Per-host drilldown ────────────────────────────────────────────────────
     scan_history = []
     if host:
         for j in sorted(jobs, key=lambda x: x.completed_at or datetime.min):
             result_for_job = next((r for r in results if r.job_id == j.id), None)
             entry = {
-                "date": j.completed_at.strftime("%Y-%m-%d") if j.completed_at else None,
-                "type": j.type,
-                "profile": j.profile,
+                "date":       j.completed_at.strftime("%Y-%m-%d") if j.completed_at else None,
+                "type":       j.type,
+                "profile":    j.profile,
                 "open_ports": 0,
-                "findings": 0,
-                "risk": "UNANALYSED",
+                "findings":   0,
+                "risk":       "UNANALYSED",
+                "result_id":  result_for_job.id if result_for_job else None,
             }
             if result_for_job:
                 try:
                     out = json.loads(result_for_job.output)
-                    entry["open_ports"] = sum(
-                        len([p for p in h.get("ports", []) if p.get("state") == "open"])
-                        for h in out.get("nmap", [])
-                    )
-                    entry["findings"] = len(out.get("nse", {}).get("findings", []))
+                    ports_in_scan: set = set()
+                    for h in out.get("nmap", []):
+                        for p in h.get("ports", []):
+                            if p.get("state") == "open":
+                                ports_in_scan.add(p["port"])
+                    entry["open_ports"] = len(ports_in_scan)
+ 
+                    nse_f    = len(out.get("nse", {}).get("findings", [])) if out.get("nse") else 0
+                    nikto_f  = 0
+                    for v in out.get("nikto", {}).values():
+                        if v.get("error"):
+                            continue
+                        if v.get("raw"):
+                            nikto_f += len([l for l in v["raw"].split("\\n") if l.startswith("+ [")])
+                        elif isinstance(v, list) and v:
+                            nikto_f += len(v[0].get("vulnerabilities", []))
+                    entry["findings"] = nse_f + nikto_f
                 except Exception:
                     pass
                 if result_for_job.analysis:
-                    import re
-                    m = re.search(r"##\s*Risk Level\s*\n+(\w+)", result_for_job.analysis, re.IGNORECASE)
+                    m = re.search(r"##\\s*Risk Level\\s*\\n+(\\w+)", result_for_job.analysis, re.IGNORECASE)
                     entry["risk"] = m.group(1).upper() if m else "INFO"
             scan_history.append(entry)
-
+ 
     return {
         "window": window,
-        "host": host,
+        "host":   host,
         "stats": {
-            "total_scans": total_scans,
-            "unique_hosts": unique_hosts,
+            "total_scans":      total_scans,
+            "unique_hosts":     unique_hosts,
             "total_open_ports": total_open_ports,
-            "risk_counts": risk_counts,
+            "risk_counts":      risk_counts,
         },
         "scan_activity": scan_activity,
-        "hosts": hosts_list,
-        "scan_history": scan_history,  # only populated when host= is set
+        "hosts":         hosts_list,
+        "scan_history":  scan_history,
     }
 
 
@@ -2343,6 +2386,40 @@ def dashboard():
 
         <!-- ── SCRIPTS ──────────────────────────────────────────────────── -->
         <script>
+        
+         function goToResult(resultId) {
+            resultTab = 'active';
+            switchTab('dashboard');
+            setTimeout(async () => {
+                await loadResults();
+                setTimeout(() => {
+                    const cards = document.querySelectorAll('#results > div');
+                    let targetCard = null;
+                    for (const c of cards) {
+                        if (c.querySelector('#result-body-' + resultId)) {
+                            targetCard = c;
+                            break;
+                        }
+                    }
+                    if (targetCard) {
+                        targetCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        targetCard.style.transition = 'box-shadow 0.2s';
+                        targetCard.style.boxShadow  = '0 0 0 2px #4ade80';
+                        setTimeout(() => {
+                            targetCard.style.boxShadow  = '';
+                            targetCard.style.transition = '';
+                        }, 1800);
+                        const bodyEl  = document.getElementById('result-body-'  + resultId);
+                        const arrowEl = document.getElementById('result-arrow-' + resultId);
+                        if (bodyEl && bodyEl.classList.contains('hidden')) {
+                            bodyEl.classList.remove('hidden');
+                            if (arrowEl) arrowEl.innerText = '▲';
+                        }
+                    }
+                }, 400);
+            }, 100);
+        }
+        
         // ── STATE ──────────────────────────────────────────────────────────
         let jobFilter = "all";
         let showJobHistory = false;
@@ -3228,35 +3305,65 @@ def dashboard():
                     var hostRows = '';
                     for (var hi = 0; hi < data.hosts.length; hi++) {
                         var h = data.hosts[hi];
+ 
                         var nameCell = h.hostname
                             ? '<span class="text-gray-300">' + h.hostname + '</span>'
                             : (h.agent_name
                                 ? '<span class="text-blue-400">agent: ' + h.agent_name + '</span>'
                                 : '<span class="text-gray-700 italic">unknown</span>');
                         var macCell = h.mac ? '<div class="text-gray-600 font-mono text-xs">' + h.mac + '</div>' : '';
-                        var osCell = h.os ? '<div class="text-gray-600 text-xs">' + h.os + '</div>' : '';
-                        var ipWarn = h.ip_changed ? ' <span class="text-yellow-500" title="IP changed from ' + (h.previous_ip || '') + '">\u26a0</span>' : '';
+                        var osCell  = h.os  ? '<div class="text-gray-600 text-xs">' + h.os + '</div>' : '';
+                        var ipWarn  = h.ip_changed ? ' <span class="text-yellow-500" title="IP changed from ' + (h.previous_ip || '') + '">\u26a0</span>' : '';
                         var lastScan = h.last_scan ? h.last_scan.split('T')[0] : '\u2014';
-                        hostRows += '<tr class="border-b border-gray-800 hover:bg-gray-800 transition cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">'
-                            + '<td class="py-2 pr-4"><div class="font-mono text-green-400 text-xs">' + h.ip + ipWarn + '</div>' + osCell + '</td>'
-                            + '<td class="py-2 pr-4"><div class="text-xs">' + nameCell + '</div>' + macCell + '</td>'
-                            + '<td class="py-2 pr-4 text-xs text-gray-300">' + h.scan_count + '</td>'
-                            + '<td class="py-2 pr-4 text-xs text-gray-300">' + h.open_ports + '</td>'
-                            + '<td class="py-2 pr-4 text-xs text-gray-300">' + h.findings + '</td>'
-                            + '<td class="py-2 pr-4">' + riskBadgeHtml(h.risk) + '</td>'
-                            + '<td class="py-2 pr-4 text-xs text-gray-500">' + lastScan + '</td>'
-                            + '<td class="py-2 text-xs text-blue-400">Drill in \u2192</td>'
+ 
+                        var actionCell = '';
+                        if (h.result_id) {
+                            actionCell =
+                                '<div class="flex gap-1.5 flex-wrap">'
+                                + '<a href="/report/' + h.result_id + '" target="_blank" '
+                                + 'class="text-xs px-2 py-1 rounded bg-cyan-900 hover:bg-cyan-800 text-cyan-300 border border-cyan-800 transition whitespace-nowrap">'
+                                + 'Report \u2197</a>'
+                                + '<button onclick="goToResult(' + h.result_id + ')" '
+                                + 'class="text-xs px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-green-400 border border-gray-700 transition whitespace-nowrap">'
+                                + '\u2192 Result</button>'
+                                + '</div>';
+                        } else {
+                            actionCell = '<span class="text-xs text-gray-700 italic">no result</span>';
+                        }
+ 
+                        hostRows +=
+                            '<tr class="border-b border-gray-800 hover:bg-gray-800 transition">'
+                            + '<td class="py-2 pr-4 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">'
+                            +     '<div class="font-mono text-green-400 text-xs">' + h.ip + ipWarn + '</div>' + osCell
+                            + '</td>'
+                            + '<td class="py-2 pr-4 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">'
+                            +     '<div class="text-xs">' + nameCell + '</div>' + macCell
+                            + '</td>'
+                            + '<td class="py-2 pr-4 text-xs text-gray-300 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">' + h.scan_count + '</td>'
+                            + '<td class="py-2 pr-4 text-xs text-gray-300 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">' + h.open_ports + '</td>'
+                            + '<td class="py-2 pr-4 text-xs text-gray-300 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">' + h.findings   + '</td>'
+                            + '<td class="py-2 pr-4 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">' + riskBadgeHtml(h.risk) + '</td>'
+                            + '<td class="py-2 pr-4 text-xs text-gray-500 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">' + lastScan + '</td>'
+                            + '<td class="py-2">' + actionCell + '</td>'
                             + '</tr>';
                     }
-                    tbody.innerHTML = '<table class="w-full text-sm">'
+                    tbody.innerHTML =
+                        '<table class="w-full text-sm">'
                         + '<thead><tr class="text-left text-gray-500 border-b border-gray-800 text-xs">'
-                        + '<th class="pb-2 pr-4">Host</th><th class="pb-2 pr-4">Identity</th>'
-                        + '<th class="pb-2 pr-4">Scans</th><th class="pb-2 pr-4">Open Ports</th>'
-                        + '<th class="pb-2 pr-4">Findings</th><th class="pb-2 pr-4">Risk</th>'
-                        + '<th class="pb-2 pr-4">Last Scan</th><th class="pb-2">Action</th>'
-                        + '</tr></thead><tbody>' + hostRows + '</tbody></table>';
+                        + '<th class="pb-2 pr-4">Host</th>'
+                        + '<th class="pb-2 pr-4">Identity</th>'
+                        + '<th class="pb-2 pr-4">Scans</th>'
+                        + '<th class="pb-2 pr-4">Open Ports</th>'
+                        + '<th class="pb-2 pr-4">Findings</th>'
+                        + '<th class="pb-2 pr-4">Risk</th>'
+                        + '<th class="pb-2 pr-4">Last Scan</th>'
+                        + '<th class="pb-2">Actions</th>'
+                        + '</tr></thead>'
+                        + '<tbody>' + hostRows + '</tbody>'
+                        + '</table>';
                 }
             }
+            
 
             // ── Per-host scan history ─────────────────────────────────────
             if (insightHost && data.scan_history.length) {
@@ -3299,22 +3406,38 @@ def dashboard():
                 var histRows = '';
                 for (var si = 0; si < data.scan_history.length; si++) {
                     var e = data.scan_history[si];
-                    histRows += '<tr class="border-b border-gray-800 text-xs">'
-                        + '<td class="py-2 pr-4 text-gray-400">' + (e.date || '\u2014') + '</td>'
-                        + '<td class="py-2 pr-4 font-mono text-blue-300">' + e.type + '</td>'
-                        + '<td class="py-2 pr-4 text-gray-400">' + e.profile + '</td>'
-                        + '<td class="py-2 pr-4 text-gray-300">' + e.open_ports + '</td>'
-                        + '<td class="py-2 pr-4 text-gray-300">' + e.findings + '</td>'
-                        + '<td class="py-2">' + riskBadgeHtml(e.risk) + '</td>'
+                    var histAction = e.result_id
+                        ? '<div class="flex gap-1">'
+                          + '<a href="/report/' + e.result_id + '" target="_blank" '
+                          + 'class="text-xs px-1.5 py-0.5 rounded bg-cyan-900 hover:bg-cyan-800 text-cyan-300 border border-cyan-800 transition">\u2197</a>'
+                          + '<button onclick="goToResult(' + e.result_id + ')" '
+                          + 'class="text-xs px-1.5 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-green-400 border border-gray-700 transition">\u2192</button>'
+                          + '</div>'
+                        : '';
+                    histRows +=
+                        '<tr class="border-b border-gray-800 text-xs">'
+                        + '<td class="py-2 pr-4 text-gray-400">'       + (e.date || '\u2014') + '</td>'
+                        + '<td class="py-2 pr-4 font-mono text-blue-300">' + e.type           + '</td>'
+                        + '<td class="py-2 pr-4 text-gray-400">'       + e.profile            + '</td>'
+                        + '<td class="py-2 pr-4 text-gray-300">'       + e.open_ports         + '</td>'
+                        + '<td class="py-2 pr-4 text-gray-300">'       + e.findings           + '</td>'
+                        + '<td class="py-2 pr-4">'                     + riskBadgeHtml(e.risk) + '</td>'
+                        + '<td class="py-2">'                          + histAction            + '</td>'
                         + '</tr>';
                 }
                 document.getElementById('insightScanHistoryTable').innerHTML =
                     '<table class="w-full text-sm">'
                     + '<thead><tr class="text-left text-gray-500 border-b border-gray-800 text-xs">'
-                    + '<th class="pb-2 pr-4">Date</th><th class="pb-2 pr-4">Type</th>'
-                    + '<th class="pb-2 pr-4">Profile</th><th class="pb-2 pr-4">Open Ports</th>'
-                    + '<th class="pb-2 pr-4">Findings</th><th class="pb-2">Risk</th>'
-                    + '</tr></thead><tbody>' + histRows + '</tbody></table>';
+                    + '<th class="pb-2 pr-4">Date</th>'
+                    + '<th class="pb-2 pr-4">Type</th>'
+                    + '<th class="pb-2 pr-4">Profile</th>'
+                    + '<th class="pb-2 pr-4">Open Ports</th>'
+                    + '<th class="pb-2 pr-4">Findings</th>'
+                    + '<th class="pb-2 pr-4">Risk</th>'
+                    + '<th class="pb-2">Actions</th>'
+                    + '</tr></thead>'
+                    + '<tbody>' + histRows + '</tbody>'
+                    + '</table>';
             } else if (insightHost) {
                 document.getElementById('insightScanHistoryTable').innerHTML = '<p class="text-xs text-gray-600">No scan history for this host in the selected window.</p>';
                 chartScanHistory = destroyChart(chartScanHistory);

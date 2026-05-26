@@ -217,62 +217,75 @@ def get_nse_flags(profile: str) -> list:
         return ["--script", "vuln"]
 
 
-def parse_nse_from_xml(xml_data: str) -> list:
-    """
-    Parses Nmap XML output and extracts NSE script results from <script> elements.
-    Returns a list of findings, each tied to the host/port they came from.
-    """
+def parse_nmap_xml(xml_data):
     root = ET.fromstring(xml_data)
-    findings = []
+    hosts = []
 
     for host in root.findall("host"):
-        addr_el = host.find("address")
-        if addr_el is None:
-            continue
-        addr = addr_el.get("addr")
+        # ── IP address ────────────────────────────────────────────────────
+        ip = None
+        mac = None
+        for addr_el in host.findall("address"):
+            atype = addr_el.get("addrtype", "")
+            if atype == "ipv4" or atype == "ipv6":
+                ip = addr_el.get("addr")
+            elif atype == "mac":
+                mac = addr_el.get("addr")
 
-        # host-level scripts (e.g. smb-vuln-*)
-        hostscript = host.find("hostscript")
-        if hostscript is not None:
-            for script in hostscript.findall("script"):
-                output = script.get("output", "").strip()
-                if output.startswith("ERROR: Script execution failed"):
-                    continue
-                findings.append({
-                    "host": addr,
-                    "port": portid,
-                    "service": service,
-                    "script_id": script.get("id"),
-                    "output": output,
-                })
+        if ip is None:
+            continue  # skip hosts with no IP (shouldn't happen but be safe)
 
-        # port-level scripts
+        # ── Hostname ──────────────────────────────────────────────────────
+        hostname = None
+        hostnames_el = host.find("hostnames")
+        if hostnames_el is not None:
+            for hn in hostnames_el.findall("hostname"):
+                name = hn.get("name", "").strip()
+                if name:
+                    hostname = name
+                    break  # take the first non-empty one
+
+        # ── OS fingerprint ────────────────────────────────────────────────
+        os_guess = None
+        os_el = host.find("os")
+        if os_el is not None:
+            best_match = None
+            best_accuracy = -1
+            for osmatch in os_el.findall("osmatch"):
+                try:
+                    accuracy = int(osmatch.get("accuracy", "0"))
+                except ValueError:
+                    accuracy = 0
+                if accuracy > best_accuracy:
+                    best_accuracy = accuracy
+                    best_match = osmatch.get("name", "").strip()
+            if best_match:
+                os_guess = best_match
+
+        # ── Ports ─────────────────────────────────────────────────────────
+        ports_data = []
         ports_el = host.find("ports")
-        if ports_el is None:
-            continue
-
-        for port_el in ports_el.findall("port"):
-            portid = int(port_el.get("portid"))
-            state_el = port_el.find("state")
-            if state_el is None or state_el.get("state") != "open":
-                continue
-
-            service_el = port_el.find("service")
-            service = service_el.get("name", "unknown") if service_el is not None else "unknown"
-
-            for script in port_el.findall("script"):
-                output = script.get("output", "").strip()
-                if output.startswith("ERROR: Script execution failed"):
-                    continue
-                findings.append({
-                    "host": addr,
-                    "port": portid,
+        if ports_el:
+            for port in ports_el.findall("port"):
+                state_el = port.find("state")
+                service_el = port.find("service")
+                state = state_el.get("state") if state_el is not None else "unknown"
+                service = service_el.get("name", "unknown") if service_el is not None else "unknown"
+                ports_data.append({
+                    "port": int(port.get("portid")),
+                    "state": state,
                     "service": service,
-                    "script_id": script.get("id"),
-                    "output": output,
                 })
 
-    return findings
+        hosts.append({
+            "host": ip,
+            "mac": mac,
+            "hostname": hostname,
+            "os": os_guess,
+            "ports": ports_data,
+        })
+
+    return hosts
 
 
 def resolve_nse_ports(ports_str: str | None, profile: str) -> list[str]:
