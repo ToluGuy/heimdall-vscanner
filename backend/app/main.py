@@ -1497,7 +1497,6 @@ def get_insights(
     total_scans  = len(jobs)
     unique_hosts = len(set(j.target for j in jobs))
  
-    # Deduplicated open ports: unique (host_ip, port) pairs across the window
     unique_open_ports: set = set()
     risk_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0, "UNANALYSED": 0}
  
@@ -1513,8 +1512,14 @@ def get_insights(
             for p in h.get("ports", []):
                 if p.get("state") == "open":
                     unique_open_ports.add((host_ip, p["port"]))
+        # Also collect ports from NSE findings
+        for f in out.get("nse", {}).get("findings", []):
+            if f.get("port") and f.get("host"):
+                unique_open_ports.add((f["host"], f["port"]))
+ 
         if r.analysis:
-            m = re.search(r"##\\s*Risk Level\\s*\\n+(\\w+)", r.analysis, re.IGNORECASE)
+            # Single backslash — this is real Python regex, not an embedded string
+            m = re.search(r"##\s*Risk Level\s*\n+(\w+)", r.analysis, re.IGNORECASE)
             risk = m.group(1).upper() if m else "INFO"
             if risk in risk_counts:
                 risk_counts[risk] += 1
@@ -1546,13 +1551,13 @@ def get_insights(
         ip = j.target
         if ip not in host_data:
             host_data[ip] = {
-                "ip":              ip,
-                "scan_count":      0,
-                "open_ports_set":  set(),   # (host_ip, port) — deduplicated
-                "findings":        0,
-                "last_scan":       None,
-                "risk":            "UNANALYSED",
-                "result_id":       None,
+                "ip":               ip,
+                "scan_count":       0,
+                "open_ports_set":   set(),
+                "findings":         0,
+                "last_scan":        None,
+                "risk":             "UNANALYSED",
+                "result_id":        None,
                 "latest_result_ts": None,
             }
         host_data[ip]["scan_count"] += 1
@@ -1573,35 +1578,36 @@ def get_insights(
         except Exception:
             continue
  
-        # Deduplicated open ports per host
+        # Deduplicated open ports — nmap + NSE findings
         for h in out.get("nmap", []):
             host_ip = h.get("host") or ip
             for p in h.get("ports", []):
                 if p.get("state") == "open":
                     host_data[ip]["open_ports_set"].add((host_ip, p["port"]))
+        for f in out.get("nse", {}).get("findings", []):
+            if f.get("port") and f.get("host"):
+                host_data[ip]["open_ports_set"].add((f["host"], f["port"]))
  
-        # Findings from the latest result only (avoids inflation on rescan)
+        # Findings from the latest result only
         result_ts = j.completed_at or datetime.min
         if host_data[ip]["latest_result_ts"] is None or result_ts > host_data[ip]["latest_result_ts"]:
             host_data[ip]["latest_result_ts"] = result_ts
             host_data[ip]["result_id"]        = r.id
  
             nse_count = len(out.get("nse", {}).get("findings", [])) if out.get("nse") else 0
- 
             nikto_count = 0
             for v in out.get("nikto", {}).values():
                 if v.get("error"):
                     continue
                 if v.get("raw"):
-                    nikto_count += len([l for l in v["raw"].split("\\n") if l.startswith("+ [")])
+                    nikto_count += len([l for l in v["raw"].split("\n") if l.startswith("+ [")])
                 elif isinstance(v, list) and v:
                     nikto_count += len(v[0].get("vulnerabilities", []))
- 
             host_data[ip]["findings"] = nse_count + nikto_count
  
-        # Risk: worst seen across all results for this host
+        # Risk: worst seen
         if r.analysis:
-            m = re.search(r"##\\s*Risk Level\\s*\\n+(\\w+)", r.analysis, re.IGNORECASE)
+            m = re.search(r"##\s*Risk Level\s*\n+(\w+)", r.analysis, re.IGNORECASE)
             risk    = m.group(1).upper() if m else "INFO"
             current = host_data[ip]["risk"]
             try:
@@ -1640,27 +1646,33 @@ def get_insights(
             if result_for_job:
                 try:
                     out = json.loads(result_for_job.output)
+ 
+                    # Count unique open ports: nmap + NSE findings
                     ports_in_scan: set = set()
                     for h in out.get("nmap", []):
                         for p in h.get("ports", []):
                             if p.get("state") == "open":
                                 ports_in_scan.add(p["port"])
+                    for f in out.get("nse", {}).get("findings", []):
+                        if f.get("port"):
+                            ports_in_scan.add(f["port"])
                     entry["open_ports"] = len(ports_in_scan)
  
-                    nse_f    = len(out.get("nse", {}).get("findings", [])) if out.get("nse") else 0
-                    nikto_f  = 0
+                    nse_f   = len(out.get("nse", {}).get("findings", [])) if out.get("nse") else 0
+                    nikto_f = 0
                     for v in out.get("nikto", {}).values():
                         if v.get("error"):
                             continue
                         if v.get("raw"):
-                            nikto_f += len([l for l in v["raw"].split("\\n") if l.startswith("+ [")])
+                            nikto_f += len([l for l in v["raw"].split("\n") if l.startswith("+ [")])
                         elif isinstance(v, list) and v:
                             nikto_f += len(v[0].get("vulnerabilities", []))
                     entry["findings"] = nse_f + nikto_f
                 except Exception:
                     pass
+ 
                 if result_for_job.analysis:
-                    m = re.search(r"##\\s*Risk Level\\s*\\n+(\\w+)", result_for_job.analysis, re.IGNORECASE)
+                    m = re.search(r"##\s*Risk Level\s*\n+(\w+)", result_for_job.analysis, re.IGNORECASE)
                     entry["risk"] = m.group(1).upper() if m else "INFO"
             scan_history.append(entry)
  
@@ -2453,7 +2465,7 @@ def dashboard():
             if (tab === 'discovery') { loadSweepHistory(); }
             if (tab === 'schedules') { loadSchedules(); }
             if (tab === 'insights') { loadInsights(); }
-            if (tab === 'topology') { loadTopology(); }
+            if (tab === 'topology') { setTimeout(loadTopology, 50); }
         }
 
         // ── AUTH ───────────────────────────────────────────────────────────
@@ -3198,8 +3210,8 @@ def dashboard():
             ).filter(Boolean).join(' · ') || '<span class="text-gray-600">None analysed</span>';
 
             document.getElementById('insightStats').innerHTML = [
-                ['Total Scans', data.stats.total_scans, 'text-green-400'],
-                [insightHost ? 'Scan Count' : 'Unique Hosts', insightHost ? data.stats.total_scans : data.stats.unique_hosts, 'text-blue-400'],
+                [insightHost ? 'Scans (this host)' : 'Total Scans', insightHost ? data.stats.total_scans : data.stats.total_scans, 'text-green-400'],
+                [insightHost ? 'Host' : 'Unique Hosts', insightHost ? insightHost : data.stats.unique_hosts, 'text-blue-400'],
                 ['Open Ports Found', data.stats.total_open_ports, 'text-orange-400'],
             ].map(([label, val, cls]) => `
                 <div class="bg-gray-900 rounded-xl border border-gray-800 p-4 text-center">
@@ -3730,14 +3742,19 @@ function renderTopology(data) {
         .on('zoom', (event) => {
             g.attr('transform', event.transform);
         });
- 
-    svg.call(topoZoom);
- 
-    // Initial centering transform
-    svg.call(topoZoom.transform, d3.zoomIdentity
-        .translate(W / 2, H / 2)
-        .scale(0.85));
- 
+    
+     svg.call(topoZoom);
+
+    // Re-read dimensions after layout is complete, then center
+    requestAnimationFrame(() => {
+        const svgEl = document.getElementById('topoSvg');
+        const fw = svgEl.clientWidth  || wrap.clientWidth;
+        const fh = svgEl.clientHeight || wrap.clientHeight;
+        svg.call(topoZoom.transform, d3.zoomIdentity
+            .translate(fw / 2, fh / 2)
+            .scale(0.85));
+    });
+
     // Click on background → deselect
     svg.on('click', () => closeTopoPanel());
 }
