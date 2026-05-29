@@ -2668,6 +2668,15 @@ def dashboard():
             const d = new Date(normalized);
             return `${d.toISOString().split('T')[0]} at ${d.toTimeString().split(' ')[0]}`;
         }
+        function relativeTime(ts) {
+            if (!ts) return '';
+            const normalized = ts.endsWith('Z') ? ts : ts + 'Z';
+            const diff = Math.floor((Date.now() - new Date(normalized).getTime()) / 1000);
+            if (diff < 60)    return 'just now';
+            if (diff < 3600)  return Math.floor(diff / 60) + 'm ago';
+            if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+            return Math.floor(diff / 86400) + 'd ago';
+        }
         function elapsedDisplay(startedAt) {
             if (!startedAt) return 'running…';
             const ts = startedAt.endsWith('Z') ? startedAt : startedAt + 'Z';
@@ -2892,30 +2901,116 @@ def dashboard():
             if (!res) return;
             const data = await res.json();
             if (!data.length) { document.getElementById("results").innerHTML = `<p class="text-gray-500 text-sm">${isHistory ? 'No archived results.' : 'No results yet.'}</p>`; return; }
+            
             const html = data.slice().sort((a, b) => b.id - a.id).map(r => {
                 const out = r.output;
-                const nmapCount = out.nmap ? out.nmap.reduce((a, h) => a + (h.ports || []).filter(p => p.state === 'open').length, 0) : 0;
-                const niktoCount = out.nikto ? Object.values(out.nikto).reduce((a, v) => { if (v.error) return a; if (v.raw) return a + (v.raw.match(/^\\+ \\[/gm) || []).length; return a + (v[0]?.vulnerabilities?.length || 0); }, 0) : 0;
+ 
+                // ── Counts ────────────────────────────────────────────────
+                const nmapCount = out.nmap
+                    ? out.nmap.reduce((a, h) => a + (h.ports || []).filter(p => p.state === 'open').length, 0)
+                    : 0;
+                const niktoCount = out.nikto
+                    ? Object.values(out.nikto).reduce((a, v) => {
+                        if (v.error) return a;
+                        if (v.raw) return a + (v.raw.match(/^\\+ \\[/gm) || []).length;
+                        return a + (v[0]?.vulnerabilities?.length || 0);
+                      }, 0)
+                    : 0;
                 const nseCount = out.nse ? (out.nse.findings || []).length : 0;
-                const summary = [out.nmap ? `${nmapCount} open port(s)` : null, out.nikto ? `${niktoCount} web finding(s)` : null, out.nse ? `${nseCount} NSE finding(s)` : null].filter(Boolean).join(' · ') || 'No data';
+ 
+                // ── Risk badge ────────────────────────────────────────────
+                let riskBadge = '';
+                if (r.analysis) {
+                    const rm = r.analysis.match(/##\\s*Risk Level\\s*\\n+(\\w+)/i);
+                    const riskLevel = rm ? rm[1].toUpperCase() : 'INFO';
+                    const riskStyles = {
+                        CRITICAL: 'bg-red-900 text-red-200 border-red-700',
+                        HIGH:     'bg-orange-900 text-orange-200 border-orange-700',
+                        MEDIUM:   'bg-yellow-900 text-yellow-200 border-yellow-700',
+                        LOW:      'bg-blue-900 text-blue-200 border-blue-700',
+                        INFO:     'bg-gray-800 text-gray-400 border-gray-600',
+                    };
+                    const riskCls = riskStyles[riskLevel] || riskStyles.INFO;
+                    riskBadge = '<span class="text-xs px-2 py-0.5 rounded-full border font-bold tracking-wide flex-shrink-0 ' + riskCls + '">' + riskLevel + '</span>';
+                } else {
+                    riskBadge = '<span class="text-xs px-2 py-0.5 rounded-full border border-gray-700 text-gray-600 font-medium animate-pulse flex-shrink-0" title="Click Analyse to generate AI risk assessment">unanalysed</span>';
+                }
+ 
+                // ── Target label: hostname > IP ───────────────────────────
+                let targetLabel = r.job_info ? r.job_info.target : ('Job #' + r.job_id);
+                if (out.nmap && out.nmap.length > 0 && out.nmap[0].hostname) {
+                    targetLabel = out.nmap[0].hostname;
+                }
+                const targetEl = '<span class="font-mono text-xs text-green-400 font-semibold flex-shrink-0">' + targetLabel + '</span>';
+ 
+                // ── Finding pills ─────────────────────────────────────────
+                const pills = [];
+                if (out.nmap !== undefined) {
+                    pills.push('<span class="text-xs px-2 py-0.5 rounded-full bg-blue-950 text-blue-300 border border-blue-900 whitespace-nowrap">' + nmapCount + ' open port' + (nmapCount !== 1 ? 's' : '') + '</span>');
+                }
+                if (niktoCount > 0) {
+                    pills.push('<span class="text-xs px-2 py-0.5 rounded-full bg-orange-950 text-orange-300 border border-orange-900 whitespace-nowrap">' + niktoCount + ' web finding' + (niktoCount !== 1 ? 's' : '') + '</span>');
+                }
+                if (nseCount > 0) {
+                    pills.push('<span class="text-xs px-2 py-0.5 rounded-full bg-purple-950 text-purple-300 border border-purple-900 whitespace-nowrap">' + nseCount + ' NSE finding' + (nseCount !== 1 ? 's' : '') + '</span>');
+                }
+                if (!pills.length && !out.nmap && !out.nse && !out.nikto) {
+                    pills.push('<span class="text-xs text-gray-600 italic">no data</span>');
+                }
+ 
+                // ── Timestamp ─────────────────────────────────────────────
+                const ts = r.job_info ? relativeTime(r.job_info.completed_at) : '';
+ 
+                // ── Actions ───────────────────────────────────────────────
                 const actions = isHistory
-                    ? `<div class="flex items-center gap-3">
-                    <input type="checkbox" class="result-checkbox accent-red-500" data-id="${r.id}">
-                    <a href="/report/${r.id}" target="_blank" class="text-xs text-cyan-400 hover:text-cyan-300 transition">Report</a>
-                    <button onclick="deleteResult(${r.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button>
-                    </div>`
-                    : `<div class="flex items-center gap-3">
-                    <input type="checkbox" class="result-checkbox accent-yellow-500" data-id="${r.id}">
-                    <a href="/report/${r.id}" target="_blank" class="text-xs text-cyan-400 hover:text-cyan-300 transition">Report</a>
-                    <button onclick="triggerAnalysis(${r.id})" class="text-xs text-purple-400 hover:text-purple-300 transition">Analyse</button>
-                    <button onclick="clearResult(${r.id})" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button></div>`;
-                return `<div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
-                <div class="flex items-center justify-between px-5 py-4 cursor-pointer hover:bg-gray-750 transition" 
-                onclick="toggleResult(${r.id})">
-                <div class="flex items-center gap-4">
-                <span class="text-sm font-semibold text-white">Result #${r.id}</span>
-                <span class="text-xs text-gray-400">Job #${r.job_id}</span>
-                <span class="text-xs text-gray-500">${summary}</span></div><div class="flex items-center gap-4" onclick="event.stopPropagation()">${actions}<span id="result-arrow-${r.id}" class="text-gray-400 text-xs pointer-events-none">▼</span></div></div><div id="result-body-${r.id}" class="hidden px-5 pb-5 border-t border-gray-700 pt-4">${isHistory ? renderJobInfo(r.job_info) : ''}${out.nmap ? `<div class="mb-4"><p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Nmap</p>${renderNmapResult(out.nmap)}</div>` : ''}${out.nikto ? `<div class="mb-4"><p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Nikto</p>${renderNiktoResult(out.nikto)}</div>` : ''}${out.nse ? `<div class="mb-4"><p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">NSE</p>${renderNseResult(out.nse)}</div>` : ''}${!out.nmap && !out.nikto && !out.nse ? `<pre class="text-xs text-gray-400 overflow-x-auto">${JSON.stringify(out, null, 2)}</pre>` : ''}${r.analysis ? `<div class="mb-4">${renderAnalysis(r.analysis)}</div>` : `<div class="mb-2 flex items-center gap-3"><span class="text-xs text-gray-600 italic">Analysis pending - Click Analyse above to generate</span></div>`}</div></div>`;
+                    ? '<div class="flex items-center gap-3">'
+                      + '<input type="checkbox" class="result-checkbox accent-red-500" data-id="' + r.id + '">'
+                      + '<a href="/report/' + r.id + '" target="_blank" class="text-xs text-cyan-400 hover:text-cyan-300 transition">Report</a>'
+                      + '<button onclick="deleteResult(' + r.id + ')" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button>'
+                      + '</div>'
+                    : '<div class="flex items-center gap-3">'
+                      + '<input type="checkbox" class="result-checkbox accent-yellow-500" data-id="' + r.id + '">'
+                      + '<a href="/report/' + r.id + '" target="_blank" class="text-xs text-cyan-400 hover:text-cyan-300 transition">Report</a>'
+                      + '<button onclick="triggerAnalysis(' + r.id + ')" class="text-xs text-purple-400 hover:text-purple-300 transition">Analyse</button>'
+                      + '<button onclick="clearResult(' + r.id + ')" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button>'
+                      + '</div>';
+ 
+                return '<div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">'
+ 
+                    // ── Collapsed header ──────────────────────────────────
+                    + '<div class="flex items-center justify-between px-5 py-3.5 cursor-pointer hover:bg-gray-750 transition" onclick="toggleResult(' + r.id + ')">'
+ 
+                        // Left: id · risk · target · pills
+                        + '<div class="flex items-center gap-2.5 flex-wrap min-w-0 pr-2">'
+                        +     '<span class="text-sm font-semibold text-white flex-shrink-0">Result #' + r.id + '</span>'
+                        +     riskBadge
+                        +     targetEl
+                        +     '<div class="flex items-center gap-1.5 flex-wrap">' + pills.join('') + '</div>'
+                        + '</div>'
+ 
+                        // Right: timestamp · actions · chevron
+                        + '<div class="flex items-center gap-3 flex-shrink-0">'
+                        +     (ts ? '<span class="text-xs text-gray-600 hidden md:block">' + ts + '</span>' : '')
+                        +     '<div onclick="event.stopPropagation()">' + actions + '</div>'
+                        +     '<span id="result-arrow-' + r.id + '" class="text-gray-500 text-xs pointer-events-none">▼</span>'
+                        + '</div>'
+ 
+                    + '</div>'
+ 
+                    // ── Expanded body ─────────────────────────────────────
+                    + '<div id="result-body-' + r.id + '" class="hidden px-5 pb-5 border-t border-gray-700 pt-4">'
+                    +     (isHistory ? renderJobInfo(r.job_info) : '')
+                    +     (out.nmap  ? '<div class="mb-4"><p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Nmap</p>'   + renderNmapResult(out.nmap)  + '</div>' : '')
+                    +     (out.nikto ? '<div class="mb-4"><p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Nikto</p>' + renderNiktoResult(out.nikto) + '</div>' : '')
+                    +     (out.nse   ? '<div class="mb-4"><p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">NSE</p>'   + renderNseResult(out.nse)   + '</div>' : '')
+                    +     (!out.nmap && !out.nikto && !out.nse ? '<pre class="text-xs text-gray-400 overflow-x-auto">' + JSON.stringify(out, null, 2) + '</pre>' : '')
+                    +     (r.analysis
+                            ? '<div class="mb-4">' + renderAnalysis(r.analysis) + '</div>'
+                            : '<div class="mb-2"><span class="text-xs text-gray-600 italic">Analysis pending — click Analyse above to generate assessment</span></div>'
+                          )
+                    + '</div>'
+ 
+                + '</div>';
             }).join('');
             document.getElementById("results").innerHTML = html;
         }
