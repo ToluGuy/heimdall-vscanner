@@ -324,6 +324,18 @@ BEGIN
         );
         RAISE NOTICE 'Created schedules table';
     END IF;
+    
+    -- settings table
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_name='settings'
+    ) THEN
+        CREATE TABLE settings (
+            key   VARCHAR PRIMARY KEY,
+            value VARCHAR NOT NULL
+        );
+        RAISE NOTICE 'Created settings table';
+    END IF;
 END
 \$\$;
 EOF
@@ -333,6 +345,7 @@ PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB
     -c "GRANT ALL ON TABLE schedules TO ${DB_USER};" 2>/dev/null || true
 PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
     -c "GRANT USAGE, SELECT ON SEQUENCE schedules_id_seq TO ${DB_USER};" 2>/dev/null || true
+PGPASSWORD="$DB_PASSWORD" psql ... -c "GRANT ALL ON TABLE settings TO ${DB_USER};"
 
 log "Migrations complete"
 

@@ -102,3 +102,10 @@ class Schedule(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_run_at = Column(DateTime, nullable=True)       # when the last job was created
     next_run_at = Column(DateTime, nullable=True)       # when the next job should fire
+
+
+class Setting(Base):
+    __tablename__ = "settings"
+ 
+    key   = Column(String, primary_key=True, index=True)
+    value = Column(String, nullable=False)

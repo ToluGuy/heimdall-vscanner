@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from .db import Base, engine, get_db, SessionLocal
-from .models import Agent, Job, Result, DiscoverySweep, Schedule, Host
+from .models import Agent, Job, Result, DiscoverySweep, Schedule, Host, Setting
 from .schemas import AgentCreate, AgentResponse, JobResponse, ResultCreate, ResultResponse, JobCreate
 from .logger import get_logger
 from .ai_analysis import analyse_scan, AI_AUTO_ANALYSE, AI_PROVIDER
@@ -41,7 +41,8 @@ security = HTTPBasic()
 
 def mark_stale_agents(db: Session):
     """Flag agents whose last heartbeat is older than STALE_AGENT_HOURS."""
-    cutoff = datetime.utcnow() - timedelta(hours=STALE_AGENT_HOURS)
+    stale_hours = int(get_setting(db, "stale_agent_hours"))
+    cutoff = datetime.utcnow() - timedelta(hours=stale_hours)
     stale = db.query(Agent).filter(
         Agent.last_seen < cutoff,
         Agent.is_stale == False
@@ -112,6 +113,39 @@ def run_scheduler():
         _time.sleep(SCHEDULE_TICK_SECONDS)
 
 
+SETTING_DEFAULTS = {
+    "ai_auto_analyse":    "true",
+    "stale_agent_hours":  "24",
+}
+ 
+def _init_default_settings():
+    """Insert default settings rows if they don't already exist."""
+    db = SessionLocal()
+    try:
+        for key, value in SETTING_DEFAULTS.items():
+            existing = db.query(Setting).filter(Setting.key == key).first()
+            if not existing:
+                db.add(Setting(key=key, value=value))
+        db.commit()
+    except Exception as e:
+        logger.error(f"Settings init error: {e}")
+    finally:
+        db.close()
+ 
+ 
+def get_setting(db, key: str) -> str:
+    """Get a setting value, falling back to env var then hardcoded default."""
+    row = db.query(Setting).filter(Setting.key == key).first()
+    if row:
+        return row.value
+    # Fall back to env / hardcoded defaults
+    if key == "stale_agent_hours":
+        return os.environ.get("STALE_AGENT_HOURS", "24")
+    if key == "ai_auto_analyse":
+        return "true" if AI_AUTO_ANALYSE else "false"
+    return SETTING_DEFAULTS.get(key, "")
+
+
 @app.on_event("startup")
 def startup_cleanup():
     thread = threading.Thread(target=run_stale_cleanup, daemon=True)
@@ -121,6 +155,8 @@ def startup_cleanup():
     sched_thread = threading.Thread(target=run_scheduler, daemon=True)
     sched_thread.start()
     logger.info("Job scheduler thread started")
+    
+    _init_default_settings()
 
 DASHBOARD_USERNAME = os.environ.get("DASHBOARD_USERNAME", "admin")
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "vapt-admin")
@@ -294,7 +330,8 @@ def submit_result(
     db.refresh(new_result)
 
     # Trigger AI analysis in background if enabled
-    if AI_AUTO_ANALYSE:
+    db_auto = get_setting(db, "ai_auto_analyse")
+    if db_auto == "true":
         result_id = new_result.id
         thread = threading.Thread(
             target=run_ai_analysis,
@@ -1841,6 +1878,47 @@ def _count_risks(nodes):
     return counts
 
 
+# --- SETTINGS ---
+ 
+@app.get("/settings")
+def get_settings(
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    """Return all server-side settings as a flat dict."""
+    rows = db.query(Setting).all()
+    result = {r.key: r.value for r in rows}
+    # Fill in any missing keys with defaults
+    for key, default in SETTING_DEFAULTS.items():
+        if key not in result:
+            result[key] = default
+    return result
+ 
+ 
+@app.patch("/settings")
+def update_settings(
+    data: dict,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    """Update one or more settings. Unknown keys are ignored."""
+    allowed_keys = set(SETTING_DEFAULTS.keys())
+    updated = []
+    for key, value in data.items():
+        if key not in allowed_keys:
+            continue
+        row = db.query(Setting).filter(Setting.key == key).first()
+        if row:
+            row.value = str(value)
+        else:
+            db.add(Setting(key=key, value=str(value)))
+        updated.append(key)
+ 
+    db.commit()
+    logger.info(f"Settings updated: {updated}")
+    return {"ok": True, "updated": updated}
+
+
 # --- DASHBOARD ---
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -1865,6 +1943,31 @@ def dashboard():
             }
             .tab-panel { display: none; }
             .tab-panel.active { display: block; }
+            
+            /* ── Light theme ── */
+            body.theme-light {
+                --tw-bg-opacity: 1;
+                background-color: #f1f5f9 !important;
+                color: #0f172a !important;
+            }
+            body.theme-light .bg-gray-950  { background-color: #f1f5f9 !important; }
+            body.theme-light .bg-gray-900  { background-color: #ffffff !important; }
+            body.theme-light .bg-gray-800  { background-color: #f8fafc !important; }
+            body.theme-light .bg-gray-750  { background-color: #f1f5f9 !important; }
+            body.theme-light .bg-gray-700  { background-color: #e2e8f0 !important; }
+            body.theme-light .border-gray-800 { border-color: #e2e8f0 !important; }
+            body.theme-light .border-gray-700 { border-color: #cbd5e1 !important; }
+            body.theme-light .text-gray-100 { color: #0f172a !important; }
+            body.theme-light .text-gray-200 { color: #1e293b !important; }
+            body.theme-light .text-gray-300 { color: #334155 !important; }
+            body.theme-light .text-gray-400 { color: #475569 !important; }
+            body.theme-light .text-gray-500 { color: #64748b !important; }
+            body.theme-light .text-gray-600 { color: #94a3b8 !important; }
+            body.theme-light .text-gray-700 { color: #cbd5e1 !important; }
+            body.theme-light .text-white    { color: #0f172a !important; }
+            body.theme-light .bg-gray-950.bg-opacity-95 { background-color: rgba(241,245,249,0.97) !important; }
+            /* Keep accent colours as-is in light mode — green, blue, red etc stay vivid */
+            
         </style>
     </head>
     <body class="bg-gray-950 text-gray-100 min-h-screen">
@@ -1940,6 +2043,159 @@ def dashboard():
                 </div>
             </div>
         </div>
+        
+        
+        <!-- ── SETTINGS PANEL ─────────────────────────────────────────── -->
+        
+        <!-- Backdrop -->
+        <div id="settingsBackdrop"
+             class="fixed inset-0 bg-black bg-opacity-50 z-40 hidden transition-opacity"
+             onclick="closeSettings()"></div>
+ 
+        <!-- Slide-in panel -->
+        <div id="settingsPanel"
+             class="fixed top-0 right-0 h-full w-80 bg-gray-900 border-l border-gray-800 z-50 transform translate-x-full transition-transform duration-300 overflow-y-auto flex flex-col">
+ 
+            <!-- Panel header -->
+            <div class="flex items-center justify-between px-6 py-4 border-b border-gray-800 flex-shrink-0">
+                <div class="flex items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                    </svg>
+                    <h2 class="text-sm font-semibold text-green-400 tracking-wide">Settings</h2>
+                </div>
+                <button onclick="closeSettings()" class="text-gray-500 hover:text-gray-300 transition text-lg leading-none">✕</button>
+            </div>
+ 
+            <!-- Panel body -->
+            <div class="flex-1 px-6 py-5 space-y-7 overflow-y-auto">
+ 
+                <!-- ── Appearance ── -->
+                <section>
+                    <p class="text-xs font-bold uppercase tracking-wider text-gray-500 mb-3">Appearance</p>
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm text-gray-200">Theme</p>
+                            <p class="text-xs text-gray-500 mt-0.5">Light or dark dashboard</p>
+                        </div>
+                        <div class="flex items-center gap-1 bg-gray-800 rounded-lg p-1 border border-gray-700">
+                            <button onclick="setTheme('dark')" id="theme-dark"
+                                class="theme-btn text-xs px-3 py-1.5 rounded-md transition font-medium bg-gray-700 text-white">
+                                Dark
+                            </button>
+                            <button onclick="setTheme('light')" id="theme-light"
+                                class="theme-btn text-xs px-3 py-1.5 rounded-md transition font-medium text-gray-400 hover:text-white">
+                                Light
+                            </button>
+                        </div>
+                    </div>
+                </section>
+ 
+                <hr class="border-gray-800">
+ 
+                <!-- ── Scan defaults ── -->
+                <section>
+                    <p class="text-xs font-bold uppercase tracking-wider text-gray-500 mb-3">Scan Defaults</p>
+                    <p class="text-xs text-gray-600 mb-3">Pre-fills the Create Job form. You can still change them per job.</p>
+ 
+                    <div class="space-y-3">
+                        <div class="flex items-center justify-between gap-3">
+                            <label class="text-sm text-gray-300 flex-shrink-0">Profile</label>
+                            <select id="setting-default-profile" onchange="saveClientSetting('defaultProfile', this.value)"
+                                class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-green-500 w-36">
+                                <option value="standard">Standard</option>
+                                <option value="light">Light</option>
+                                <option value="full">Full</option>
+                            </select>
+                        </div>
+                        <div class="flex items-center justify-between gap-3">
+                            <label class="text-sm text-gray-300 flex-shrink-0">Mode</label>
+                            <select id="setting-default-mode" onchange="saveClientSetting('defaultMode', this.value)"
+                                class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-green-500 w-36">
+                                <option value="remote">Remote</option>
+                                <option value="agent">Agent</option>
+                            </select>
+                        </div>
+                        <div class="flex items-center justify-between gap-3">
+                            <label class="text-sm text-gray-300 flex-shrink-0">Priority</label>
+                            <select id="setting-default-priority" onchange="saveClientSetting('defaultPriority', this.value)"
+                                class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-green-500 w-36">
+                                <option value="medium">Medium</option>
+                                <option value="high">High</option>
+                                <option value="low">Low</option>
+                            </select>
+                        </div>
+                    </div>
+                </section>
+ 
+                <hr class="border-gray-800">
+ 
+                <!-- ── Dashboard behaviour ── -->
+                <section>
+                    <p class="text-xs font-bold uppercase tracking-wider text-gray-500 mb-3">Dashboard</p>
+ 
+                    <div class="space-y-3">
+                        <div class="flex items-center justify-between gap-3">
+                            <div>
+                                <p class="text-sm text-gray-300">Auto-refresh interval</p>
+                                <p class="text-xs text-gray-600 mt-0.5">Jobs &amp; agents poll rate</p>
+                            </div>
+                            <select id="setting-refresh-interval" onchange="saveClientSetting('refreshInterval', this.value); applyRefreshInterval()"
+                                class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-green-500 w-24">
+                                <option value="3000">3s</option>
+                                <option value="5000">5s</option>
+                                <option value="10000">10s</option>
+                                <option value="30000">30s</option>
+                                <option value="0">Off</option>
+                            </select>
+                        </div>
+                    </div>
+                </section>
+ 
+                <hr class="border-gray-800">
+ 
+                <!-- ── Server settings ── -->
+                <section>
+                    <p class="text-xs font-bold uppercase tracking-wider text-gray-500 mb-3">Server</p>
+                    <p class="text-xs text-gray-600 mb-3">These are saved to the database and take effect immediately.</p>
+ 
+                    <div class="space-y-4">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <p class="text-sm text-gray-300">AI auto-analysis</p>
+                                <p class="text-xs text-gray-600 mt-0.5">Analyse results automatically after each scan</p>
+                            </div>
+                            <button id="setting-ai-toggle" onclick="toggleServerSetting('ai_auto_analyse')"
+                                class="relative w-11 h-6 rounded-full transition-colors duration-200 focus:outline-none bg-gray-700 border border-gray-600">
+                                <span id="setting-ai-knob"
+                                    class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-gray-400 transition-transform duration-200"></span>
+                            </button>
+                        </div>
+ 
+                        <div class="flex items-center justify-between gap-3">
+                            <div>
+                                <p class="text-sm text-gray-300">Stale agent threshold</p>
+                                <p class="text-xs text-gray-600 mt-0.5">Hours before an agent is marked stale</p>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <input id="setting-stale-hours" type="number" min="1" max="720"
+                                    class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-green-500 w-20 text-right"
+                                    onchange="saveServerSetting('stale_agent_hours', this.value)">
+                                <span class="text-xs text-gray-500">hrs</span>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+ 
+            </div>
+ 
+            <!-- Panel footer -->
+            <div class="px-6 py-4 border-t border-gray-800 flex-shrink-0">
+                <p class="text-xs text-gray-700 text-center">Heimdall V-Scanner</p>
+            </div>
+        </div>
+        
 
         <!-- ── HEADER ───────────────────────────────────────────────────── -->
         <div class="bg-gray-900 border-b border-gray-800 px-6 py-3 flex items-center justify-between">
@@ -1971,8 +2227,15 @@ def dashboard():
                     Topology
                 </button>
             </nav>
-
-            <button onclick="loadAll()" class="text-sm bg-gray-800 hover:bg-gray-700 px-4 py-2 rounded-lg transition">↻ Refresh</button>
+            <div class="flex items-center gap-2">
+                <button onclick="loadAll()" class="text-sm bg-gray-800 hover:bg-gray-700 px-4 py-2 rounded-lg transition">↻ Refresh</button>
+                <button onclick="openSettings()" class="text-sm bg-gray-800 hover:bg-gray-700 w-9 h-9 rounded-lg transition flex items-center justify-center" title="Settings">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                    </svg>
+                </button>
+            </div>
         </div>
 
         <!-- ── TAB: DASHBOARD ───────────────────────────────────────────── -->
@@ -2453,6 +2716,168 @@ def dashboard():
 
         // Pending sweep payload (hosts + params) waiting for user confirmation
         let pendingSweepPayload = null;
+        
+        // ── SETTINGS ──────────────────────────────────────────────────────────
+ 
+        // Server settings cache
+        let serverSettings = {};
+ 
+        // ── Panel open/close ──────────────────────────────────────────────────
+        function openSettings() {
+            loadServerSettings();
+            applyClientSettingsToPanel();
+            document.getElementById('settingsPanel').classList.remove('translate-x-full');
+            document.getElementById('settingsBackdrop').classList.remove('hidden');
+        }
+ 
+        function closeSettings() {
+            document.getElementById('settingsPanel').classList.add('translate-x-full');
+            document.getElementById('settingsBackdrop').classList.add('hidden');
+        }
+ 
+        // Close on Escape key
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') closeSettings();
+        });
+ 
+        // ── Theme ─────────────────────────────────────────────────────────────
+        function setTheme(theme) {
+            document.body.classList.toggle('theme-light', theme === 'light');
+            localStorage.setItem('heimdall_theme', theme);
+ 
+            // Update toggle buttons
+            document.querySelectorAll('.theme-btn').forEach(b => {
+                b.classList.remove('bg-gray-700', 'text-white');
+                b.classList.add('text-gray-400');
+            });
+            const active = document.getElementById('theme-' + theme);
+            if (active) {
+                active.classList.add('bg-gray-700', 'text-white');
+                active.classList.remove('text-gray-400');
+            }
+        }
+ 
+        function applyStoredTheme() {
+            const stored = localStorage.getItem('heimdall_theme') || 'dark';
+            setTheme(stored);
+        }
+ 
+        // ── Client-side settings (localStorage) ──────────────────────────────
+        function saveClientSetting(key, value) {
+            localStorage.setItem('heimdall_' + key, value);
+        }
+ 
+        function getClientSetting(key, defaultValue) {
+            return localStorage.getItem('heimdall_' + key) || defaultValue;
+        }
+ 
+        function applyClientSettingsToPanel() {
+            // Theme
+            const theme = getClientSetting('theme', 'dark');
+            document.querySelectorAll('.theme-btn').forEach(b => {
+                b.classList.remove('bg-gray-700', 'text-white');
+                b.classList.add('text-gray-400');
+            });
+            const activeTheme = document.getElementById('theme-' + theme);
+            if (activeTheme) {
+                activeTheme.classList.add('bg-gray-700', 'text-white');
+                activeTheme.classList.remove('text-gray-400');
+            }
+ 
+            // Scan defaults — also apply to the actual form dropdowns
+            const profile = getClientSetting('defaultProfile', 'standard');
+            const mode    = getClientSetting('defaultMode', 'remote');
+            const prio    = getClientSetting('defaultPriority', 'medium');
+            const refresh = getClientSetting('refreshInterval', '5000');
+ 
+            const sp = document.getElementById('setting-default-profile');
+            const sm = document.getElementById('setting-default-mode');
+            const sr = document.getElementById('setting-default-priority');
+            const si = document.getElementById('setting-refresh-interval');
+            if (sp) sp.value = profile;
+            if (sm) sm.value = mode;
+            if (sr) sr.value = prio;
+            if (si) si.value = refresh;
+ 
+            // Apply defaults to the Create Job form
+            const fp = document.getElementById('profile');
+            const fm = document.getElementById('mode');
+            const fr = document.getElementById('priority');
+            if (fp && !fp.dataset.userChanged) fp.value = profile;
+            if (fm && !fm.dataset.userChanged) fm.value = mode;
+            if (fr && !fr.dataset.userChanged) fr.value = prio;
+        }
+ 
+        // ── Auto-refresh interval ─────────────────────────────────────────────
+        let autoRefreshTimer = null;
+ 
+        function applyRefreshInterval() {
+            if (autoRefreshTimer) {
+                clearInterval(autoRefreshTimer);
+                autoRefreshTimer = null;
+            }
+            const ms = parseInt(getClientSetting('refreshInterval', '5000'));
+            if (ms > 0) {
+                autoRefreshTimer = setInterval(() => {
+                    loadAgents();
+                    loadJobs();
+                }, ms);
+            }
+        }
+ 
+        // ── Server settings ───────────────────────────────────────────────────
+        async function loadServerSettings() {
+            const res = await apiFetch('/settings');
+            if (!res) return;
+            serverSettings = await res.json();
+            renderServerSettings();
+        }
+ 
+        function renderServerSettings() {
+            // AI auto-analysis toggle
+            const aiOn = serverSettings['ai_auto_analyse'] === 'true';
+            const toggleBtn  = document.getElementById('setting-ai-toggle');
+            const toggleKnob = document.getElementById('setting-ai-knob');
+            if (toggleBtn && toggleKnob) {
+                toggleBtn.classList.toggle('bg-green-600',  aiOn);
+                toggleBtn.classList.toggle('border-green-500', aiOn);
+                toggleBtn.classList.toggle('bg-gray-700',  !aiOn);
+                toggleBtn.classList.toggle('border-gray-600', !aiOn);
+                toggleKnob.style.transform = aiOn ? 'translateX(20px)' : 'translateX(0)';
+                toggleKnob.classList.toggle('bg-white',    aiOn);
+                toggleKnob.classList.toggle('bg-gray-400', !aiOn);
+            }
+ 
+            // Stale agent hours
+            const staleInput = document.getElementById('setting-stale-hours');
+            if (staleInput) {
+                staleInput.value = serverSettings['stale_agent_hours'] || '24';
+            }
+        }
+ 
+        async function toggleServerSetting(key) {
+            const current = serverSettings[key] === 'true';
+            const newVal  = (!current).toString();
+            await saveServerSetting(key, newVal);
+        }
+ 
+        async function saveServerSetting(key, value) {
+            const res = await apiFetch('/settings', {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ [key]: value }),
+            });
+            if (!res) return;
+            serverSettings[key] = value;
+            renderServerSettings();
+        }
+ 
+        // ── Initialise on load ────────────────────────────────────────────────
+        function initSettings() {
+            applyStoredTheme();
+            applyClientSettingsToPanel();
+            applyRefreshInterval();
+        }
 
         // ── TAB SWITCHING ──────────────────────────────────────────────────
         function switchTab(tab) {
@@ -3957,10 +4382,9 @@ function createJobFromTopo(ip) {
     document.getElementById('target').style.borderColor = '#4ade80';
     setTimeout(() => document.getElementById('target').style.borderColor = '', 1500);
 }
-        
-        setInterval(() => { loadAgents(); loadJobs(); }, 5000);
-        
+
         const AI_PROVIDER = '__AI_PROVIDER__';
+        initSettings();
 
         </script>
     </body>
