@@ -288,6 +288,64 @@ def parse_nmap_xml(xml_data):
     return hosts
 
 
+def parse_nse_from_xml(xml_data: str) -> list:
+    """
+    Parses Nmap XML output and extracts NSE script results from <script> elements.
+    Returns a list of findings, each tied to the host/port they came from.
+    """
+    root = ET.fromstring(xml_data)
+    findings = []
+
+    for host in root.findall("host"):
+        addr_el = host.find("address")
+        if addr_el is None:
+            continue
+        addr = addr_el.get("addr")
+
+        # host-level scripts (e.g. smb-vuln-*)
+        hostscript = host.find("hostscript")
+        if hostscript is not None:
+            for script in hostscript.findall("script"):
+                output = script.get("output", "").strip()
+                if output.startswith("ERROR: Script execution failed"):
+                    continue
+                findings.append({
+                    "host": addr,
+                    "port": None,
+                    "service": None,
+                    "script_id": script.get("id"),
+                    "output": output,
+                })
+
+        # port-level scripts
+        ports_el = host.find("ports")
+        if ports_el is None:
+            continue
+
+        for port_el in ports_el.findall("port"):
+            portid = int(port_el.get("portid"))
+            state_el = port_el.find("state")
+            if state_el is None or state_el.get("state") != "open":
+                continue
+
+            service_el = port_el.find("service")
+            service = service_el.get("name", "unknown") if service_el is not None else "unknown"
+
+            for script in port_el.findall("script"):
+                output = script.get("output", "").strip()
+                if output.startswith("ERROR: Script execution failed"):
+                    continue
+                findings.append({
+                    "host": addr,
+                    "port": portid,
+                    "service": service,
+                    "script_id": script.get("id"),
+                    "output": output,
+                })
+
+    return findings
+
+
 def resolve_nse_ports(ports_str: str | None, profile: str) -> list[str]:
     """
     Resolves the -p flag list for an NSE scan.
