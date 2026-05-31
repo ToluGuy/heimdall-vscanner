@@ -136,7 +136,7 @@ def send_heartbeat(api_key):
             headers=headers,
             timeout=5,
         )
-    except:
+    except Exception:
         pass
 
 
@@ -151,83 +151,17 @@ def get_nmap_flags(profile: str) -> list:
         return ["-sV"]
 
 
-def parse_nmap_xml(xml_data):
-    root = ET.fromstring(xml_data)
-
-    hosts = []
-
-    for host in root.findall("host"):
-        addr = host.find("address").get("addr")
-
-        ports_data = []
-
-        ports = host.find("ports")
-        if ports:
-            for port in ports.findall("port"):
-                state = port.find("state").get("state")
-                service = port.find("service").get("name", "unknown")
-
-                ports_data.append({
-                    "port": int(port.get("portid")),
-                    "state": state,
-                    "service": service,
-                })
-
-        hosts.append({
-            "host": addr,
-            "ports": ports_data
-        })
-
-    return hosts
-
-
-def run_nmap(target: str, profile: str = "standard"):
-    logger.info(f"Running Nmap ({profile}) on {target}")
-
-    flags = get_nmap_flags(profile)
-
-    result = subprocess.run(
-        ["nmap", *flags, "-oX", "-", target],
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode != 0:
-        raise Exception(f"Nmap failed: {result.stderr}")
-
-    parsed = parse_nmap_xml(result.stdout)
-
-    return parsed
-
-
-# --- NSE ---
-
-def get_nse_flags(profile: str) -> list:
-    """
-    Maps scan profile to NSE script intensity.
-      light    -> --script safe      (non-intrusive, safe to run anywhere)
-      standard -> --script vuln      (vulnerability checks, low disruption risk)
-      full     -> --script vuln,exploit  (intrusive — may affect services)
-    """
-    if profile == "light":
-        return ["--script", "safe"]
-    elif profile == "full":
-        return ["--script", "vuln,exploit"]
-    else:
-        return ["--script", "vuln"]
-
-
-def parse_nmap_xml(xml_data):
+def parse_nmap_xml(xml_data: str) -> list:
     root = ET.fromstring(xml_data)
     hosts = []
 
     for host in root.findall("host"):
-        # ── IP address ────────────────────────────────────────────────────
+        # ── IP address + MAC ──────────────────────────────────────────────
         ip = None
         mac = None
         for addr_el in host.findall("address"):
             atype = addr_el.get("addrtype", "")
-            if atype == "ipv4" or atype == "ipv6":
+            if atype in ("ipv4", "ipv6"):
                 ip = addr_el.get("addr")
             elif atype == "mac":
                 mac = addr_el.get("addr")
@@ -288,6 +222,40 @@ def parse_nmap_xml(xml_data):
     return hosts
 
 
+def run_nmap(target: str, profile: str = "standard") -> list:
+    logger.info(f"Running Nmap ({profile}) on {target}")
+
+    flags = get_nmap_flags(profile)
+
+    result = subprocess.run(
+        ["nmap", *flags, "-oX", "-", target],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise Exception(f"Nmap failed: {result.stderr}")
+
+    return parse_nmap_xml(result.stdout)
+
+
+# --- NSE ---
+
+def get_nse_flags(profile: str) -> list:
+    """
+    Maps scan profile to NSE script intensity.
+      light    -> --script safe      (non-intrusive, safe to run anywhere)
+      standard -> --script vuln      (vulnerability checks, low disruption risk)
+      full     -> --script vuln,exploit  (intrusive — may affect services)
+    """
+    if profile == "light":
+        return ["--script", "safe"]
+    elif profile == "full":
+        return ["--script", "vuln,exploit"]
+    else:
+        return ["--script", "vuln"]
+
+
 def parse_nse_from_xml(xml_data: str) -> list:
     """
     Parses Nmap XML output and extracts NSE script results from <script> elements.
@@ -297,12 +265,18 @@ def parse_nse_from_xml(xml_data: str) -> list:
     findings = []
 
     for host in root.findall("host"):
-        addr_el = host.find("address")
-        if addr_el is None:
-            continue
-        addr = addr_el.get("addr")
+        # ── IP address — iterate all address elements to avoid picking up MAC ──
+        addr = None
+        for addr_el in host.findall("address"):
+            atype = addr_el.get("addrtype", "")
+            if atype in ("ipv4", "ipv6"):
+                addr = addr_el.get("addr")
+                break
 
-        # host-level scripts (e.g. smb-vuln-*)
+        if addr is None:
+            continue
+
+        # ── Host-level scripts (e.g. smb-vuln-*) ─────────────────────────
         hostscript = host.find("hostscript")
         if hostscript is not None:
             for script in hostscript.findall("script"):
@@ -317,7 +291,7 @@ def parse_nse_from_xml(xml_data: str) -> list:
                     "output": output,
                 })
 
-        # port-level scripts
+        # ── Port-level scripts ────────────────────────────────────────────
         ports_el = host.find("ports")
         if ports_el is None:
             continue
@@ -367,7 +341,7 @@ def resolve_nse_ports(ports_str: str | None, profile: str) -> list[str]:
     return [str(p) for p in non_web]
 
 
-def run_nse(target: str, profile: str = "standard", ports_str: str | None = None):
+def run_nse(target: str, profile: str = "standard", ports_str: str | None = None) -> dict:
     """
     Runs an NSE scan against target.
     Web ports are excluded — Nikto owns that surface.
@@ -423,7 +397,7 @@ def get_nikto_flags(profile: str) -> list:
         return []
 
 
-def run_nikto(target: str, port: int, profile: str = "standard"):
+def run_nikto(target: str, port: int, profile: str = "standard") -> dict:
     logger.info(f"Running Nikto ({profile}) on {target}:{port}")
 
     flags = get_nikto_flags(profile)
@@ -552,7 +526,7 @@ def main():
         api_key = register()
 
     logger.info(f"Remote scanner '{AGENT_NAME}' started, polling for jobs...")
-    
+
     hb_thread = threading.Thread(target=heartbeat_loop, args=(api_key,), daemon=True)
     hb_thread.start()
 
