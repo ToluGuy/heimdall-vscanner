@@ -199,13 +199,13 @@ log "Privileges granted"
 
 section "Database Migrations"
 
-info "Running schema setup via FastAPI..."
+info "Running schema setup via SQLAlchemy..."
 cd "$INSTALL_DIR"
 "$INSTALL_DIR/venv/bin/python" -c "
 import sys
 sys.path.insert(0, '.')
 from backend.app.db import engine, Base
-from backend.app.models import Agent, Job, Result
+from backend.app.models import Agent, Job, Result, DiscoverySweep, Schedule, Host, Setting
 Base.metadata.create_all(bind=engine)
 print('  Tables created/verified')
 "
@@ -214,7 +214,6 @@ info "Applying column migrations..."
 PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" <<EOF
 DO \$\$
 BEGIN
-    -- results.cleared
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name='results' AND column_name='cleared'
@@ -223,7 +222,6 @@ BEGIN
         RAISE NOTICE 'Added results.cleared';
     END IF;
 
-    -- jobs.cleared
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name='jobs' AND column_name='cleared'
@@ -232,7 +230,6 @@ BEGIN
         RAISE NOTICE 'Added jobs.cleared';
     END IF;
 
-    -- jobs.mode
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name='jobs' AND column_name='mode'
@@ -241,7 +238,6 @@ BEGIN
         RAISE NOTICE 'Added jobs.mode';
     END IF;
 
-    -- jobs.profile
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name='jobs' AND column_name='profile'
@@ -250,7 +246,6 @@ BEGIN
         RAISE NOTICE 'Added jobs.profile';
     END IF;
 
-    -- jobs.started_at
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name='jobs' AND column_name='started_at'
@@ -259,7 +254,6 @@ BEGIN
         RAISE NOTICE 'Added jobs.started_at';
     END IF;
 
-    -- jobs.completed_at
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name='jobs' AND column_name='completed_at'
@@ -268,7 +262,6 @@ BEGIN
         RAISE NOTICE 'Added jobs.completed_at';
     END IF;
 
-    -- jobs.next_run_at
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name='jobs' AND column_name='next_run_at'
@@ -277,7 +270,6 @@ BEGIN
         RAISE NOTICE 'Added jobs.next_run_at';
     END IF;
 
-    -- jobs.port
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_name='jobs' AND column_name='port'
@@ -302,7 +294,6 @@ BEGIN
         RAISE NOTICE 'Added agents.is_stale';
     END IF;
 
-    -- schedules table (created by SQLAlchemy on fresh installs, manual migration for upgrades)
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.tables
         WHERE table_name='schedules'
@@ -324,8 +315,7 @@ BEGIN
         );
         RAISE NOTICE 'Created schedules table';
     END IF;
-    
-    -- settings table
+
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.tables
         WHERE table_name='settings'
@@ -340,12 +330,13 @@ END
 \$\$;
 EOF
 
-# Grant permissions on schedules table — must run outside DO block to access shell variable
+# Grant permissions on tables and sequences — must run outside DO block
 PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
     -c "GRANT ALL ON TABLE schedules TO ${DB_USER};" 2>/dev/null || true
 PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
     -c "GRANT USAGE, SELECT ON SEQUENCE schedules_id_seq TO ${DB_USER};" 2>/dev/null || true
-PGPASSWORD="$DB_PASSWORD" psql ... -c "GRANT ALL ON TABLE settings TO ${DB_USER};"
+PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+    -c "GRANT ALL ON TABLE settings TO ${DB_USER};" 2>/dev/null || true
 
 log "Migrations complete"
 
@@ -357,7 +348,6 @@ CURRENT_USER=$(whoami)
 PYTHON_BIN="$INSTALL_DIR/venv/bin/python"
 UVICORN_BIN="$INSTALL_DIR/venv/bin/uvicorn"
 
-# Server service
 cat > /tmp/vapt-server.service <<EOF
 [Unit]
 Description=Heimdall V-Scanner — Server
@@ -379,7 +369,6 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-# Scanner service
 cat > /tmp/vapt-scanner.service <<EOF
 [Unit]
 Description=Heimdall V-Scanner — Remote Scanner
@@ -469,7 +458,10 @@ echo -e "  ${BOLD}To run an agent on an endpoint:${NC}"
 echo -e "  ${CYAN}VAPT_AGENT_NAME=pc-name VAPT_SERVER_URL=http://${SERVER_IP}:8000 python3 agent/agent.py${NC}"
 echo ""
 echo -e "  ${BOLD}Service commands:${NC}"
-echo -e "  sudo systemctl status vapt-server"
-echo -e "  sudo systemctl restart vapt-server"
+echo -e "  sudo systemctl status vapt-server vapt-scanner"
+echo -e "  sudo systemctl restart vapt-server vapt-scanner"
 echo -e "  journalctl -u vapt-server -f"
+echo ""
+echo -e "  ${BOLD}To update in future:${NC}"
+echo -e "  ${CYAN}./update.sh${NC}"
 echo ""
