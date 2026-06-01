@@ -1,6 +1,6 @@
 # Heimdall V-Scanner
 
-A distributed vulnerability assessment and penetration testing scanner built for internal office network use. Heimdall coordinates scan jobs across a central server and multiple remote agents, providing a unified dashboard for visibility into network vulnerabilities across the entire LAN.
+A distributed vulnerability assessment scanner built for internal office network use. Heimdall coordinates scan jobs across a central server and multiple remote agents, providing a unified dashboard for visibility into network vulnerabilities across the entire LAN.
 
 ## Architecture
 
@@ -24,27 +24,31 @@ This tool is for use on networks and systems you own or have **explicit written 
 
 ## Scan Tools
 
-- **Nmap** — Port discovery and service detection across all scan modes and agents
-- **Nikto** — Web vulnerability scanning, triggered automatically when Nmap finds open web ports
-- **NSE (Nmap Scripting Engine)** — Vulnerability and exploit script scanning against non-web services (SSH, SMB, RDP, databases, etc.)
+Heimdall chains three tools together automatically:
+
+- **Nmap** — Port discovery and service detection. Runs first on every scan.
+- **Nikto** — Web vulnerability scanning. Triggered automatically when Nmap finds open web ports.
+- **NSE (Nmap Scripting Engine)** — Vulnerability script scanning against non-web services (SSH, SMB, RDP, databases, etc.).
+
+The dashboard uses plain language for scan types. The internal names (used in the API and database) are shown in brackets for reference.
 
 ---
 
 ## Scan Types
 
-| Type | Description |
-|------|-------------|
-| `nmap_scan` | Port scan with automatic Nikto follow-up on any open web ports found |
-| `nikto_scan` | Standalone web vulnerability scan against a specific port |
-| `nse_scan` | NSE script scan against non-web ports (web ports excluded — Nikto owns that surface) |
+| Dashboard label | Internal name | Description |
+|-----------------|---------------|-------------|
+| Port Scan | `nmap_scan` | Discovers open ports; automatically runs a Web Scan on any web ports found |
+| Web Scan | `nikto_scan` | Standalone web vulnerability scan against a specific port |
+| Vulnerability Scan | `nse_scan` | Script-based vulnerability checks against non-web services; web ports are excluded |
 
 ## Scan Profiles
 
-| Profile | Nmap flags | Nikto flags | NSE scripts | Description |
-|---------|-----------|-------------|-------------|-------------|
-| light | `-F` | `-Tuning 1` | `safe` | Top 100 ports, fast, non-intrusive |
-| standard | `-sV` | default | `vuln` | Top 1000 ports with service detection |
-| full | `-sV -O -p-` | `-Tuning x6` | `vuln,exploit` ⚠️ | All ports, deep scan — exploit scripts are intrusive |
+| Profile | Nmap flags | Web Scan flags | Vuln scripts | Description |
+|---------|-----------|----------------|--------------|-------------|
+| Light | `-F` | `-Tuning 1` | `safe` | Top 100 ports, fast, non-intrusive |
+| Standard | `-sV` | default | `vuln` | Top 1000 ports with service detection |
+| Full | `-sV -O -p-` | `-Tuning x6` | `vuln,exploit` ⚠️ | All ports, deep scan — exploit scripts are intrusive |
 
 ---
 
@@ -69,6 +73,22 @@ The installer will:
 - Run all schema migrations automatically
 - Install and optionally start the `vapt-server` and `vapt-scanner` systemd services
 - Open port 8000 in UFW if active
+
+---
+
+## Updating
+
+When a new version is released, run the updater instead of reinstalling:
+
+```bash
+git pull
+chmod +x update.sh
+./update.sh
+```
+
+The updater pulls the latest code, updates Python dependencies, runs any new database migrations, and restarts the services. Your `.env`, existing scan data, and agent registrations are all preserved. The dashboard will be unavailable for a few seconds during the service restart.
+
+If you installed without git (manual download), replace the project files manually, then run `./update.sh` to handle deps, migrations, and restarts.
 
 ---
 
@@ -136,12 +156,12 @@ DB_PASSWORD=your-password
 ```bash
 python3 -c "
 from backend.app.db import engine, Base
-from backend.app.models import Agent, Job, Result
+from backend.app.models import Agent, Job, Result, DiscoverySweep, Schedule, Host, Setting
 Base.metadata.create_all(bind=engine)
 "
 ```
 
-If upgrading from an earlier version, also run these SQL statements against the database:
+If upgrading from an earlier version, also run these SQL statements:
 
 ```sql
 ALTER TABLE results ADD COLUMN IF NOT EXISTS cleared BOOLEAN DEFAULT FALSE;
@@ -171,11 +191,17 @@ CREATE TABLE IF NOT EXISTS schedules (
     next_run_at TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+    key   VARCHAR PRIMARY KEY,
+    value VARCHAR NOT NULL
+);
+
 GRANT ALL ON TABLE schedules TO vapt_user;
+GRANT ALL ON TABLE settings TO vapt_user;
 GRANT USAGE, SELECT ON SEQUENCE schedules_id_seq TO vapt_user;
 ```
 
-The `discovery_sweeps` table is created automatically by SQLAlchemy on startup.
+The `discovery_sweeps` and `hosts` tables are created automatically by SQLAlchemy on startup.
 
 ### 8. Start the server
 
@@ -191,7 +217,7 @@ The dashboard is available at `http://localhost:8000/dashboard`.
 
 ### Recommended setup
 
-The recommended deployment is a dedicated Linux VM on whatever hypervisor you have available (ESXi, Proxmox, VirtualBox, etc.). The backend server and remote scanner both run on this VM. Agents run separately on individual endpoints across the network.
+A dedicated Linux VM on whatever hypervisor you have available (ESXi, Proxmox, VirtualBox, etc.). The backend server and remote scanner both run on this VM. Agents run separately on individual endpoints.
 
 **Minimum VM spec:**
 - 2 vCPU, 2 GB RAM, 20 GB disk
@@ -225,7 +251,7 @@ sudo netplan apply
 
 ### Systemd services
 
-The installer sets up two services automatically. To manage them manually:
+The installer sets up two services automatically:
 
 ```bash
 # Status
@@ -234,7 +260,7 @@ sudo systemctl status vapt-scanner
 
 # Start / stop / restart
 sudo systemctl start vapt-server vapt-scanner
-sudo systemctl restart vapt-server
+sudo systemctl restart vapt-server vapt-scanner
 
 # Enable on boot
 sudo systemctl enable vapt-server vapt-scanner
@@ -242,15 +268,6 @@ sudo systemctl enable vapt-server vapt-scanner
 # Live logs
 journalctl -u vapt-server -f
 journalctl -u vapt-scanner -f
-```
-
-If you need to install the service files manually, edit `vapt-server.service` and `vapt-scanner.service` to replace `YOUR_USERNAME` and the install path, then:
-
-```bash
-sudo cp vapt-server.service vapt-scanner.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable vapt-server vapt-scanner
-sudo systemctl start vapt-server vapt-scanner
 ```
 
 ### Network requirements
@@ -277,20 +294,45 @@ Access the dashboard at `/dashboard`. You will be prompted for credentials on fi
 
 From the dashboard you can:
 
-- **Network Discovery** — Sweep a subnet in CIDR notation to find live hosts and automatically create scan jobs for each one
-- **Schedules** — Set up recurring scans on a configurable interval (hourly, daily, or any number of hours); pause, resume, or delete schedules at any time
-- **Create Jobs** — Submit scan jobs manually for any IP on the network, with control over scan type, profile, mode, and priority
-- **Agents** — Monitor all registered agents, their online/offline status, and last heartbeat; show or hide stale agents; restore or permanently dismiss them
+- **Network Discovery** — Sweep a subnet in CIDR notation to find live hosts; review results before assigning scan jobs
+- **Schedules** — Set up recurring scans on a configurable interval; pause, resume, or delete schedules at any time
+- **Create Jobs** — Submit scan jobs manually for any IP, with control over scan type, profile, mode, and priority
+- **Agents** — Monitor registered agents, their online/offline status, and last heartbeat; show or hide stale agents; restore or dismiss them
 - **Jobs** — View the job queue with live elapsed timers on running jobs; filter by status; delete pending and failed jobs in bulk
-- **Scan Results** — Expand results to view Nmap port tables, NSE findings, and Nikto web findings; toggle between active results and history
+- **Scan Results** — Expand results to view port tables, vulnerability findings, and web scan findings; toggle between active results and history
+- **Insights** — Analytics dashboard showing scan activity over time, risk distribution, and per-host drilldowns
+- **Topology** — Interactive D3 network map showing all discovered hosts, clustered by subnet, coloured by risk level
 - **Reports** — Generate a printable HTML report for any scan result, exportable as PDF via the browser print dialog
 - **Export** — Download scan results as structured JSON, individually or in bulk
 
 ---
 
+## AI Analysis
+
+Heimdall can automatically generate a risk assessment and remediation plan for each scan result using an AI provider of your choice. Add the following to your `.env`:
+
+```
+AI_PROVIDER=anthropic          # anthropic | openai | groq | ollama
+AI_API_KEY=your-api-key
+AI_MODEL=                      # optional — leave blank for the provider default
+AI_BASE_URL=                   # only needed for ollama
+AI_AUTO_ANALYSE=true           # set to false to trigger analysis manually per result
+```
+
+| Provider | Default model |
+|----------|--------------|
+| `anthropic` | claude-sonnet-4-5 |
+| `openai` | gpt-4o-mini |
+| `groq` | llama-3.3-70b-versatile |
+| `ollama` | llama3 (local) |
+
+AI analysis can also be toggled on/off at runtime from the Settings panel in the dashboard without restarting the server.
+
+---
+
 ## Agents
 
-For full agent setup instructions on both Linux and Windows endpoints, see [`agent/SETUP.md`](agent/SETUP.md).
+For full agent setup instructions on both Linux and Windows endpoints, see [`agent/SETUP_GUIDE.md`](agent/SETUP_GUIDE.md).
 
 ### Quick start — Linux
 
@@ -319,29 +361,29 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 python3 agent/local_scanner.py
 ```
 
-Opens a browser-based scan UI at `http://127.0.0.1:9731`. Supports Nmap and NSE scans. Results live in memory for the session and can be exported as JSON before closing.
+Opens a browser-based scan UI at `http://127.0.0.1:9731`. Supports Port Scans and Vulnerability Scans. Results live in memory for the session and can be exported as JSON before closing.
 
 ---
 
 ## Scheduling
 
-Schedules are created from the dashboard and stored in the database. Each schedule defines a scan type, target, profile, mode, priority, and repeat interval in hours. The scheduler runs a background thread that checks every 60 seconds for due schedules and creates the corresponding jobs automatically.
+Schedules are created from the dashboard and stored in the database. Each schedule defines a scan type, target, profile, mode, priority, and repeat interval in hours. The scheduler checks every 60 seconds for due schedules and creates the corresponding jobs automatically.
 
-Schedules fire immediately on creation (first tick after save), then repeat at the configured interval. Resuming a paused schedule waits one full interval before firing again.
+Schedules fire immediately on creation, then repeat at the configured interval. Resuming a paused schedule waits one full interval before firing again.
 
 ---
 
 ## Stale Agent Cleanup
 
-Agents that have not sent a heartbeat within the configurable threshold (default 24 hours) are automatically flagged as stale by a background cleanup thread that runs hourly. Stale agents are hidden from the default agents view but can be shown via the "Show Stale" toggle. From there they can be restored (clears the stale flag) or permanently dismissed.
+Agents that have not sent a heartbeat within the configurable threshold (default 24 hours) are automatically flagged as stale by a background cleanup thread. Stale agents are hidden from the default agents view but can be shown via the "Show Stale" toggle. From there they can be restored or permanently dismissed.
 
-The threshold can be adjusted by setting `STALE_AGENT_HOURS` in the `.env` file.
+The threshold can be adjusted from the Settings panel in the dashboard, or by setting `STALE_AGENT_HOURS` in `.env`.
 
 ---
 
 ## Priority Queue
 
-Jobs support three priority levels: `high`, `medium`, and `low`. The dispatcher always picks the highest-priority eligible job first. Within the same priority level, agent-specific jobs are preferred over any-agent jobs, and older jobs are picked before newer ones.
+Jobs support three priority levels: `high`, `medium`, and `low`. The dispatcher always picks the highest-priority eligible job first. Within the same priority, agent-specific jobs are preferred over any-agent jobs, and older jobs are picked before newer ones. Each agent handles at most 2 concurrent jobs.
 
 ---
 
@@ -353,16 +395,26 @@ heimdall-vscanner/
 │   ├── agent.py              # Endpoint agent — polls server, runs scans locally
 │   ├── local_scanner.py      # Standalone scan tool with browser UI (no server needed)
 │   ├── setup_agent.ps1       # Windows endpoint setup script
-│   └── SETUP.md              # Agent and local scanner setup guide
+│   └── SETUP_GUIDE.md        # Agent and local scanner setup guide
 ├── backend/
 │   └── app/
 │       ├── main.py           # FastAPI server, all endpoints, dashboard HTML
 │       ├── models.py         # SQLAlchemy database models
 │       ├── schemas.py        # Pydantic request/response schemas
 │       ├── db.py             # Database connection and session
-│       └── logger.py         # Logging configuration
+│       ├── logger.py         # Logging configuration
+│       └── ai_analysis.py    # AI-powered scan analysis (optional)
+├── tools/
+│   ├── check_db.py           # Database health check
+│   ├── reset_stuck_jobs.py   # Unstick jobs that got stuck in 'running'
+│   ├── purge_history.py      # Permanently delete archived scan history
+│   ├── reset_db.py           # Wipe all scan data (dev/test use only)
+│   ├── seed_test_jobs.py     # Create test jobs against localhost
+│   ├── test_connection.py    # Verify agent-to-server connectivity
+│   └── test_ports.py         # Open netcat listeners for scan testing
 ├── scanner.py                # Agentless remote scanner (runs on central server)
 ├── install.sh                # Automated Linux installer
+├── update.sh                 # Lightweight updater for new releases
 ├── vapt-server.service       # Systemd service file — backend server
 ├── vapt-scanner.service      # Systemd service file — remote scanner
 ├── requirements.txt
@@ -386,6 +438,11 @@ heimdall-vscanner/
 | `DB_USER` | Database user | `vapt_user` |
 | `DB_PASSWORD` | Database password | — |
 | `STALE_AGENT_HOURS` | Hours before an agent is flagged stale | `24` |
+| `AI_PROVIDER` | AI provider for scan analysis (`anthropic`, `openai`, `groq`, `ollama`) | — |
+| `AI_API_KEY` | API key for the chosen AI provider | — |
+| `AI_MODEL` | Model override — leave blank for provider default | — |
+| `AI_BASE_URL` | Base URL for Ollama (e.g. `http://localhost:11434`) | — |
+| `AI_AUTO_ANALYSE` | Auto-run AI analysis after each scan | `true` |
 
 ### Agent
 
@@ -393,7 +450,7 @@ heimdall-vscanner/
 |----------|-------------|---------|
 | `VAPT_SERVER_URL` | URL of the backend server | `http://127.0.0.1:8000` |
 | `VAPT_AGENT_NAME` | Name for this agent instance | `agent-default` |
-| `VAPT_CAPABILITIES` | Comma-separated scan capabilities | `nmap_scan,nikto_scan,nse_scan` |
+| `VAPT_CAPABILITIES` | Comma-separated scan types this agent handles | `nmap_scan,nikto_scan,nse_scan` |
 | `VAPT_KEY_FILE` | Path to store the agent API key | `{agent-name}_key.txt` |
 
 ---
@@ -407,17 +464,17 @@ Check the logs: `journalctl -u vapt-server -n 50`. The most common causes are a 
 The heartbeat timeout is 30 seconds. If the agent hasn't sent a heartbeat within that window it shows offline. Confirm the agent is running and can reach the server on port 8000.
 
 **Schedules fail with a permission error**
-This means the `schedules` table was created without the database user having write access. Run the following as the postgres superuser:
+The `schedules` table was created without the database user having write access. Run as the postgres superuser:
 ```sql
 GRANT ALL ON TABLE schedules TO vapt_user;
 GRANT USAGE, SELECT ON SEQUENCE schedules_id_seq TO vapt_user;
 ```
 
-**Nikto hangs**
+**Web Scan (Nikto) hangs**
 Caused by a CIRT.net update prompt in Nikto 2.6.x. The scanner suppresses it automatically with `input="n\n"`. If scans still hang, check Nikto is installed correctly with `nikto -Version`.
 
-**NSE scan returns no findings**
-This is normal if the target has no non-web services running on discoverable ports. NSE deliberately skips web ports (80, 443, 8080, 8443, 8000, 8888) — use a Nikto scan for web surface testing.
+**Vulnerability Scan returns no findings**
+Normal if the target has no non-web services running on discoverable ports. Vulnerability Scans deliberately skip web ports (80, 443, 8080, 8443, 8000, 8888) — use a Web Scan for web surface testing.
 
 **Port 8000 unreachable from agents**
 Check the server firewall: `sudo ufw status`. If active, run `sudo ufw allow 8000/tcp`.
@@ -427,3 +484,9 @@ Check the server firewall: `sudo ufw status`. If active, run `sudo ufw allow 800
 GRANT ALL ON SCHEMA public TO vapt_user;
 ALTER DATABASE vapt OWNER TO vapt_user;
 ```
+
+**AI analysis not appearing**
+Check that `AI_PROVIDER` and `AI_API_KEY` are set in `.env` and that the server has been restarted. You can also trigger analysis manually from the dashboard by clicking "Analyse" on any result. Verify the setting is enabled in the Settings panel.
+
+**Update broke something**
+Each update only adds columns — it never drops or modifies existing ones. If something looks wrong after an update, check `journalctl -u vapt-server -n 50` for startup errors and compare your `.env` against the Environment Variables table above for any new required values.
