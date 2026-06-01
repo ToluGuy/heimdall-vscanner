@@ -23,7 +23,7 @@ import webbrowser
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 # ── in-memory result store ────────────────────────────────────────────────────
 # Results live for the session only. Export before closing.
@@ -69,10 +69,16 @@ def parse_nmap_xml(xml_data: str) -> list:
     root = ET.fromstring(xml_data)
     hosts = []
     for host in root.findall("host"):
-        addr_el = host.find("address")
-        if addr_el is None:
+        # ── IP address — iterate all address elements to avoid picking up MAC ──
+        ip = None
+        for addr_el in host.findall("address"):
+            atype = addr_el.get("addrtype", "")
+            if atype in ("ipv4", "ipv6"):
+                ip = addr_el.get("addr")
+                break
+        if ip is None:
             continue
-        addr = addr_el.get("addr")
+
         ports_data = []
         ports_el = host.find("ports")
         if ports_el:
@@ -84,7 +90,7 @@ def parse_nmap_xml(xml_data: str) -> list:
                     "state": state_el.get("state") if state_el is not None else "unknown",
                     "service": service_el.get("name", "unknown") if service_el is not None else "unknown",
                 })
-        hosts.append({"host": addr, "ports": ports_data})
+        hosts.append({"host": ip, "ports": ports_data})
     return hosts
 
 
@@ -92,10 +98,17 @@ def parse_nse_xml(xml_data: str) -> list:
     root = ET.fromstring(xml_data)
     findings = []
     for host in root.findall("host"):
-        addr_el = host.find("address")
-        if addr_el is None:
+        # ── IP address — iterate all address elements to avoid picking up MAC ──
+        addr = None
+        for addr_el in host.findall("address"):
+            atype = addr_el.get("addrtype", "")
+            if atype in ("ipv4", "ipv6"):
+                addr = addr_el.get("addr")
+                break
+        if addr is None:
             continue
-        addr = addr_el.get("addr")
+
+        # ── Host-level scripts ────────────────────────────────────────────
         hostscript = host.find("hostscript")
         if hostscript is not None:
             for script in hostscript.findall("script"):
@@ -107,6 +120,8 @@ def parse_nse_xml(xml_data: str) -> list:
                     "script_id": script.get("id"),
                     "output": output,
                 })
+
+        # ── Port-level scripts ────────────────────────────────────────────
         ports_el = host.find("ports")
         if ports_el is None:
             continue
@@ -118,10 +133,12 @@ def parse_nse_xml(xml_data: str) -> list:
             service_el = port_el.find("service")
             service = service_el.get("name", "unknown") if service_el is not None else "unknown"
             for script in port_el.findall("script"):
+                # Bug fix: read output fresh inside this loop, use correct portid/service
+                output = script.get("output", "").strip()
                 if output.startswith("ERROR: Script execution failed"):
                     continue
                 findings.append({
-                    "host": addr, "port": None, "service": None,
+                    "host": addr, "port": portid, "service": service,
                     "script_id": script.get("id"),
                     "output": output,
                 })
@@ -134,8 +151,7 @@ def run_nmap_scan(target: str, profile: str) -> dict:
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
         raise RuntimeError(f"nmap failed: {result.stderr[:300]}")
-    hosts = parse_nmap_xml(result.stdout)
-    return {"nmap": hosts}
+    return {"nmap": parse_nmap_xml(result.stdout)}
 
 
 def run_nse_scan(target: str, profile: str, ports_str: str) -> dict:
@@ -200,13 +216,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VAPT Local Scanner</title>
+<title>Heimdall // Local Scanner</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
 
   :root {
     --bg:        #0b0e14;
     --surface:   #111520;
+    --surface2:  #161b28;
     --border:    #1e2535;
     --border2:   #2a3347;
     --green:     #00e5a0;
@@ -214,6 +231,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     --blue:      #4d9fff;
     --purple:    #a78bfa;
     --yellow:    #f5c842;
+    --orange:    #f97316;
     --red:       #f04f4f;
     --text:      #d4dbe8;
     --muted:     #5a6a82;
@@ -240,68 +258,72 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       0deg,
       transparent,
       transparent 2px,
-      rgba(0,229,160,0.015) 2px,
-      rgba(0,229,160,0.015) 4px
+      rgba(0,229,160,0.012) 2px,
+      rgba(0,229,160,0.012) 4px
     );
     pointer-events: none;
     z-index: 9999;
   }
 
+  /* ── header ── */
   header {
     border-bottom: 1px solid var(--border);
-    padding: 16px 28px;
+    padding: 14px 28px;
     display: flex;
     align-items: center;
-    gap: 16px;
+    gap: 14px;
     background: var(--surface);
+    position: sticky;
+    top: 0;
+    z-index: 100;
   }
 
   .logo-dot {
-    width: 10px; height: 10px;
+    width: 9px; height: 9px;
     border-radius: 50%;
     background: var(--green);
     box-shadow: 0 0 8px var(--green);
     animation: pulse 2s ease-in-out infinite;
+    flex-shrink: 0;
   }
-  @keyframes pulse {
-    0%,100% { opacity: 1; }
-    50% { opacity: 0.4; }
-  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
 
   .logo-text {
     font-family: var(--mono);
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 600;
     color: var(--green);
-    letter-spacing: 0.12em;
+    letter-spacing: 0.14em;
     text-transform: uppercase;
   }
 
   .logo-sub {
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 10px;
     color: var(--muted);
     margin-left: auto;
   }
 
+  /* ── layout ── */
   main {
-    max-width: 960px;
+    max-width: 980px;
     margin: 0 auto;
-    padding: 32px 24px;
+    padding: 28px 20px;
     display: flex;
     flex-direction: column;
-    gap: 24px;
+    gap: 20px;
   }
 
+  /* ── panels ── */
   .panel {
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: 10px;
     overflow: hidden;
   }
 
   .panel-header {
-    padding: 14px 20px;
+    padding: 13px 20px;
     border-bottom: 1px solid var(--border);
     display: flex;
     align-items: center;
@@ -310,21 +332,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   .panel-title {
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 10px;
     font-weight: 600;
-    letter-spacing: 0.1em;
+    letter-spacing: 0.12em;
     text-transform: uppercase;
     color: var(--muted);
   }
 
   .panel-body { padding: 20px; }
 
-  /* scan form */
+  /* ── scan form ── */
   .form-grid {
     display: grid;
     grid-template-columns: 1fr 1fr 1fr;
     gap: 14px;
-    margin-bottom: 14px;
+    margin-bottom: 16px;
   }
 
   .field { display: flex; flex-direction: column; gap: 5px; }
@@ -341,7 +363,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   input, select {
     background: var(--bg);
     border: 1px solid var(--border2);
-    border-radius: 4px;
+    border-radius: 5px;
     color: var(--text);
     font-family: var(--mono);
     font-size: 13px;
@@ -350,10 +372,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     transition: border-color 0.15s;
     width: 100%;
   }
-
   input:focus, select:focus { border-color: var(--green-dim); }
   input::placeholder { color: var(--muted); }
-
   select option { background: var(--surface); }
 
   .ports-field { grid-column: 1 / -1; display: none; }
@@ -361,73 +381,56 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   .actions { display: flex; gap: 10px; align-items: center; }
 
+  /* ── buttons ── */
   .btn {
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 600;
     letter-spacing: 0.06em;
-    padding: 9px 20px;
-    border-radius: 4px;
+    padding: 9px 22px;
+    border-radius: 5px;
     border: none;
     cursor: pointer;
     transition: all 0.15s;
     text-transform: uppercase;
   }
-
-  .btn-primary {
-    background: var(--green);
-    color: #000;
-  }
+  .btn-primary { background: var(--green); color: #000; }
   .btn-primary:hover { background: #00ffb2; }
-  .btn-primary:disabled {
-    background: var(--border2);
-    color: var(--muted);
-    cursor: not-allowed;
-  }
-
-  .btn-secondary {
-    background: transparent;
-    color: var(--muted);
-    border: 1px solid var(--border2);
-  }
+  .btn-primary:disabled { background: var(--border2); color: var(--muted); cursor: not-allowed; }
+  .btn-secondary { background: transparent; color: var(--muted); border: 1px solid var(--border2); }
   .btn-secondary:hover { border-color: var(--blue); color: var(--blue); }
+  .btn-ghost { background: transparent; color: var(--red); border: 1px solid transparent; padding: 4px 8px; font-size: 11px; }
+  .btn-ghost:hover { border-color: var(--red); }
 
-  .btn-danger {
-    background: transparent;
-    color: var(--red);
-    border: 1px solid transparent;
-    padding: 4px 8px;
-    font-size: 11px;
-  }
-  .btn-danger:hover { border-color: var(--red); }
-
-  /* warning banner */
+  /* ── exploit warning ── */
   .exploit-warning {
     display: none;
-    margin-top: 12px;
+    margin-top: 14px;
     padding: 10px 14px;
-    background: rgba(240,79,79,0.08);
-    border: 1px solid rgba(240,79,79,0.3);
-    border-radius: 4px;
+    background: rgba(240,79,79,0.07);
+    border: 1px solid rgba(240,79,79,0.28);
+    border-radius: 5px;
     font-size: 12px;
     color: #f9a0a0;
+    gap: 8px;
+    align-items: flex-start;
   }
-  .exploit-warning.visible { display: flex; gap: 8px; align-items: flex-start; }
+  .exploit-warning.visible { display: flex; }
 
-  /* scan status */
+  /* ── scan status ── */
   .scan-status {
     display: none;
     align-items: center;
     gap: 10px;
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: 11px;
     color: var(--green);
     margin-left: auto;
   }
   .scan-status.visible { display: flex; }
 
   .spinner {
-    width: 8px; height: 8px;
+    width: 7px; height: 7px;
     border-radius: 50%;
     background: var(--green);
     animation: spin-pulse 0.8s ease-in-out infinite alternate;
@@ -437,55 +440,52 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     to   { opacity: 1;   transform: scale(1.2); }
   }
 
-  /* results */
+  /* ── result cards ── */
   .results-empty {
     text-align: center;
-    padding: 40px;
+    padding: 48px 20px;
     font-family: var(--mono);
     font-size: 12px;
     color: var(--muted);
   }
 
   .result-card {
+    background: var(--surface2);
     border: 1px solid var(--border);
-    border-radius: 6px;
-    margin-bottom: 12px;
+    border-radius: 8px;
+    margin-bottom: 10px;
     overflow: hidden;
   }
   .result-card:last-child { margin-bottom: 0; }
 
   .result-header {
-    padding: 12px 16px;
+    padding: 13px 18px;
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
     cursor: pointer;
-    background: rgba(255,255,255,0.02);
     transition: background 0.1s;
     user-select: none;
+    flex-wrap: wrap;
   }
-  .result-header:hover { background: rgba(255,255,255,0.04); }
+  .result-header:hover { background: rgba(255,255,255,0.03); }
 
-  .result-id {
+  .result-num {
     font-family: var(--mono);
     font-size: 12px;
     font-weight: 600;
     color: var(--text);
+    flex-shrink: 0;
   }
 
   .result-meta {
     font-family: var(--mono);
     font-size: 11px;
     color: var(--muted);
+    flex-shrink: 0;
   }
 
-  .result-summary {
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--muted);
-    margin-left: 4px;
-  }
-
+  /* status badges */
   .badge {
     font-family: var(--mono);
     font-size: 10px;
@@ -493,23 +493,40 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     padding: 2px 8px;
     border-radius: 20px;
     letter-spacing: 0.05em;
+    flex-shrink: 0;
   }
-  .badge-done    { background: rgba(0,229,160,0.12); color: var(--green); border: 1px solid rgba(0,229,160,0.25); }
-  .badge-failed  { background: rgba(240,79,79,0.12);  color: var(--red);   border: 1px solid rgba(240,79,79,0.25); }
-  .badge-running { background: rgba(77,159,255,0.12); color: var(--blue);  border: 1px solid rgba(77,159,255,0.25); }
+  .badge-done    { background: rgba(0,229,160,0.1);  color: var(--green);  border: 1px solid rgba(0,229,160,0.22); }
+  .badge-failed  { background: rgba(240,79,79,0.1);  color: var(--red);    border: 1px solid rgba(240,79,79,0.22); }
+  .badge-running { background: rgba(77,159,255,0.1); color: var(--blue);   border: 1px solid rgba(77,159,255,0.22); }
 
-  .result-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  /* finding pills */
+  .pills { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .pill {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 500;
+    padding: 2px 8px;
+    border-radius: 20px;
+    white-space: nowrap;
+  }
+  .pill-ports  { background: rgba(77,159,255,0.1);   color: var(--blue);   border: 1px solid rgba(77,159,255,0.2); }
+  .pill-nse    { background: rgba(167,139,250,0.1);  color: var(--purple); border: 1px solid rgba(167,139,250,0.2); }
+  .pill-error  { background: rgba(240,79,79,0.1);    color: var(--red);    border: 1px solid rgba(240,79,79,0.2); }
+
+  .result-actions { margin-left: auto; display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
 
   .arrow {
-    font-size: 10px;
+    font-size: 9px;
     color: var(--muted);
     transition: transform 0.2s;
+    flex-shrink: 0;
   }
   .arrow.open { transform: rotate(180deg); }
 
+  /* expanded body */
   .result-body {
     display: none;
-    padding: 16px;
+    padding: 18px;
     border-top: 1px solid var(--border);
   }
   .result-body.open { display: block; }
@@ -524,7 +541,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     border-bottom: 1px solid var(--border);
     padding-bottom: 6px;
     margin-bottom: 12px;
-    margin-top: 16px;
+    margin-top: 18px;
   }
   .section-label:first-child { margin-top: 0; }
 
@@ -538,26 +555,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     text-transform: uppercase;
     color: var(--muted);
     text-align: left;
-    padding: 6px 12px 6px 0;
+    padding: 6px 14px 6px 0;
     border-bottom: 1px solid var(--border);
   }
   td {
     font-family: var(--mono);
     font-size: 12px;
-    padding: 7px 12px 7px 0;
+    padding: 7px 14px 7px 0;
     border-bottom: 1px solid rgba(255,255,255,0.03);
     vertical-align: top;
   }
-  .td-port  { color: var(--blue); font-weight: 500; }
-  .td-open  { color: var(--green); }
-  .td-service { color: var(--text); }
+  .td-port    { color: var(--blue);  font-weight: 600; }
+  .td-open    { color: var(--green); }
+  .td-closed  { color: var(--muted); }
+  .td-service { color: var(--text);  }
 
   /* NSE findings */
   .finding {
-    background: rgba(0,0,0,0.3);
+    background: rgba(0,0,0,0.25);
     border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 10px 12px;
+    border-radius: 5px;
+    padding: 11px 14px;
     margin-bottom: 8px;
   }
   .finding:last-child { margin-bottom: 0; }
@@ -567,7 +585,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     flex-wrap: wrap;
     gap: 10px;
     align-items: center;
-    margin-bottom: 6px;
+    margin-bottom: 7px;
   }
   .finding-script { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--purple); }
   .finding-port   { font-family: var(--mono); font-size: 11px; color: var(--blue); }
@@ -578,12 +596,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-size: 11px;
     color: var(--text);
     white-space: pre-wrap;
-    line-height: 1.5;
+    line-height: 1.55;
     max-height: 180px;
     overflow: hidden;
-    position: relative;
   }
   .finding-output.expanded { max-height: none; }
+
   .show-more {
     font-family: var(--mono);
     font-size: 11px;
@@ -597,32 +615,46 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .show-more:hover { color: var(--text); }
 
   .error-box {
-    background: rgba(240,79,79,0.08);
-    border: 1px solid rgba(240,79,79,0.25);
-    border-radius: 4px;
+    background: rgba(240,79,79,0.07);
+    border: 1px solid rgba(240,79,79,0.22);
+    border-radius: 5px;
     padding: 10px 14px;
     font-family: var(--mono);
     font-size: 12px;
     color: var(--red);
   }
 
-  /* export toolbar */
+  .warn-box {
+    background: rgba(245,200,66,0.07);
+    border: 1px solid rgba(245,200,66,0.22);
+    border-radius: 5px;
+    padding: 10px 14px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--yellow);
+    margin-bottom: 10px;
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+  }
+
+  /* export bar */
   .export-bar {
     padding: 12px 20px;
     border-top: 1px solid var(--border);
     display: flex;
     align-items: center;
     gap: 10px;
-    background: rgba(0,0,0,0.2);
+    background: rgba(0,0,0,0.18);
   }
   .export-note {
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 10px;
     color: var(--muted);
     margin-left: auto;
   }
 
-  /* scan counter */
+  /* count badge */
   .count-badge {
     font-family: var(--mono);
     font-size: 10px;
@@ -632,13 +664,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     color: var(--muted);
     margin-left: 6px;
   }
+
+  /* alert banner (scan already running) */
+  .alert-banner {
+    display: none;
+    padding: 9px 14px;
+    background: rgba(245,200,66,0.08);
+    border: 1px solid rgba(245,200,66,0.25);
+    border-radius: 5px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--yellow);
+    margin-top: 14px;
+    gap: 8px;
+    align-items: center;
+  }
+  .alert-banner.visible { display: flex; }
 </style>
 </head>
 <body>
 
 <header>
   <div class="logo-dot"></div>
-  <span class="logo-text">VAPT // Local Scanner</span>
+  <span class="logo-text">Heimdall // Local Scanner</span>
   <span class="logo-sub">session only · results lost on close</span>
 </header>
 
@@ -689,6 +737,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <span><strong>Full + NSE</strong> uses <code>--script vuln,exploit</code> — intrusive scripts
         that can disrupt services. Only scan hosts you own or have permission to test.</span>
       </div>
+
+      <div class="alert-banner" id="busyBanner">
+        <span>⚠</span>
+        <span>A scan is already running — wait for it to finish before starting another.</span>
+      </div>
     </div>
   </div>
 
@@ -699,7 +752,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="panel-body" id="resultsBody">
       <div class="results-empty" id="emptyMsg">
-        No scans yet. Run a scan above to see results here.
+        No scans yet — run a scan above to see results here.
       </div>
     </div>
     <div class="export-bar" id="exportBar" style="display:none">
@@ -714,26 +767,25 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 let results = [];
 let selectedIds = new Set();
-let scanCounter = 0;
 let pollInterval = null;
+
+// ── form behaviour ────────────────────────────────────────────────────────────
 
 function onTypeChange() {
   const type = document.getElementById('scanType').value;
-  const portsField = document.getElementById('portsField');
-  portsField.classList.toggle('visible', type === 'nse_scan');
+  document.getElementById('portsField').classList.toggle('visible', type === 'nse_scan');
   updateExploitWarn();
 }
 
-function onProfileChange() {
-  updateExploitWarn();
-}
+function onProfileChange() { updateExploitWarn(); }
 
 function updateExploitWarn() {
   const type    = document.getElementById('scanType').value;
   const profile = document.getElementById('profile').value;
-  const warn    = document.getElementById('exploitWarn');
-  warn.classList.toggle('visible', type === 'nse_scan' && profile === 'full');
+  document.getElementById('exploitWarn').classList.toggle('visible', type === 'nse_scan' && profile === 'full');
 }
+
+// ── scan ──────────────────────────────────────────────────────────────────────
 
 function startScan() {
   const target  = document.getElementById('target').value.trim();
@@ -745,10 +797,10 @@ function startScan() {
 
   const btn = document.getElementById('runBtn');
   btn.disabled = true;
+  document.getElementById('busyBanner').classList.remove('visible');
   document.getElementById('scanStatus').classList.add('visible');
 
   const startTime = Date.now();
-
   function tick() {
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
     const m = Math.floor(elapsed / 60);
@@ -763,10 +815,20 @@ function startScan() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ target, type, profile, ports })
   })
-  .then(r => r.json())
+  .then(r => {
+    if (r.status === 409) {
+      // Another scan is already running
+      clearInterval(ticker);
+      btn.disabled = false;
+      document.getElementById('scanStatus').classList.remove('visible');
+      document.getElementById('busyBanner').classList.add('visible');
+      return null;
+    }
+    return r.json();
+  })
   .then(data => {
+    if (!data) return;
     const scanId = data.scan_id;
-    // poll for completion
     pollInterval = setInterval(() => {
       fetch(`/api/result/${scanId}`)
         .then(r => r.json())
@@ -789,6 +851,8 @@ function startScan() {
   });
 }
 
+// ── results ───────────────────────────────────────────────────────────────────
+
 function addResult(res) {
   results.unshift(res);
   renderResults();
@@ -803,6 +867,20 @@ function removeResult(id) {
 function toggleSelect(id) {
   if (selectedIds.has(id)) selectedIds.delete(id);
   else selectedIds.add(id);
+}
+
+function buildSummary(out) {
+  const pills = [];
+  if (out.nmap) {
+    const open = out.nmap.reduce((a, h) => a + h.ports.filter(p => p.state === 'open').length, 0);
+    pills.push(`<span class="pill pill-ports">${open} open port${open !== 1 ? 's' : ''}</span>`);
+  }
+  if (out.nse) {
+    const n = (out.nse.findings || []).length;
+    if (n > 0) pills.push(`<span class="pill pill-nse">${n} NSE finding${n !== 1 ? 's' : ''}</span>`);
+  }
+  if (out.error) pills.push('<span class="pill pill-error">error</span>');
+  return pills.length ? `<div class="pills">${pills.join('')}</div>` : '';
 }
 
 function renderResults() {
@@ -828,17 +906,18 @@ function renderResults() {
     const num     = results.length - idx;
     const out     = r.output || {};
     const summary = buildSummary(out);
+    const statusCls = r.status === 'done' ? 'badge-done' : 'badge-failed';
 
     return `
     <div class="result-card" id="card-${r.id}">
       <div class="result-header" onclick="toggleBody('${r.id}')">
-        <span class="result-id">#${num}</span>
-        <span class="${r.status === 'done' ? 'badge badge-done' : 'badge badge-failed'}">${r.status}</span>
-        <span class="result-meta">${r.scan_type.replace('_', ' ')} · ${r.target} · ${r.profile}</span>
-        <span class="result-summary">${summary}</span>
+        <span class="result-num">Result #${num}</span>
+        <span class="badge ${statusCls}">${r.status}</span>
+        <span class="result-meta">${r.scan_type.replace('_scan','').toUpperCase()} · ${escHtml(r.target)} · ${r.profile}</span>
+        ${summary}
         <div class="result-actions" onclick="event.stopPropagation()">
           <input type="checkbox" onchange="toggleSelect('${r.id}')" title="Select for export">
-          <button class="btn btn-danger" onclick="removeResult('${r.id}')">✕</button>
+          <button class="btn btn-ghost" onclick="removeResult('${r.id}')">✕</button>
         </div>
         <span class="arrow" id="arrow-${r.id}">▼</span>
       </div>
@@ -856,19 +935,6 @@ function toggleBody(id) {
   arrow.classList.toggle('open');
 }
 
-function buildSummary(out) {
-  const parts = [];
-  if (out.nmap) {
-    const open = out.nmap.reduce((a, h) => a + h.ports.filter(p => p.state === 'open').length, 0);
-    parts.push(`${open} open port(s)`);
-  }
-  if (out.nse) {
-    parts.push(`${(out.nse.findings || []).length} NSE finding(s)`);
-  }
-  if (out.error) parts.push('error');
-  return parts.join(' · ') || 'no data';
-}
-
 function renderOutput(out) {
   if (out.error) {
     return `<div class="error-box">Error: ${escHtml(out.error)}</div>`;
@@ -881,15 +947,11 @@ function renderOutput(out) {
     for (const host of out.nmap) {
       const open = host.ports.filter(p => p.state === 'open');
       if (!open.length) {
-        html += `<p style="font-family:var(--mono);font-size:12px;color:var(--muted)">
-          ${escHtml(host.host)}: no open ports found</p>`;
+        html += `<p style="font-family:var(--mono);font-size:12px;color:var(--muted);padding:4px 0">${escHtml(host.host)}: no open ports found</p>`;
         continue;
       }
-      html += `<p style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-bottom:6px">
-        ${escHtml(host.host)}</p>
-        <table><thead><tr>
-          <th>Port</th><th>State</th><th>Service</th>
-        </tr></thead><tbody>`;
+      html += `<p style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-bottom:8px">${escHtml(host.host)}</p>
+        <table><thead><tr><th>Port</th><th>State</th><th>Service</th></tr></thead><tbody>`;
       for (const p of open) {
         html += `<tr>
           <td class="td-port">${p.port}</td>
@@ -904,18 +966,17 @@ function renderOutput(out) {
   if (out.nse) {
     html += '<div class="section-label">NSE Findings</div>';
     if (out.nse.warning) {
-      html += `<div class="exploit-warning visible" style="margin-bottom:10px">
-        <span>⚠</span><span>${escHtml(out.nse.warning)}</span></div>`;
+      html += `<div class="warn-box"><span>⚠</span><span>${escHtml(out.nse.warning)}</span></div>`;
     }
     const findings = out.nse.findings || [];
     if (!findings.length) {
       html += `<p style="font-family:var(--mono);font-size:12px;color:var(--muted)">No NSE findings.</p>`;
     } else {
       for (const f of findings) {
-        const uid   = 'f-' + Math.random().toString(36).slice(2);
-        const port  = f.port ? `port ${f.port} (${escHtml(f.service)})` : 'host-level';
-        const short = f.output.length > 250 ? f.output.slice(0, 250) + '…' : f.output;
-        const more  = f.output.length > 250;
+        const uid  = 'f-' + Math.random().toString(36).slice(2);
+        const port = f.port ? `port ${f.port} (${escHtml(f.service)})` : 'host-level';
+        const isLong = f.output.length > 250;
+        const short  = isLong ? f.output.slice(0, 250) + '…' : f.output;
         html += `
         <div class="finding">
           <div class="finding-meta">
@@ -924,13 +985,13 @@ function renderOutput(out) {
             <span class="finding-host">${escHtml(f.host)}</span>
           </div>
           <div class="finding-output" id="${uid}">${escHtml(short)}</div>
-          ${more ? `<button class="show-more" onclick="expandFinding('${uid}', ${JSON.stringify(f.output)})">Show more</button>` : ''}
+          ${isLong ? `<button class="show-more" onclick="expandFinding('${uid}',${JSON.stringify(f.output)})">Show more</button>` : ''}
         </div>`;
       }
     }
   }
 
-  return html || '<p style="font-family:var(--mono);font-size:12px;color:var(--muted)">No output.</p>';
+  return html || `<p style="font-family:var(--mono);font-size:12px;color:var(--muted)">No output.</p>`;
 }
 
 function expandFinding(uid, full) {
@@ -940,7 +1001,7 @@ function expandFinding(uid, full) {
 }
 
 function escHtml(s) {
-  return String(s)
+  return String(s ?? '')
     .replace(/&/g,'&amp;')
     .replace(/</g,'&lt;')
     .replace(/>/g,'&gt;')
@@ -952,18 +1013,18 @@ function escHtml(s) {
 function buildExportDoc(subset) {
   return {
     exported_at: new Date().toISOString(),
-    source: 'VAPT Local Scanner',
+    source: 'Heimdall Local Scanner',
     host: location.hostname,
     total: subset.length,
     results: subset.map(r => ({
-      scan_type: r.scan_type,
-      target:    r.target,
-      profile:   r.profile,
-      status:    r.status,
+      scan_type:    r.scan_type,
+      target:       r.target,
+      profile:      r.profile,
+      status:       r.status,
       started_at:   r.started_at,
       completed_at: r.completed_at,
-      nmap: r.output.nmap || null,
-      nse:  r.output.nse  || null,
+      nmap:  r.output.nmap  || null,
+      nse:   r.output.nse   || null,
       error: r.output.error || null,
     }))
   };
@@ -974,23 +1035,21 @@ function downloadJson(doc, filename) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(a.href);
 }
 
 function exportAll() {
   if (!results.length) { alert('No results to export.'); return; }
-  const ts = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
-  downloadJson(buildExportDoc(results), `vapt-local-${ts}.json`);
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  downloadJson(buildExportDoc(results), `heimdall-local-${ts}.json`);
 }
 
 function exportSelected() {
   const subset = results.filter(r => selectedIds.has(r.id));
   if (!subset.length) { alert('No results selected — tick the checkboxes first.'); return; }
-  const ts = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
-  downloadJson(buildExportDoc(subset), `vapt-local-selected-${ts}.json`);
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  downloadJson(buildExportDoc(subset), `heimdall-local-selected-${ts}.json`);
 }
 </script>
 </body>
@@ -1021,10 +1080,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
+        path = urlparse(self.path).path
 
-        if path == "/" or path == "/index.html":
+        if path in ("/", "/index.html"):
             self.send_html(DASHBOARD_HTML)
 
         elif path.startswith("/api/result/"):
@@ -1034,7 +1092,6 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 self.send_json(match)
             else:
-                # still running
                 self.send_json({"id": scan_id, "status": "running"})
 
         elif path == "/api/results":
@@ -1080,9 +1137,9 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+# ── startup ───────────────────────────────────────────────────────────────────
 
-def check_nmap():
+def check_nmap() -> bool:
     try:
         result = subprocess.run(
             ["nmap", "--version"],
@@ -1094,7 +1151,7 @@ def check_nmap():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="VAPT Local Scanner")
+    parser = argparse.ArgumentParser(description="Heimdall Local Scanner")
     parser.add_argument("--port", type=int, default=9731, help="Port to listen on (default: 9731)")
     parser.add_argument("--no-browser", action="store_true", help="Don't open browser automatically")
     args = parser.parse_args()
@@ -1110,7 +1167,7 @@ def main():
 
     server = HTTPServer(("127.0.0.1", port), Handler)
 
-    print(f"\n  VAPT Local Scanner")
+    print(f"\n  Heimdall Local Scanner")
     print(f"  {'─' * 36}")
     print(f"  URL  : {url}")
     print(f"  Ctrl+C to stop\n")
