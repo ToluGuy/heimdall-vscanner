@@ -2260,9 +2260,9 @@ def dashboard():
                         <label class="text-xs text-gray-400">Scan Type</label>
                         <select id="job_type" onchange="onJobTypeChange()"
                             class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
-                            <option value="nmap_scan">Nmap Scan</option>
-                            <option value="nikto_scan">Nikto Scan</option>
-                            <option value="nse_scan">NSE Scan</option>
+                            <option value="nmap_scan">Port Scan</option>
+                            <option value="nikto_scan">Web Scan</option>
+                            <option value="nse_scan">Vuln Scan</option>
                         </select>
                     </div>
                     <div class="flex flex-col gap-1" id="portField" style="display:none">
@@ -2303,7 +2303,7 @@ def dashboard():
                 <div id="nseExploitBanner" class="hidden mt-4 flex items-start justify-between gap-3 bg-red-950 border border-red-800 rounded-lg px-4 py-3">
                     <div class="flex items-start gap-3">
                         <span class="text-red-400 text-sm mt-0.5">⚠</span>
-                        <p class="text-xs text-red-300"><strong class="text-red-200">Full profile with NSE</strong> uses <span class="font-mono">--script vuln,exploit</span> — intrusive scripts that may disrupt services.</p>
+                        <p class="text-xs text-red-300"><strong class="text-red-200">Full profile with Vulnerability Scan</strong> uses <span class="font-mono">--script vuln,exploit</span> — intrusive scripts that may disrupt services.</p>
                     </div>
                     <button onclick="dismissExploitBanner()" class="text-red-500 hover:text-red-300 transition text-sm leading-none flex-shrink-0">✕</button>
                 </div>
@@ -2460,9 +2460,9 @@ def dashboard():
                     <div class="flex flex-col gap-1">
                         <label class="text-xs text-gray-400">Scan Type</label>
                         <select id="sched_type" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
-                            <option value="nmap_scan">Nmap Scan</option>
-                            <option value="nikto_scan">Nikto Scan</option>
-                            <option value="nse_scan">NSE Scan</option>
+                            <option value="nmap_scan">Port Scan</option>
+                            <option value="nikto_scan">Web Scan</option>
+                            <option value="nse_scan">Vuln Scan</option>
                         </select>
                     </div>
                     <div class="flex flex-col gap-1">
@@ -2713,6 +2713,16 @@ def dashboard():
 
         // Tracks job statuses from last poll — used to detect completions
         let lastJobStatuses = {};
+        
+        // Friendly display names for scan types
+        const SCAN_TYPE_LABELS = {
+            nmap_scan:   'Port Scan',
+            nikto_scan:  'Web Scan',
+            nse_scan:    'Vulnerability Scan',
+        };
+        function scanTypeLabel(type) {
+            return SCAN_TYPE_LABELS[type] || type;
+        }
 
         // Pending sweep payload (hosts + params) waiting for user confirmation
         let pendingSweepPayload = null;
@@ -3174,7 +3184,7 @@ def dashboard():
                 if (j.cleared) action = '<span class="text-xs text-gray-500 italic">archived</span>';
                 else if (j.status === 'pending' || j.status === 'failed') action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-red-500 hover:text-red-400 transition font-medium">Delete</button>`;
                 else action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button>`;
-                html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition"><td class="py-2 pr-3 text-gray-500 text-xs">${idx + 1}</td><td class="py-2 pr-3 text-gray-500 text-xs font-mono">${j.id}</td><td class="py-2 pr-3 font-mono text-xs text-blue-300">${j.type}</td><td class="py-2 pr-3 font-mono text-xs">${j.target}</td><td class="py-2 pr-3" data-field="status">${statusBadge(j.status)}</td><td class="py-2 pr-3">${priorityBadge(j.priority)}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.mode}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.profile}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.agent}</td><td class="py-2 pr-3 text-xs text-gray-400 tabular-nums" id="job-time-${j.id}" data-started-at="${j.started_at || ''}">${j.status === 'running' ? elapsedDisplay(j.started_at) : formatTimestamp(j.completed_at)}</td><td class="py-2">${action}</td></tr>`;
+                html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition"><td class="py-2 pr-3 text-gray-500 text-xs">${idx + 1}</td><td class="py-2 pr-3 text-gray-500 text-xs font-mono">${j.id}</td><td class="py-2 pr-3 text-xs text-blue-300">${scanTypeLabel(j.type)}</td><td class="py-2 pr-3 font-mono text-xs">${j.target}</td><td class="py-2 pr-3" data-field="status">${statusBadge(j.status)}</td><td class="py-2 pr-3">${priorityBadge(j.priority)}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.mode}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.profile}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.agent}</td><td class="py-2 pr-3 text-xs text-gray-400 tabular-nums" id="job-time-${j.id}" data-started-at="${j.started_at || ''}">${j.status === 'running' ? elapsedDisplay(j.started_at) : formatTimestamp(j.completed_at)}</td><td class="py-2">${action}</td></tr>`;
             });
             html += '</tbody></table>';
             document.getElementById("jobs").innerHTML = html;
@@ -3386,6 +3396,9 @@ def dashboard():
                 // ── Timestamp ─────────────────────────────────────────────
                 const ts = r.job_info ? relativeTime(r.job_info.completed_at) : '';
  
+                // ── Scan type label ───────────────────────────────────────
+                const scanLabel = SCAN_TYPE_LABELS[r.job_info?.type] || (r.job_info?.type || '');
+ 
                 // ── Actions ───────────────────────────────────────────────
                 const actions = isHistory
                     ? '<div class="flex items-center gap-3">'
@@ -3425,9 +3438,9 @@ def dashboard():
                     // ── Expanded body ─────────────────────────────────────
                     + '<div id="result-body-' + r.id + '" class="hidden px-5 pb-5 border-t border-gray-700 pt-4">'
                     +     (isHistory ? renderJobInfo(r.job_info) : '')
-                    +     (out.nmap  ? '<div class="mb-4"><p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Nmap</p>'   + renderNmapResult(out.nmap)  + '</div>' : '')
-                    +     (out.nikto ? '<div class="mb-4"><p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Nikto</p>' + renderNiktoResult(out.nikto) + '</div>' : '')
-                    +     (out.nse   ? '<div class="mb-4"><p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">NSE</p>'   + renderNseResult(out.nse)   + '</div>' : '')
+                    +     (out.nmap  ? '<div class="mb-4"><p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Port Scan</p>'          + renderNmapResult(out.nmap)   + '</div>' : '')
+                    +     (out.nikto ? '<div class="mb-4"><p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Web Scan</p>'         + renderNiktoResult(out.nikto) + '</div>' : '')
+                    +     (out.nse   ? '<div class="mb-4"><p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">Vulnerability Scan</p>' + renderNseResult(out.nse)    + '</div>' : '')
                     +     (!out.nmap && !out.nikto && !out.nse ? '<pre class="text-xs text-gray-400 overflow-x-auto">' + JSON.stringify(out, null, 2) + '</pre>' : '')
                     +     (r.analysis
                             ? '<div class="mb-4">' + renderAnalysis(r.analysis) + '</div>'
@@ -3605,7 +3618,7 @@ def dashboard():
                 : `<button onclick="pauseSchedule(${s.id})" class="text-xs text-yellow-400 hover:text-yellow-300 transition">Pause</button>`;
                 html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition">
                 <td class="py-2 pr-3 font-medium text-sm">${s.name}</td>
-                <td class="py-2 pr-3 font-mono text-xs text-blue-300">${s.type}</td>
+                <td class="py-2 pr-3 text-xs text-blue-300">${scanTypeLabel(s.type)}</td>
                 <td class="py-2 pr-3 font-mono text-xs">${s.target}</td>
                 <td class="py-2 pr-3 text-xs text-gray-300">${s.profile}</td>
                 <td class="py-2 pr-3 text-xs text-gray-300">${s.interval_hours}h</td>
@@ -3950,6 +3963,7 @@ def dashboard():
                         '<tr class="border-b border-gray-800 text-xs">'
                         + '<td class="py-2 pr-4 text-gray-400">'       + (e.date || '\u2014') + '</td>'
                         + '<td class="py-2 pr-4 font-mono text-blue-300">' + e.type           + '</td>'
+                        + '<td class="py-2 pr-4 text-blue-300">'           + scanTypeLabel(e.type) + '</td>'
                         + '<td class="py-2 pr-4 text-gray-400">'       + e.profile            + '</td>'
                         + '<td class="py-2 pr-4 text-gray-300">'       + e.open_ports         + '</td>'
                         + '<td class="py-2 pr-4 text-gray-300">'       + e.findings           + '</td>'

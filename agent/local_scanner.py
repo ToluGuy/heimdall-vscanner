@@ -710,8 +710,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="field">
           <label>Scan Type</label>
           <select id="scanType" onchange="onTypeChange()">
-            <option value="nmap_scan">Nmap Scan</option>
-            <option value="nse_scan">NSE Scan</option>
+            <option value="nmap_scan">Port Scan</option>
+            <option value="nse_scan">Vulnerability Scan</option>
           </select>
         </div>
         <div class="field">
