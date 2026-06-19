@@ -1967,7 +1967,39 @@ def dashboard():
             body.theme-light .text-white    { color: #0f172a !important; }
             body.theme-light .bg-gray-950.bg-opacity-95 { background-color: rgba(241,245,249,0.97) !important; }
             /* Keep accent colours as-is in light mode — green, blue, red etc stay vivid */
-            
+             
+            /* ── Result card hover tooltip ── */
+            .result-tooltip {
+                position: absolute;
+                bottom: calc(100% + 8px);
+                left: 50%;
+                transform: translateX(-50%);
+                min-width: 240px;
+                max-width: 320px;
+                background: #060a10;
+                border: 1px solid #2a3347;
+                border-radius: 8px;
+                padding: 10px 14px;
+                pointer-events: none;
+                opacity: 0;
+                transition: opacity 0.12s ease;
+                z-index: 30;
+                white-space: nowrap;
+                box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+            }
+            .result-tooltip.visible {
+                opacity: 1;
+            }
+            /* Arrow pointing down */
+            .result-tooltip::after {
+                content: '';
+                position: absolute;
+                top: 100%;
+                left: 50%;
+                transform: translateX(-50%);
+                border: 5px solid transparent;
+                border-top-color: #2a3347;
+            }
         </style>
     </head>
     <body class="bg-gray-950 text-gray-100 min-h-screen">
@@ -2200,7 +2232,7 @@ def dashboard():
         <!-- ── HEADER ───────────────────────────────────────────────────── -->
         <div class="bg-gray-900 border-b border-gray-800 px-6 py-3 flex items-center justify-between">
             <div class="flex items-center gap-3">
-                <div class="w-3 h-3 rounded-full bg-green-400 animate-pulse"></div>
+                <div class="w-3 h-3 rounded-full bg-green-400 animate-ping opacity-75"></div>
                 <h1 class="text-lg font-bold text-green-400 tracking-wider">Heimdall V-Scanner</h1>
             </div>
 
@@ -3244,6 +3276,27 @@ def dashboard():
             body.classList.toggle('hidden');
             arrow.innerText = body.classList.contains('hidden') ? '▼' : '▲';
         }
+         
+        // ── Result card hover tooltip ──────────────────────────────────────
+        let _tooltipTimer = null;
+ 
+        function showResultTooltip(event, id) {
+            // Don't show if card is expanded — content is already visible
+            const body = document.getElementById('result-body-' + id);
+            if (body && !body.classList.contains('hidden')) return;
+ 
+            clearTimeout(_tooltipTimer);
+            _tooltipTimer = setTimeout(() => {
+                const tip = document.getElementById('tip-' + id);
+                if (tip) tip.classList.add('visible');
+            }, 480);
+        }
+ 
+        function hideResultTooltip(id) {
+            clearTimeout(_tooltipTimer);
+            const tip = document.getElementById('tip-' + id);
+            if (tip) tip.classList.remove('visible');
+        }
         function renderNmapResult(nmap) {
             if (!nmap || !nmap.length) return '<p class="text-gray-500 text-xs">No hosts found.</p>';
             return nmap.map(host => {
@@ -3412,11 +3465,50 @@ def dashboard():
                       + '<button onclick="triggerAnalysis(' + r.id + ')" class="text-xs text-purple-400 hover:text-purple-300 transition">Analyse</button>'
                       + '<button onclick="clearResult(' + r.id + ')" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button>'
                       + '</div>';
+
+                // Build tooltip content
+                const tipRisk = r.analysis
+                    ? (() => {
+                        const rm = r.analysis.match(/##\\s*Risk Level\\s*\\n+(\w+)/i);
+                        return rm ? rm[1].toUpperCase() : 'INFO';
+                      })()
+                    : null;
+                const tipRiskStyles = {
+                    CRITICAL: 'background:rgba(239,68,68,0.15);color:#fca5a5;border-color:rgba(239,68,68,0.3)',
+                    HIGH:     'background:rgba(249,115,22,0.15);color:#fdba74;border-color:rgba(249,115,22,0.3)',
+                    MEDIUM:   'background:rgba(234,179,8,0.15);color:#fde047;border-color:rgba(234,179,8,0.3)',
+                    LOW:      'background:rgba(59,130,246,0.15);color:#93c5fd;border-color:rgba(59,130,246,0.3)',
+                    INFO:     'background:rgba(107,114,128,0.15);color:#9ca3af;border-color:rgba(107,114,128,0.3)',
+                };
+                const tipRiskBadge = tipRisk
+                    ? `<span style="font-size:10px;padding:1px 7px;border-radius:20px;border:1px solid;font-weight:600;${tipRiskStyles[tipRisk] || tipRiskStyles.INFO}">${tipRisk}</span>`
+                    : `<span style="font-size:10px;padding:1px 7px;border-radius:20px;border:1px solid;border-color:#374151;color:#4b5563;font-weight:500">UNANALYSED</span>`;
  
-                return '<div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">'
+                const tipTarget = r.job_info ? r.job_info.target : ('Job #' + r.job_id);
+                const tipType   = SCAN_TYPE_LABELS[r.job_info?.type] || (r.job_info?.type || '—');
+                const tipTime   = r.job_info ? relativeTime(r.job_info.completed_at) : '';
+                const tipPorts  = nmapCount + ' port' + (nmapCount !== 1 ? 's' : '');
+                const tipFinds  = (nseCount + niktoCount) + ' finding' + ((nseCount + niktoCount) !== 1 ? 's' : '');
  
+                const tipHtml = `
+                    <div id="tip-${r.id}" class="result-tooltip">
+                        <div style="display:flex;align-items:center;gap:8px;margin-bottom:7px;flex-wrap:wrap">
+                            ${tipRiskBadge}
+                            <span style="font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:600;color:#4ade80">${tipTarget}</span>
+                            <span style="font-size:10px;color:#4b5563;margin-left:auto">${tipTime}</span>
+                        </div>
+                        <div style="display:flex;gap:12px;font-size:10px;color:#6b7280;font-family:'IBM Plex Mono',monospace">
+                            <span>⬡ ${tipType}</span>
+                            <span style="color:#3b82f6">▣ ${tipPorts}</span>
+                            ${(nseCount + niktoCount) > 0 ? `<span style="color:#a78bfa">◈ ${tipFinds}</span>` : ''}
+                        </div>
+                    </div>`;
+ 
+                return '<div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden" style="position:relative">'
+                    + tipHtml
+                  
                     // ── Collapsed header ──────────────────────────────────
-                    + '<div class="flex items-center justify-between px-5 py-3.5 cursor-pointer hover:bg-gray-750 transition" onclick="toggleResult(' + r.id + ')">'
+                    + '<div class="flex items-center justify-between px-5 py-3.5 cursor-pointer hover:bg-gray-750 transition" onclick="toggleResult(' + r.id + ')" onmouseenter="showResultTooltip(event,' + r.id + ')" onmouseleave="hideResultTooltip(' + r.id + ')">'
  
                         // Left: id · risk · target · pills
                         + '<div class="flex items-center gap-2.5 flex-wrap min-w-0 pr-2">'
