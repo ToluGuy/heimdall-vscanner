@@ -38,7 +38,7 @@ The dashboard uses plain language for scan types. The internal names (used in th
 
 | Dashboard label | Internal name | Description |
 |-----------------|---------------|-------------|
-| Port Scan | `nmap_scan` | Discovers open ports; automatically runs a Web Scan on any web ports found |
+| Port Scan | `nmap_scan` | Discovers open ports; automatically runs a fast Web Scan (light profile) on any web ports found. To run a thorough web scan, create a Web Scan job explicitly. |
 | Web Scan | `nikto_scan` | Standalone web vulnerability scan against a specific port |
 | Vulnerability Scan | `nse_scan` | Script-based vulnerability checks against non-web services; web ports are excluded |
 

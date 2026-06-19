@@ -13,7 +13,10 @@ DB_NAME = os.environ.get("DB_NAME", "vapt")
 DB_USER = os.environ.get("DB_USER", "admin")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 
-DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+DATABASE_URL = (
+    f"postgresql://{DB_USER}:{quote_plus(DB_PASSWORD)}"
+    f"@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+)
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)

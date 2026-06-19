@@ -466,7 +466,7 @@ def execute_job(job: dict, api_key: str):
                         logger.info(f"Port {wp} in skip list — omitting from Nikto")
                         continue
                     try:
-                        nikto_results[str(wp)] = run_nikto(target, wp, profile)
+                        nikto_results[str(wp)] = run_nikto(target, wp, "light")
                     except Exception as e:
                         nikto_results[str(wp)] = {"error": str(e)}
                 if nikto_results:
