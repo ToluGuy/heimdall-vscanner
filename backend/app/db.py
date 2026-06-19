@@ -1,6 +1,8 @@
 # backend/app/db.py
 
 import os
+from urllib.parse import quote_plus
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from dotenv import load_dotenv
