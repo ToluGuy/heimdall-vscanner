@@ -2645,10 +2645,16 @@ def dashboard():
                 <div class="flex-1 bg-gray-900 rounded-xl border border-gray-800 relative overflow-hidden" id="topoCanvasWrap">
                     <div id="topoEmpty" class="absolute inset-0 flex items-center justify-center hidden">
                         <div class="text-center">
-                            <p class="text-gray-600 text-sm">No hosts discovered yet.</p>
-                            <p class="text-gray-700 text-xs mt-1">Run a discovery sweep or scan some hosts first.</p>
+                            <div class="text-4xl mb-4 opacity-20">⌖</div>
+                            <p class="text-gray-500 text-sm font-medium mb-1">No hosts mapped yet</p>
+                            <p class="text-gray-700 text-xs mb-4">Run a discovery sweep or a port scan to populate the map.</p>
+                            <button onclick="switchTab('discovery')"
+                                class="text-xs px-4 py-2 rounded-lg bg-green-900 hover:bg-green-800 text-green-300 border border-green-800 transition font-medium">
+                                → Go to Discovery
+                            </button>
                         </div>
                     </div>
+ 
                     <svg id="topoSvg" class="w-full h-full">
                         <defs>
                             <filter id="glow">
@@ -4111,15 +4117,15 @@ function setTopoFilter(f) {
     }
     if (topoData) renderTopology(topoData);
 }
- 
+
 function resetTopoZoom() {
-    const svg = d3.select('#topoSvg');
-    svg.transition().duration(500).call(
+    const svgEl  = document.getElementById('topoSvg');
+    const r = svgEl.getBoundingClientRect();
+    const fw = r.width  || 900;
+    const fh = r.height || 680;
+    d3.select('#topoSvg').transition().duration(500).call(
         topoZoom.transform,
-        d3.zoomIdentity.translate(
-            document.getElementById('topoSvg').clientWidth / 2,
-            document.getElementById('topoSvg').clientHeight / 2
-        ).scale(0.85)
+        d3.zoomIdentity.translate(fw / 2, fh / 2).scale(0.82)
     );
 }
  
@@ -4162,85 +4168,105 @@ async function loadTopology() {
     }
     document.getElementById('topoEmpty').classList.add('hidden');
  
+
+    // Bind zoom once — renderTopology reuses this reference
+    if (!topoZoom) {
+        const svgSel = d3.select('#topoSvg');
+        topoZoom = d3.zoom()
+            .scaleExtent([0.15, 5])
+            .on('zoom', (event) => {
+                d3.select('#topoG').attr('transform', event.transform);
+            });
+        svgSel.call(topoZoom);
+    }
+ 
     renderTopology(topoData);
 }
- 
+
 function renderTopology(data) {
     const wrap = document.getElementById('topoCanvasWrap');
-    const W = wrap.clientWidth;
-    const H = wrap.clientHeight;
- 
-    const svg = d3.select('#topoSvg');
-    const g   = d3.select('#topoG');
+    const svg  = d3.select('#topoSvg');
+    const g    = d3.select('#topoG');
     g.selectAll('*').remove();
  
-    // Apply filter
+    // ── Filter ────────────────────────────────────────────────────────────
     let visibleHosts = data.nodes.filter(n => n.type === 'host');
     if (topoFilter !== 'all') {
         visibleHosts = visibleHosts.filter(n => n.risk === topoFilter);
     }
-    const visibleHostIds = new Set(visibleHosts.map(n => n.id));
- 
-    // Only include subnets that have at least one visible host
     const relevantSubnets = new Set(visibleHosts.map(n => n.subnet));
     const subnetNodes = data.nodes.filter(n => n.type === 'subnet' && relevantSubnets.has(n.label));
  
-    const nodes = [...visibleHosts, ...subnetNodes];
+    const nodes   = [...visibleHosts, ...subnetNodes];
     const nodeIds = new Set(nodes.map(n => n.id));
-    const edges = data.edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
+    const edges   = data.edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
  
-    // Clone for D3 mutation
+    // Clone for D3 mutation (D3 adds x/y/vx/vy to nodes in-place)
     const simNodes = nodes.map(n => ({ ...n }));
     const simEdges = edges.map(e => ({ ...e }));
  
-    // Group subnets into clusters using a subnet-center attraction
+    // ── Initial positions: cluster hosts near their subnet centroid ───────
+    // Read actual painted dimensions RIGHT NOW via getBoundingClientRect,
+    // not clientWidth which can be 0 before layout completes.
+    const rect = wrap.getBoundingClientRect();
+    const W = rect.width  || 900;
+    const H = rect.height || 680;
+ 
     const subnetCenters = {};
     const subnetsArr = [...relevantSubnets];
-    const cols = Math.ceil(Math.sqrt(subnetsArr.length));
+    const cols = Math.max(1, Math.ceil(Math.sqrt(subnetsArr.length)));
+    const rows = Math.ceil(subnetsArr.length / cols);
     subnetsArr.forEach((subnet, i) => {
-        const col = i % cols;
-        const row = Math.floor(i / cols);
         subnetCenters[subnet] = {
-            x: (W / (cols + 1)) * (col + 1),
-            y: (H / (Math.ceil(subnetsArr.length / cols) + 1)) * (row + 1),
+            x: (W / (cols + 1)) * ((i % cols) + 1),
+            y: (H / (rows + 1)) * (Math.floor(i / cols) + 1),
         };
     });
  
-    // Pre-position subnet nodes
     simNodes.forEach(n => {
-        if (n.type === 'subnet' && subnetCenters[n.label]) {
-            n.fx = subnetCenters[n.label].x;
-            n.fy = subnetCenters[n.label].y;
-        }
-        if (n.type === 'host' && subnetCenters[n.subnet]) {
-            n.x = subnetCenters[n.subnet].x + (Math.random() - 0.5) * 120;
-            n.y = subnetCenters[n.subnet].y + (Math.random() - 0.5) * 120;
+        const center = subnetCenters[n.type === 'subnet' ? n.label : n.subnet];
+        if (!center) return;
+        if (n.type === 'subnet') {
+            // Pin subnet labels at their cluster center initially,
+            // then release so they float to where the simulation settles
+            n.x = center.x;
+            n.y = center.y;
+        } else {
+            // Scatter hosts around their subnet center
+            const angle = Math.random() * 2 * Math.PI;
+            const radius = 40 + Math.random() * 60;
+            n.x = center.x + Math.cos(angle) * radius;
+            n.y = center.y + Math.sin(angle) * radius;
         }
     });
  
-    // Force simulation
+    // ── Force simulation ──────────────────────────────────────────────────
     if (topoSimulation) topoSimulation.stop();
  
     topoSimulation = d3.forceSimulation(simNodes)
-        .force('link', d3.forceLink(simEdges).id(d => d.id).distance(d => {
-            if (d.target.type === 'subnet') return 90;
-            return 60;
-        }).strength(0.6))
-        .force('charge', d3.forceManyBody().strength(d => d.type === 'subnet' ? -300 : -180))
-        .force('collide', d3.forceCollide().radius(d => d.type === 'subnet' ? 40 : 22))
-        .alphaDecay(0.03);
+        .force('link', d3.forceLink(simEdges)
+            .id(d => d.id)
+            .distance(d => d.target.type === 'subnet' ? 95 : 65)
+            .strength(0.55))
+        .force('charge', d3.forceManyBody()
+            .strength(d => d.type === 'subnet' ? -320 : -200))
+        .force('collide', d3.forceCollide()
+            .radius(d => d.type === 'subnet' ? 55 : 26)
+            .strength(0.8))
+        .force('center', d3.forceCenter(W / 2, H / 2).strength(0.05))
+        .alphaDecay(0.025);
  
-    // Edges
+    // ── Edges ─────────────────────────────────────────────────────────────
     const link = g.append('g').attr('class', 'topo-links')
         .selectAll('line')
         .data(simEdges)
         .enter().append('line')
-        .attr('stroke', '#1f2937')
+        .attr('stroke', '#1e2535')
         .attr('stroke-width', 1.5)
         .attr('stroke-dasharray', d => d.target.type === 'subnet' ? '4,3' : 'none')
-        .attr('opacity', 0.7);
+        .attr('opacity', 0.8);
  
-    // Subnet nodes (rectangles)
+    // ── Subnet nodes (pill labels) ────────────────────────────────────────
     const subnetGroup = g.append('g').attr('class', 'topo-subnets')
         .selectAll('g')
         .data(simNodes.filter(n => n.type === 'subnet'))
@@ -4248,32 +4274,30 @@ function renderTopology(data) {
         .attr('class', 'topo-subnet-node');
  
     subnetGroup.append('rect')
-        .attr('width', 100).attr('height', 28)
-        .attr('x', -50).attr('y', -14)
-        .attr('rx', 6)
-        .attr('fill', '#111827')
-        .attr('stroke', '#374151')
-        .attr('stroke-width', 1.5);
+        .attr('width', 108).attr('height', 26)
+        .attr('x', -54).attr('y', -13)
+        .attr('rx', 13)  // fully pill-shaped
+        .attr('fill', '#0d1117')
+        .attr('stroke', '#2a3347')
+        .attr('stroke-width', 1);
  
     subnetGroup.append('text')
         .text(d => d.label)
         .attr('text-anchor', 'middle')
         .attr('dy', '0.35em')
-        .attr('fill', '#6b7280')
+        .attr('fill', '#4b5563')
         .attr('font-family', 'IBM Plex Mono, monospace')
-        .attr('font-size', 10);
+        .attr('font-size', 9)
+        .attr('letter-spacing', '0.05em');
  
-    // Host nodes
+    // ── Host nodes ────────────────────────────────────────────────────────
     const hostGroup = g.append('g').attr('class', 'topo-hosts')
         .selectAll('g')
         .data(simNodes.filter(n => n.type === 'host'))
         .enter().append('g')
         .attr('class', 'topo-host-node-group')
         .style('cursor', 'pointer')
-        .on('click', (event, d) => {
-            event.stopPropagation();
-            selectTopoHost(d);
-        })
+        .on('click', (event, d) => { event.stopPropagation(); selectTopoHost(d); })
         .call(d3.drag()
             .on('start', (event, d) => {
                 if (!event.active) topoSimulation.alphaTarget(0.3).restart();
@@ -4286,31 +4310,47 @@ function renderTopology(data) {
             })
         );
  
-    // Outer ring for agent hosts
+    // Agent host outer ring (dashed border)
     hostGroup.filter(d => d.is_agent)
         .append('circle')
-        .attr('r', 20)
+        .attr('r', d => 22 + Math.min(d.port_count, 10))
         .attr('fill', 'none')
         .attr('stroke', '#4ade80')
         .attr('stroke-width', 1.5)
         .attr('stroke-dasharray', '3,2')
-        .attr('opacity', 0.6);
+        .attr('opacity', 0.5);
  
-    // Main circle
+    // CRITICAL pulse ring — CSS animation via SVG animateTransform
+    // (avoids the recursive D3 transition memory leak)
+    hostGroup.filter(d => d.risk === 'CRITICAL')
+        .append('circle')
+        .attr('r', d => 14 + Math.min(d.port_count, 10))
+        .attr('fill', 'none')
+        .attr('stroke', '#ef4444')
+        .attr('stroke-width', 1.5)
+        .attr('opacity', 0.6)
+        .each(function(d) {
+            const baseR = 14 + Math.min(d.port_count, 10);
+            const el = d3.select(this);
+            (function ping() {
+                el.attr('r', baseR).attr('opacity', 0.6)
+                  .transition().duration(1800).ease(d3.easeCubicOut)
+                  .attr('r', baseR + 14).attr('opacity', 0)
+                  .on('end', ping);
+            })();
+        });
+ 
+    // Main host circle
     hostGroup.append('circle')
         .attr('class', 'topo-host-node')
-        .attr('r', d => {
-            // Size by port count
-            const base = 14;
-            return base + Math.min(d.port_count, 10);
-        })
+        .attr('r', d => 14 + Math.min(d.port_count, 10))
         .attr('fill', d => riskColor(d.risk))
-        .attr('fill-opacity', 0.15)
+        .attr('fill-opacity', 0.12)
         .attr('stroke', d => riskColor(d.risk))
         .attr('stroke-width', 2)
         .attr('filter', d => ['CRITICAL', 'HIGH'].includes(d.risk) ? 'url(#glow)' : null);
  
-    // IP label
+    // IP label inside node
     hostGroup.append('text')
         .text(d => d.ip)
         .attr('text-anchor', 'middle')
@@ -4318,40 +4358,30 @@ function renderTopology(data) {
         .attr('fill', d => riskColor(d.risk))
         .attr('font-family', 'IBM Plex Mono, monospace')
         .attr('font-size', 9)
-        .attr('font-weight', '600');
+        .attr('font-weight', '600')
+        .attr('pointer-events', 'none');
  
-    // Port count badge (top-right of node)
+    // Port count badge — top-right of node
     hostGroup.filter(d => d.port_count > 0)
         .append('text')
         .text(d => d.port_count)
-        .attr('x', d => 14 + Math.min(d.port_count, 10) - 4)
-        .attr('y', d => -(14 + Math.min(d.port_count, 10) - 4))
+        .attr('x', d => 11 + Math.min(d.port_count, 10))
+        .attr('y', d => -(11 + Math.min(d.port_count, 10)))
         .attr('text-anchor', 'middle')
-        .attr('fill', '#9ca3af')
+        .attr('fill', '#6b7280')
         .attr('font-size', 8)
-        .attr('font-family', 'IBM Plex Mono, monospace');
+        .attr('font-family', 'IBM Plex Mono, monospace')
+        .attr('pointer-events', 'none');
  
-    // Pulse animation for CRITICAL nodes
-    hostGroup.filter(d => d.risk === 'CRITICAL')
-        .append('circle')
-        .attr('r', d => 14 + Math.min(d.port_count, 10))
-        .attr('fill', 'none')
-        .attr('stroke', '#ef4444')
-        .attr('stroke-width', 1)
-        .attr('opacity', 0)
-        .each(function pulse() {
-            d3.select(this)
-                .transition().duration(1500)
-                .attr('r', d => (14 + Math.min(d.port_count, 10)) + 12)
-                .attr('opacity', 0)
-                .on('end', function() {
-                    d3.select(this).attr('r', d => 14 + Math.min(d.port_count, 10)).attr('opacity', 0.5);
-                    pulse.call(this);
-                });
+    // ── Tick: update positions + clamp nodes inside canvas ────────────────
+    const PAD = 40; // minimum distance from SVG edge
+    topoSimulation.on('tick', () => {
+        // Clamp nodes so they never drift off-screen
+        simNodes.forEach(n => {
+            n.x = Math.max(PAD, Math.min(W - PAD, n.x || W / 2));
+            n.y = Math.max(PAD, Math.min(H - PAD, n.y || H / 2));
         });
  
-    // Tick
-    topoSimulation.on('tick', () => {
         link
             .attr('x1', d => d.source.x)
             .attr('y1', d => d.source.y)
@@ -4362,28 +4392,25 @@ function renderTopology(data) {
         hostGroup.attr('transform', d => `translate(${d.x},${d.y})`);
     });
  
-    // Zoom + pan
-    topoZoom = d3.zoom()
-        .scaleExtent([0.2, 4])
-        .on('zoom', (event) => {
-            g.attr('transform', event.transform);
-        });
-    
-     svg.call(topoZoom);
-
-    // Re-read dimensions after layout is complete, then center
-    requestAnimationFrame(() => {
-        const svgEl = document.getElementById('topoSvg');
-        const fw = svgEl.clientWidth  || wrap.clientWidth;
-        const fh = svgEl.clientHeight || wrap.clientHeight;
-        svg.call(topoZoom.transform, d3.zoomIdentity
-            .translate(fw / 2, fh / 2)
-            .scale(0.85));
-    });
-
-    // Click on background → deselect
+    // ── Zoom: bind on the svg element (done once in loadTopology) ─────────
+    // Just update the click-background handler — zoom is already bound
     svg.on('click', () => closeTopoPanel());
+ 
+    // ── Initial centering: wait for simulation to settle a bit ───────────
+    // Using two rAF calls ensures the browser has painted the SVG,
+    // giving us accurate dimensions for the centering transform.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+        const svgEl  = document.getElementById('topoSvg');
+        const svgRect = svgEl.getBoundingClientRect();
+        const fw = svgRect.width  || W;
+        const fh = svgRect.height || H;
+        svg.transition().duration(400).call(
+            topoZoom.transform,
+            d3.zoomIdentity.translate(fw / 2, fh / 2).scale(0.82)
+        );
+    }));
 }
+ 
  
 function selectTopoHost(d) {
     topoSelectedNode = d.id;
