@@ -1,5 +1,7 @@
+# TEMPLATE ONLY — install.sh generates the real service file with correct paths.
+# Do not copy this directly. Edit install.sh or the generated file in /etc/systemd/system/.
 [Unit]
-Description=VAPT Scanner Server
+Description=Heimdall V-Scanner — Server
 After=network.target postgresql.service
 Requires=postgresql.service
 
