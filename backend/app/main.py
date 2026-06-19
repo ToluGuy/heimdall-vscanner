@@ -2633,6 +2633,17 @@ def dashboard():
                         <button onclick="setTopoFilter('UNANALYSED')" id="tf-UNANALYSED"
                             class="topo-filter text-xs px-3 py-1 rounded-md transition font-medium text-gray-400 hover:text-white">Unanalysed</button>
                     </div>
+                    <div class="flex items-center gap-1 bg-gray-900 border border-gray-800 rounded-lg p-1">
+                        <span class="text-xs text-gray-600 px-1">Label:</span>
+                        <button onclick="setTopoLabelMode('auto')" id="tlm-auto"
+                            class="topo-label-btn text-xs px-2 py-1 rounded-md transition font-medium bg-gray-700 text-white">Auto</button>
+                        <button onclick="setTopoLabelMode('ip')" id="tlm-ip"
+                            class="topo-label-btn text-xs px-2 py-1 rounded-md transition font-medium text-gray-400 hover:text-white">IP</button>
+                        <button onclick="setTopoLabelMode('hostname')" id="tlm-hostname"
+                            class="topo-label-btn text-xs px-2 py-1 rounded-md transition font-medium text-gray-400 hover:text-white">Host</button>
+                        <button onclick="setTopoLabelMode('mac')" id="tlm-mac"
+                            class="topo-label-btn text-xs px-2 py-1 rounded-md transition font-medium text-gray-400 hover:text-white">MAC</button>
+                    </div>
                     <button onclick="resetTopoZoom()" class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-400 transition">⊙ Reset</button>
                     <button onclick="loadTopology()" class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-400 transition">↻ Refresh</button>
                 </div>
@@ -3282,20 +3293,18 @@ def dashboard():
             body.classList.toggle('hidden');
             arrow.innerText = body.classList.contains('hidden') ? '▼' : '▲';
         }
-         
+
         // ── Result card hover tooltip ──────────────────────────────────────
         let _tooltipTimer = null;
  
         function showResultTooltip(event, id) {
-            // Don't show if card is expanded — content is already visible
             const body = document.getElementById('result-body-' + id);
             if (body && !body.classList.contains('hidden')) return;
- 
             clearTimeout(_tooltipTimer);
             _tooltipTimer = setTimeout(() => {
                 const tip = document.getElementById('tip-' + id);
                 if (tip) tip.classList.add('visible');
-            }, 480);
+            }, 500);
         }
  
         function hideResultTooltip(id) {
@@ -3496,23 +3505,53 @@ def dashboard():
                 const tipPorts  = nmapCount + ' port' + (nmapCount !== 1 ? 's' : '');
                 const tipFinds  = (nseCount + niktoCount) + ' finding' + ((nseCount + niktoCount) !== 1 ? 's' : '');
  
-                const tipHtml = `
-                    <div id="tip-${r.id}" class="result-tooltip">
-                        <div style="display:flex;align-items:center;gap:8px;margin-bottom:7px;flex-wrap:wrap">
-                            ${tipRiskBadge}
-                            <span style="font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:600;color:#4ade80">${tipTarget}</span>
-                            <span style="font-size:10px;color:#4b5563;margin-left:auto">${tipTime}</span>
-                        </div>
-                        <div style="display:flex;gap:12px;font-size:10px;color:#6b7280;font-family:'IBM Plex Mono',monospace">
-                            <span>⬡ ${tipType}</span>
-                            <span style="color:#3b82f6">▣ ${tipPorts}</span>
-                            ${(nseCount + niktoCount) > 0 ? `<span style="color:#a78bfa">◈ ${tipFinds}</span>` : ''}
-                        </div>
-                    </div>`;
+                // Build the useful tooltip content:
+                // - Open ports list (not visible without expanding)
+                // - First sentence of AI analysis (never visible in collapsed state)
+                const openPortsList = out.nmap
+                    ? out.nmap.flatMap(h => h.ports.filter(p => p.state === 'open'))
+                    : [];
  
-                return '<div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden" style="position:relative">'
+                let tipPortsHtml = '';
+                if (openPortsList.length) {
+                    const shown = openPortsList.slice(0, 6);
+                    const more  = openPortsList.length - shown.length;
+                    tipPortsHtml = '<div style="margin-bottom:6px">'
+                        + '<div style="font-size:9px;letter-spacing:0.08em;text-transform:uppercase;color:#4b5563;margin-bottom:4px">Open Ports</div>'
+                        + '<div style="display:flex;flex-wrap:wrap;gap:4px">'
+                        + shown.map(p =>
+                            `<span style="font-family:\'IBM Plex Mono\',monospace;font-size:10px;background:rgba(59,130,246,0.1);color:#93c5fd;border:1px solid rgba(59,130,246,0.2);border-radius:4px;padding:1px 6px">${p.port}<span style="color:#4b5563;font-size:9px"> ${p.service}</span></span>`
+                          ).join('')
+                        + (more > 0 ? `<span style="font-size:9px;color:#4b5563;align-self:center">+${more} more</span>` : '')
+                        + '</div></div>';
+                } else if (out.nmap !== undefined) {
+                    tipPortsHtml = '<div style="font-size:10px;color:#4b5563;margin-bottom:6px">No open ports found</div>';
+                }
+ 
+                let tipAnalysisHtml = '';
+                if (r.analysis) {
+                    // Extract the Summary section — first meaningful sentence after ## Summary
+                    const summaryMatch = r.analysis.match(/##\\s*Summary\\s*\\n+([\\s\\S]+?)(?=\\n##|\\n\*\*|$)/i);
+                    if (summaryMatch) {
+                        const summaryText = summaryMatch[1].trim().split(/\.\\s+/)[0] + '.';
+                        tipAnalysisHtml = '<div style="border-top:1px solid #1e2535;padding-top:6px;margin-top:2px">'
+                            + '<div style="font-size:9px;letter-spacing:0.08em;text-transform:uppercase;color:#4b5563;margin-bottom:3px">AI Summary</div>'
+                            + `<div style="font-size:10px;color:#9ca3af;line-height:1.5;white-space:normal">${summaryText}</div>`
+                            + '</div>';
+                    }
+                }
+ 
+                // Only build the tooltip if there's something useful to show
+                const hasTipContent = tipPortsHtml || tipAnalysisHtml;
+                const tipHtml = hasTipContent ? `
+                    <div id="tip-${r.id}" class="result-tooltip">
+                        ${tipPortsHtml}
+                        ${tipAnalysisHtml}
+                    </div>` : `<div id="tip-${r.id}"></div>`;
+   
+                return '<div class="bg-gray-800 rounded-xl border border-gray-700" style="position:relative">'
                     + tipHtml
-                  
+
                     // ── Collapsed header ──────────────────────────────────
                     + '<div class="flex items-center justify-between px-5 py-3.5 cursor-pointer hover:bg-gray-750 transition" onclick="toggleResult(' + r.id + ')" onmouseenter="showResultTooltip(event,' + r.id + ')" onmouseleave="hideResultTooltip(' + r.id + ')">'
  
@@ -4119,13 +4158,12 @@ function setTopoFilter(f) {
 }
 
 function resetTopoZoom() {
-    const svgEl  = document.getElementById('topoSvg');
-    const r = svgEl.getBoundingClientRect();
-    const fw = r.width  || 900;
-    const fh = r.height || 680;
+    const wrap = document.getElementById('topoCanvasWrap');
+    const fw = wrap.offsetWidth  || 900;
+    const fh = wrap.offsetHeight || 680;
     d3.select('#topoSvg').transition().duration(500).call(
         topoZoom.transform,
-        d3.zoomIdentity.translate(fw / 2, fh / 2).scale(0.82)
+        d3.zoomIdentity.translate(fw / 2, fh / 2).scale(0.78)
     );
 }
  
@@ -4135,7 +4173,7 @@ function closeTopoPanel() {
     // deselect all nodes
     d3.selectAll('.topo-host-node').attr('stroke', d => d.is_agent ? '#4ade80' : 'none').attr('stroke-width', d => d.is_agent ? 2 : 0);
 }
- 
+
 async function loadTopology() {
     const res = await apiFetch('/topology');
     if (!res) return;
@@ -4168,7 +4206,6 @@ async function loadTopology() {
     }
     document.getElementById('topoEmpty').classList.add('hidden');
  
-
     // Bind zoom once — renderTopology reuses this reference
     if (!topoZoom) {
         const svgSel = d3.select('#topoSvg');
@@ -4180,13 +4217,59 @@ async function loadTopology() {
         svgSel.call(topoZoom);
     }
  
-    renderTopology(topoData);
+    // CRITICAL: wait for the browser to paint the tab panel before reading
+    // dimensions. The tab just switched from display:none — layout is scheduled
+    // but not committed until after the next paint frame.
+    requestAnimationFrame(() => {
+        const wrap = document.getElementById('topoCanvasWrap');
+        const W = wrap.offsetWidth || 900;
+        const H = wrap.offsetHeight || 680;
+        renderTopology(topoData, W, H);
+    });
 }
 
-function renderTopology(data) {
-    const wrap = document.getElementById('topoCanvasWrap');
-    const svg  = d3.select('#topoSvg');
-    const g    = d3.select('#topoG');
+// Label display mode — what text to show inside each host node
+// Toggleable from the topology controls bar
+let topoLabelMode = 'auto'; // 'auto' | 'ip' | 'hostname' | 'mac'
+ 
+function getNodeLabel(d) {
+    switch (topoLabelMode) {
+        case 'hostname': return d.hostname || d.ip;
+        case 'mac':      return d.mac      || d.ip;
+        case 'ip':       return d.ip;
+        default:         return d.hostname || d.ip; // auto: prefer hostname
+    }
+}
+ 
+function setTopoLabelMode(mode) {
+    topoLabelMode = mode;
+    // Update button styles
+    document.querySelectorAll('.topo-label-btn').forEach(b => {
+        b.classList.remove('bg-gray-700', 'text-white');
+        b.classList.add('text-gray-400');
+    });
+    const active = document.getElementById('tlm-' + mode);
+    if (active) {
+        active.classList.add('bg-gray-700', 'text-white');
+        active.classList.remove('text-gray-400');
+    }
+    // Re-render with current data
+    if (topoData) {
+        requestAnimationFrame(() => {
+            const wrap = document.getElementById('topoCanvasWrap');
+            renderTopology(topoData, wrap.offsetWidth || 900, wrap.offsetHeight || 680);
+        });
+    }
+}
+ 
+function renderTopology(data, W, H) {
+    // W and H are passed in from loadTopology/setTopoLabelMode after a paint frame,
+    // guaranteeing real dimensions rather than 0 from a freshly-visible tab.
+    W = W || 900;
+    H = H || 680;
+ 
+    const svg = d3.select('#topoSvg');
+    const g   = d3.select('#topoG');
     g.selectAll('*').remove();
  
     // ── Filter ────────────────────────────────────────────────────────────
@@ -4201,17 +4284,12 @@ function renderTopology(data) {
     const nodeIds = new Set(nodes.map(n => n.id));
     const edges   = data.edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
  
-    // Clone for D3 mutation (D3 adds x/y/vx/vy to nodes in-place)
+    // Clone for D3 mutation
     const simNodes = nodes.map(n => ({ ...n }));
     const simEdges = edges.map(e => ({ ...e }));
  
     // ── Initial positions: cluster hosts near their subnet centroid ───────
-    // Read actual painted dimensions RIGHT NOW via getBoundingClientRect,
-    // not clientWidth which can be 0 before layout completes.
-    const rect = wrap.getBoundingClientRect();
-    const W = rect.width  || 900;
-    const H = rect.height || 680;
- 
+    // W and H are real values passed in after a paint frame — safe to use directly.
     const subnetCenters = {};
     const subnetsArr = [...relevantSubnets];
     const cols = Math.max(1, Math.ceil(Math.sqrt(subnetsArr.length)));
@@ -4225,16 +4303,13 @@ function renderTopology(data) {
  
     simNodes.forEach(n => {
         const center = subnetCenters[n.type === 'subnet' ? n.label : n.subnet];
-        if (!center) return;
+        if (!center) { n.x = W / 2; n.y = H / 2; return; }
         if (n.type === 'subnet') {
-            // Pin subnet labels at their cluster center initially,
-            // then release so they float to where the simulation settles
             n.x = center.x;
             n.y = center.y;
         } else {
-            // Scatter hosts around their subnet center
-            const angle = Math.random() * 2 * Math.PI;
-            const radius = 40 + Math.random() * 60;
+            const angle  = Math.random() * 2 * Math.PI;
+            const radius = 50 + Math.random() * 70;
             n.x = center.x + Math.cos(angle) * radius;
             n.y = center.y + Math.sin(angle) * radius;
         }
@@ -4246,15 +4321,15 @@ function renderTopology(data) {
     topoSimulation = d3.forceSimulation(simNodes)
         .force('link', d3.forceLink(simEdges)
             .id(d => d.id)
-            .distance(d => d.target.type === 'subnet' ? 95 : 65)
-            .strength(0.55))
+            .distance(d => d.target.type === 'subnet' ? 95 : 70)
+            .strength(0.5))
         .force('charge', d3.forceManyBody()
-            .strength(d => d.type === 'subnet' ? -320 : -200))
+            .strength(d => d.type === 'subnet' ? -350 : -220))
         .force('collide', d3.forceCollide()
-            .radius(d => d.type === 'subnet' ? 55 : 26)
-            .strength(0.8))
-        .force('center', d3.forceCenter(W / 2, H / 2).strength(0.05))
-        .alphaDecay(0.025);
+            .radius(d => d.type === 'subnet' ? 60 : 28)
+            .strength(0.9))
+        .force('center', d3.forceCenter(W / 2, H / 2).strength(0.08))
+        .alphaDecay(0.022);
  
     // ── Edges ─────────────────────────────────────────────────────────────
     const link = g.append('g').attr('class', 'topo-links')
@@ -4276,7 +4351,7 @@ function renderTopology(data) {
     subnetGroup.append('rect')
         .attr('width', 108).attr('height', 26)
         .attr('x', -54).attr('y', -13)
-        .attr('rx', 13)  // fully pill-shaped
+        .attr('rx', 13)
         .attr('fill', '#0d1117')
         .attr('stroke', '#2a3347')
         .attr('stroke-width', 1);
@@ -4310,7 +4385,7 @@ function renderTopology(data) {
             })
         );
  
-    // Agent host outer ring (dashed border)
+    // Agent host outer ring
     hostGroup.filter(d => d.is_agent)
         .append('circle')
         .attr('r', d => 22 + Math.min(d.port_count, 10))
@@ -4320,8 +4395,7 @@ function renderTopology(data) {
         .attr('stroke-dasharray', '3,2')
         .attr('opacity', 0.5);
  
-    // CRITICAL pulse ring — CSS animation via SVG animateTransform
-    // (avoids the recursive D3 transition memory leak)
+    // CRITICAL pulse ring
     hostGroup.filter(d => d.risk === 'CRITICAL')
         .append('circle')
         .attr('r', d => 14 + Math.min(d.port_count, 10))
@@ -4340,28 +4414,28 @@ function renderTopology(data) {
             })();
         });
  
-    // Main host circle
+    // Main host circle — risk colour ring, dark fill
     hostGroup.append('circle')
         .attr('class', 'topo-host-node')
         .attr('r', d => 14 + Math.min(d.port_count, 10))
-        .attr('fill', d => riskColor(d.risk))
-        .attr('fill-opacity', 0.12)
+        .attr('fill', '#111827')           // dark fill — always readable
+        .attr('fill-opacity', 0.92)
         .attr('stroke', d => riskColor(d.risk))
         .attr('stroke-width', 2)
         .attr('filter', d => ['CRITICAL', 'HIGH'].includes(d.risk) ? 'url(#glow)' : null);
  
-    // IP label inside node
+    // Node label — white text, always readable against dark fill
     hostGroup.append('text')
-        .text(d => d.ip)
+        .text(d => getNodeLabel(d))
         .attr('text-anchor', 'middle')
         .attr('dy', '0.35em')
-        .attr('fill', d => riskColor(d.risk))
+        .attr('fill', '#e5e7eb')           // white-ish — readable on dark fill
         .attr('font-family', 'IBM Plex Mono, monospace')
-        .attr('font-size', 9)
-        .attr('font-weight', '600')
+        .attr('font-size', 8)
+        .attr('font-weight', '500')
         .attr('pointer-events', 'none');
  
-    // Port count badge — top-right of node
+    // Port count badge — top-right
     hostGroup.filter(d => d.port_count > 0)
         .append('text')
         .text(d => d.port_count)
@@ -4374,44 +4448,30 @@ function renderTopology(data) {
         .attr('pointer-events', 'none');
  
     // ── Tick: update positions + clamp nodes inside canvas ────────────────
-    const PAD = 40; // minimum distance from SVG edge
+    const PAD = 40;
     topoSimulation.on('tick', () => {
-        // Clamp nodes so they never drift off-screen
         simNodes.forEach(n => {
             n.x = Math.max(PAD, Math.min(W - PAD, n.x || W / 2));
             n.y = Math.max(PAD, Math.min(H - PAD, n.y || H / 2));
         });
- 
         link
-            .attr('x1', d => d.source.x)
-            .attr('y1', d => d.source.y)
-            .attr('x2', d => d.target.x)
-            .attr('y2', d => d.target.y);
- 
+            .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+            .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
         subnetGroup.attr('transform', d => `translate(${d.x},${d.y})`);
-        hostGroup.attr('transform', d => `translate(${d.x},${d.y})`);
+        hostGroup.attr('transform',   d => `translate(${d.x},${d.y})`);
     });
  
-    // ── Zoom: bind on the svg element (done once in loadTopology) ─────────
-    // Just update the click-background handler — zoom is already bound
     svg.on('click', () => closeTopoPanel());
  
-    // ── Initial centering: wait for simulation to settle a bit ───────────
-    // Using two rAF calls ensures the browser has painted the SVG,
-    // giving us accurate dimensions for the centering transform.
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-        const svgEl  = document.getElementById('topoSvg');
-        const svgRect = svgEl.getBoundingClientRect();
-        const fw = svgRect.width  || W;
-        const fh = svgRect.height || H;
-        svg.transition().duration(400).call(
-            topoZoom.transform,
-            d3.zoomIdentity.translate(fw / 2, fh / 2).scale(0.82)
-        );
-    }));
+    // ── Apply initial centering transform ─────────────────────────────────
+    // W and H are already correct (passed in after paint frame), so apply
+    // the centering transform immediately — no further rAF needed.
+    svg.call(
+        topoZoom.transform,
+        d3.zoomIdentity.translate(W / 2, H / 2).scale(0.78)
+    );
 }
- 
- 
+
 function selectTopoHost(d) {
     topoSelectedNode = d.id;
  
@@ -4459,7 +4519,7 @@ function selectTopoHost(d) {
             <div class="flex gap-2 text-xs"><span class="text-gray-500 w-20">Subnet</span><span class="text-gray-400 font-mono">${d.subnet}</span></div>
             <div class="flex gap-2 text-xs"><span class="text-gray-500 w-20">Last scan</span><span class="text-gray-400">${lastScan}</span></div>
         </div>
- 
+
         <!-- Findings summary -->
         <div class="mb-4 grid grid-cols-3 gap-2">
             <div class="bg-gray-800 rounded-lg p-2 text-center">
@@ -4468,14 +4528,14 @@ function selectTopoHost(d) {
             </div>
             <div class="bg-gray-800 rounded-lg p-2 text-center">
                 <div class="text-sm font-bold text-purple-400">${d.nse_findings}</div>
-                <div class="text-xs text-gray-500">NSE</div>
+                <div class="text-xs text-gray-500">Vuln</div>
             </div>
             <div class="bg-gray-800 rounded-lg p-2 text-center">
                 <div class="text-sm font-bold text-orange-400">${d.nikto_findings}</div>
-                <div class="text-xs text-gray-500">Nikto</div>
+                <div class="text-xs text-gray-500">Web</div>
             </div>
         </div>
- 
+         
         <!-- Open ports -->
         <div class="mb-4">
             <p class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">Open Ports</p>
