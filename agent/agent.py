@@ -41,6 +41,138 @@ WEB_PORTS = {80, 443, 8080, 8443, 8000, 8888}
 # scanning it with Nikto is meaningless and reliably times out.
 NIKTO_SKIP_PORTS = {8000}
 
+# --- CUSTOM PROFILE: SCRIPT → PORT MAPPING ---
+#
+# Maps each NSE script name to the TCP ports it targets.
+# Used to auto-derive the -p flag when running a custom profile scan.
+# Scripts not listed here get no dedicated port added — they rely on Nmap's
+# default service discovery or host-level execution.
+#
+# UDP ports are handled separately in CUSTOM_SCRIPT_UDP_PORTS.
+
+CUSTOM_SCRIPT_TCP_PORTS: dict[str, list[int]] = {
+    # ── Auth & Access Control ──────────────────────────────────────────────
+    "ftp-anon":              [21],
+    "http-auth-finder":      [80, 443, 8080, 8443],
+    "ssh-auth-methods":      [22],
+    "snmp-brute":            [],          # UDP — handled separately
+    "smb-security-mode":     [445, 139],
+    "http-open-proxy":       [80, 443, 8080, 8443, 3128, 8118],
+    "irc-unrealircd-backdoor": [6667, 6697],
+
+    # ── Windows & SMB Enumeration ──────────────────────────────────────────
+    "smb-os-discovery":      [445, 139],
+    "smb-system-info":       [445, 139],
+    "smb-enum-shares":       [445, 139],
+    "smb-vuln-ms17-010":     [445],
+    "smb-vuln-ms10-054":     [445],
+    "smb-enum-users":        [445, 139],
+    "smb-enum-groups":       [445, 139],
+    "smb-enum-sessions":     [445, 139],
+    "smb-enum-domains":      [445, 139],
+
+    # ── SNMP & Network Device Enumeration ──────────────────────────────────
+    "snmp-info":             [],          # UDP
+    "snmp-sysdescr":         [],          # UDP
+    "snmp-interfaces":       [],          # UDP
+    "snmp-netstat":          [],          # UDP
+    "snmp-processes":        [],          # UDP
+    "snmp-win32-users":      [],          # UDP
+    "snmp-win32-shares":     [],          # UDP
+
+    # ── SSL/TLS Analysis ───────────────────────────────────────────────────
+    "ssl-cert":              [443, 8443, 993, 995, 465, 636, 3389],
+    "ssl-enum-ciphers":      [443, 8443, 993, 995, 465, 636, 3389],
+    "ssl-heartbleed":        [443, 8443],
+    "ssl-poodle":            [443, 8443],
+    "ssl-dh-params":         [443, 8443],
+    "ssl-ccs-injection":     [443, 8443],
+    "tls-ticketbleed":       [443, 8443],
+    "ssl-known-key":         [443, 8443],
+
+    # ── Network Service Discovery ──────────────────────────────────────────
+    "dns-zone-transfer":     [53],
+    "dns-recursion":         [53],
+    "nfs-ls":                [2049, 111],
+    "nfs-showmount":         [2049, 111],
+    "rdp-enum-encryption":   [3389],
+    "telnet-encryption":     [23],
+    "vnc-info":              [5900, 5901, 5902],
+    "finger":                [79],
+    "broadcast-dhcp-discover": [],       # broadcast — no specific target port
+    "ldap-rootdse":          [389, 636],
+}
+
+# Scripts that run over UDP — added as a separate protocol argument
+CUSTOM_SCRIPT_UDP_PORTS: dict[str, list[int]] = {
+    "snmp-brute":            [161],
+    "snmp-info":             [161],
+    "snmp-sysdescr":         [161],
+    "snmp-interfaces":       [161],
+    "snmp-netstat":          [161],
+    "snmp-processes":        [161],
+    "snmp-win32-users":      [161],
+    "snmp-win32-shares":     [161],
+}
+
+
+def derive_custom_ports(scripts: list[str]) -> tuple[list[int], list[int]]:
+    """
+    Given a list of selected NSE script names, returns two lists:
+      (tcp_ports, udp_ports)
+
+    TCP ports are deduplicated and sorted. Web ports (80, 443, etc.) are
+    included here because SSL/TLS scripts legitimately need them — unlike
+    standard NSE scans, custom profiles explicitly choose those scripts.
+    """
+    tcp: set[int] = set()
+    udp: set[int] = set()
+
+    for script in scripts:
+        for port in CUSTOM_SCRIPT_TCP_PORTS.get(script, []):
+            tcp.add(port)
+        for port in CUSTOM_SCRIPT_UDP_PORTS.get(script, []):
+            udp.add(port)
+
+    return sorted(tcp), sorted(udp)
+
+
+def build_custom_nmap_command(
+    target: str,
+    scripts: list[str],
+    tcp_ports: list[int],
+    udp_ports: list[int],
+) -> list[str]:
+    """
+    Constructs the nmap command for a custom profile scan.
+
+    Strategy:
+    - Always run -sV for service detection (scripts need it)
+    - If TCP ports derived: add -p <ports>
+    - If UDP ports derived: add -sU and merge UDP ports into the -p flag
+      using the T:<tcp>/U:<udp> syntax
+    - If no ports at all (broadcast/host-level scripts only): no -p flag,
+      rely on Nmap defaults
+    - --script takes the comma-joined list of selected scripts
+    """
+    script_str = ",".join(scripts)
+    cmd = ["nmap", "-sV", "--script", script_str]
+
+    if tcp_ports and udp_ports:
+        # Mixed TCP + UDP — use T:/U: prefix syntax
+        tcp_str = ",".join(str(p) for p in tcp_ports)
+        udp_str = ",".join(str(p) for p in udp_ports)
+        cmd += ["-sU", "-p", f"T:{tcp_str},U:{udp_str}"]
+    elif tcp_ports:
+        cmd += ["-p", ",".join(str(p) for p in tcp_ports)]
+    elif udp_ports:
+        udp_str = ",".join(str(p) for p in udp_ports)
+        cmd += ["-sU", "-p", f"U:{udp_str}"]
+    # else: no -p flag — Nmap will use its default port range
+
+    cmd += ["-oX", "-", target]
+    return cmd
+
 
 def register():
     payload = {
@@ -150,7 +282,7 @@ def parse_nmap_xml(xml_data: str) -> list:
                 mac = addr_el.get("addr")
 
         if ip is None:
-            continue  # skip hosts with no IP (shouldn't happen but be safe)
+            continue
 
         # ── Hostname ──────────────────────────────────────────────────────
         hostname = None
@@ -160,7 +292,7 @@ def parse_nmap_xml(xml_data: str) -> list:
                 name = hn.get("name", "").strip()
                 if name:
                     hostname = name
-                    break  # take the first non-empty one
+                    break
 
         # ── OS fingerprint ────────────────────────────────────────────────
         os_guess = None
@@ -234,12 +366,6 @@ def run_nmap(target: str, profile: str = "standard") -> list:
 # --- NSE ---
 
 def get_nse_flags(profile: str) -> list:
-    """
-    Maps scan profile to NSE script intensity.
-      light    -> --script safe      (non-intrusive, safe to run anywhere)
-      standard -> --script vuln      (vulnerability checks, low disruption risk)
-      full     -> --script vuln,exploit  (intrusive — may affect services)
-    """
     if profile == "light":
         return ["--script", "safe"]
     elif profile == "full":
@@ -249,10 +375,6 @@ def get_nse_flags(profile: str) -> list:
 
 
 def parse_nse_from_xml(xml_data: str) -> list:
-    """
-    Parses Nmap XML output and extracts NSE script results from <script> elements.
-    Returns a list of findings, each tied to the host/port they came from.
-    """
     root = ET.fromstring(xml_data)
     findings = []
 
@@ -268,10 +390,7 @@ def parse_nse_from_xml(xml_data: str) -> list:
         if addr is None:
             continue
 
-        # ── Host-level scripts (e.g. smb-vuln-*) ─────────────────────────
-        # Bug fix: original code referenced `portid` and `service` here, but
-        # those variables are only defined in the port-level loop below.
-        # Host-level scripts have no associated port — use None explicitly.
+        # ── Host-level scripts ────────────────────────────────────────────
         hostscript = host.find("hostscript")
         if hostscript is not None:
             for script in hostscript.findall("script"):
@@ -316,13 +435,6 @@ def parse_nse_from_xml(xml_data: str) -> list:
 
 
 def resolve_nse_ports(ports_str: str | None, profile: str) -> list[str]:
-    """
-    Resolves the -p flag list for an NSE scan.
-
-    - If ports_str is provided, parse and exclude web ports.
-    - If nothing remains after exclusion, return an empty list (caller handles warning).
-    - If ports_str is blank, return [] meaning "use Nmap profile defaults" (no -p flag).
-    """
     if not ports_str:
         return []
 
@@ -337,17 +449,11 @@ def resolve_nse_ports(ports_str: str | None, profile: str) -> list[str]:
 
 
 def run_nse(target: str, profile: str = "standard", ports_str: str | None = None) -> dict:
-    """
-    Runs an NSE scan against target.
-    Web ports are excluded — Nikto owns that surface.
-    Returns a dict with 'findings' (list) and optionally 'warning'.
-    """
     logger.info(f"Running NSE ({profile}) on {target}")
 
     nse_flags = get_nse_flags(profile)
     port_list = resolve_nse_ports(ports_str, profile)
 
-    # If the user specified ports but all were web ports, warn and bail out
     if ports_str and not port_list:
         warning = (
             "All specified ports are web ports (80, 443, 8080, 8443, 8000, 8888). "
@@ -379,6 +485,52 @@ def run_nse(target: str, profile: str = "standard", ports_str: str | None = None
     logger.info(f"NSE complete — {len(findings)} finding(s) on {target}")
 
     return {"findings": findings}
+
+
+def run_custom_nse(target: str, scripts: list[str]) -> dict:
+    """
+    Runs a custom NSE scan using only the explicitly selected scripts.
+    Port targeting is derived automatically from the script list.
+
+    Unlike standard NSE, custom scans:
+    - Do NOT blanket-exclude web ports (SSL scripts legitimately need 443)
+    - Use a derived port list rather than Nmap's default range
+    - Run exactly the scripts the user chose, nothing more
+    """
+    if not scripts:
+        return {"findings": [], "warning": "No scripts selected for custom scan."}
+
+    logger.info(f"Running custom NSE on {target} — {len(scripts)} script(s): {', '.join(scripts)}")
+
+    tcp_ports, udp_ports = derive_custom_ports(scripts)
+    cmd = build_custom_nmap_command(target, scripts, tcp_ports, udp_ports)
+
+    logger.info(f"Custom NSE command: {' '.join(cmd)}")
+    if tcp_ports:
+        logger.info(f"  TCP ports targeted: {tcp_ports}")
+    if udp_ports:
+        logger.info(f"  UDP ports targeted: {udp_ports}")
+    if not tcp_ports and not udp_ports:
+        logger.info("  No ports derived — using Nmap default range")
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise Exception(f"Custom NSE scan failed: {result.stderr}")
+
+    findings = parse_nse_from_xml(result.stdout)
+    logger.info(f"Custom NSE complete — {len(findings)} finding(s) on {target}")
+
+    return {
+        "findings": findings,
+        "scripts_used": scripts,
+        "tcp_ports": tcp_ports,
+        "udp_ports": udp_ports,
+    }
 
 
 # --- NIKTO ---
@@ -439,8 +591,9 @@ def execute_job(job: dict, api_key: str):
     target = job.get("target")
     job_id = job.get("id")
     profile = job.get("profile", "standard")
-    port = job.get("port")       # single port (nikto_scan)
-    ports = job.get("ports")     # comma-separated (nse_scan / multi-port nikto)
+    port = job.get("port")            # single port (nikto_scan)
+    ports = job.get("ports")          # comma-separated (nse_scan / multi-port nikto)
+    custom_scripts = job.get("custom_scripts")  # list of script names (custom profile)
 
     try:
         logger.info(f"Job {job_id} starting — type={job_type} target={target} profile={profile}")
@@ -466,7 +619,7 @@ def execute_job(job: dict, api_key: str):
                         logger.info(f"Port {wp} in skip list — omitting from Nikto")
                         continue
                     try:
-                        nikto_results[str(wp)] = run_nikto(target, wp, "light")
+                        nikto_results[str(wp)] = run_nikto(target, wp, profile)
                     except Exception as e:
                         nikto_results[str(wp)] = {"error": str(e)}
                 if nikto_results:
@@ -481,8 +634,19 @@ def execute_job(job: dict, api_key: str):
             output = {"nikto": {str(scan_port): nikto_result}}
 
         elif job_type == "nse_scan":
-            nse_result = run_nse(target, profile, ports)
-            output = {"nse": nse_result}
+            if profile == "custom":
+                # Custom profile — use explicitly selected scripts
+                scripts = custom_scripts if custom_scripts else []
+                if not scripts:
+                    logger.warning(f"Job {job_id} is custom profile but has no scripts — falling back to standard vuln scan")
+                    nse_result = run_nse(target, "standard", ports)
+                else:
+                    nse_result = run_custom_nse(target, scripts)
+                output = {"nse": nse_result}
+            else:
+                # Standard / light / full profile
+                nse_result = run_nse(target, profile, ports)
+                output = {"nse": nse_result}
 
         else:
             output = {"error": f"Unknown job type: {job_type}"}

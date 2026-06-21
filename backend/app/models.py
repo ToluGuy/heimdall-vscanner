@@ -41,8 +41,9 @@ class Job(Base):
     max_retries = Column(Integer, default=3)
     mode = Column(String, default="remote")
     profile = Column(String, default="standard")
-    port = Column(Integer, nullable=True)       # single port — used by nikto_scan
-    ports = Column(String, nullable=True)       # comma-separated — used by nse_scan and multi-port nikto
+    port = Column(Integer, nullable=True)        # single port — used by nikto_scan
+    ports = Column(String, nullable=True)        # comma-separated — used by nse_scan and multi-port nikto
+    custom_scripts = Column(String, nullable=True)  # comma-separated NSE script names — used when profile='custom'
     cleared = Column(Boolean, default=False)
 
 
@@ -106,6 +107,6 @@ class Schedule(Base):
 
 class Setting(Base):
     __tablename__ = "settings"
- 
+
     key   = Column(String, primary_key=True, index=True)
     value = Column(String, nullable=False)

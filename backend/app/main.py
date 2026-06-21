@@ -572,18 +572,29 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
             )
 
     # validate ports for nse jobs — warn if all are web ports, but still create the job
-    # (the actual filtering + warning is returned in the scan result by the agent/scanner)
+    # (the actual filtering + warning is returned in the scan result by the agent/scanner) 
     nse_ports_warning = None
-    if job.type == "nse_scan" and job.ports:
+    if job.type == "nse_scan" and job.ports and job.profile != "custom":
         requested = [int(p.strip()) for p in job.ports.split(",") if p.strip().isdigit()]
         non_web = [p for p in requested if p not in WEB_PORTS]
         if requested and not non_web:
-            # All ports are web ports — surface this immediately so the user knows
-            # before the job even runs (the agent will also warn in its result output)
             nse_ports_warning = (
                 f"Warning: all specified ports {requested} are web ports. "
                 "NSE will have nothing to scan on those. Use a Nikto job for web surface testing."
             )
+
+    # Custom profile validation — must have at least one script selected
+    if job.profile == "custom" and job.type == "nse_scan":
+        if not job.custom_scripts:
+            raise HTTPException(
+                status_code=400,
+                detail="Custom profile requires at least one script to be selected."
+            )
+
+    # Serialise custom_scripts list to comma-separated string for DB storage
+    custom_scripts_str = None
+    if job.custom_scripts:
+        custom_scripts_str = ",".join(s.strip() for s in job.custom_scripts if s.strip())
 
     new_job = Job(
         type=job.type,
@@ -595,6 +606,7 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
         profile=job.profile if job.profile else "standard",
         port=job.port if job.port else None,
         ports=job.ports if job.ports else None,
+        custom_scripts=custom_scripts_str,
     )
     db.add(new_job)
     db.commit()
@@ -761,6 +773,11 @@ def get_next_job(
     job.started_at = datetime.utcnow()
     db.commit()
 
+    # Deserialise custom_scripts from comma-separated DB string back to a list
+    custom_scripts_list = None
+    if job.custom_scripts:
+        custom_scripts_list = [s.strip() for s in job.custom_scripts.split(",") if s.strip()]
+
     return {
         "id": job.id,
         "type": job.type,
@@ -768,9 +785,9 @@ def get_next_job(
         "mode": job.mode,
         "profile": job.profile,
         "port": job.port,
-        "ports": job.ports,     # <-- now included so agents/scanner can use it
+        "ports": job.ports,
+        "custom_scripts": custom_scripts_list,
     }
-
 
 @app.post("/agents/heartbeat")
 def heartbeat(
@@ -1258,7 +1275,7 @@ def generate_report(
         if rows:
             nmap_html = f"""
             <section class="mb-8">
-                <h2 class="section-title">Port Scan Results</h2>
+                <h2 class="section-title">Open Port Scan Results</h2>
                 <table class="w-full border-collapse">
                     <thead>
                         <tr class="border-b-2 border-gray-200 text-left text-xs uppercase tracking-wider text-gray-500">
@@ -1274,7 +1291,7 @@ def generate_report(
         else:
             nmap_html = """
             <section class="mb-8">
-                <h2 class="section-title">Port Scan Results</h2>
+                <h2 class="section-title">Open Port Scan Results</h2>
                 <p class="text-sm text-gray-500">No open ports found.</p>
             </section>"""
 
@@ -2017,17 +2034,85 @@ def dashboard():
                 </div>
             </div>
         </div>
-
+ 
         <!-- Sweep Confirm Dialog (ping results → assign jobs?) -->
         <div id="sweepConfirmDialog" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 hidden">
-            <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md">
+            <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-lg max-h-screen overflow-y-auto">
                 <div class="flex items-center gap-3 mb-3">
                     <span class="text-cyan-400 text-lg">⌖</span>
                     <h3 class="text-sm font-semibold text-white">Assign Scan Jobs?</h3>
                 </div>
                 <p id="sweepConfirmMsg" class="text-xs text-gray-400 mb-2"></p>
-                <div id="sweepHostList" class="max-h-40 overflow-y-auto mb-4 space-y-1"></div>
-                <p class="text-xs text-gray-500 mb-5">Confirming will create an Nmap scan job for each host above.</p>
+                <div id="sweepHostList" class="max-h-32 overflow-y-auto mb-4 space-y-1"></div>
+
+                <!-- Job type + profile selectors -->
+                <div class="bg-gray-800 border border-gray-700 rounded-lg p-4 mb-4 space-y-3">
+                    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Scan Settings</p>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500">Scan Type</label>
+                            <select id="sweepJobType" onchange="onSweepJobTypeChange()"
+                                class="bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-cyan-500">
+                                <option value="nmap_scan">Open Port Scan</option>
+                                <option value="nse_scan">Vulnerability Scan</option>
+                                <option value="nikto_scan">Web Scan</option>
+                            </select>
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500">Profile</label>
+                            <select id="sweepProfile" onchange="onSweepProfileChange()"
+                                class="bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-cyan-500">
+                                <option value="standard">Standard</option>
+                                <option value="light">Light</option>
+                                <option value="full">Full</option>
+                                <option value="custom">Custom</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Sweep mode + priority -->
+                    <div class="grid grid-cols-2 gap-3">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500">Mode</label>
+                            <select id="sweepJobMode"
+                                class="bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-cyan-500">
+                                <option value="remote">Remote</option>
+                                <option value="agent">Agent</option>
+                            </select>
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500">Priority</label>
+                            <select id="sweepJobPriority"
+                                class="bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-cyan-500">
+                                <option value="medium">Medium</option>
+                                <option value="high">High</option>
+                                <option value="low">Low</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Intrusive warning — shown for full profile -->
+                    <div id="sweepFullWarning" class="hidden flex items-start gap-2 bg-red-950 border border-red-800 rounded-lg px-3 py-2">
+                        <span class="text-red-400 text-xs mt-0.5 flex-shrink-0">⚠</span>
+                        <p class="text-xs text-red-300">Full profile with Vulnerability Scan uses <span class="font-mono">--script vuln,exploit</span> — intrusive scripts that may disrupt services.</p>
+                    </div>
+                </div>
+
+                <!-- Custom profile capability cards (compact) — shown when type=nse_scan + profile=custom -->
+                <div id="sweepCustomPanel" class="hidden mb-4">
+                    <div class="flex items-center justify-between mb-2">
+                        <p class="text-xs font-semibold text-green-400 uppercase tracking-wider">Select Capabilities</p>
+                        <div class="flex items-center gap-3">
+                            <button onclick="sweepSelectAll()" class="text-xs text-gray-500 hover:text-gray-300 transition">Select all</button>
+                            <button onclick="sweepClearAll()" class="text-xs text-gray-500 hover:text-gray-300 transition">Clear all</button>
+                            <span id="sweepScriptCount" class="text-xs text-gray-600">0 scripts selected</span>
+                        </div>
+                    </div>
+                    <div id="sweepCapabilityCards" class="space-y-1.5"></div>
+                    <p id="sweepCustomWarning" class="hidden mt-2 text-xs text-red-400">Select at least one capability before assigning jobs.</p>
+                </div>
+
+                <p id="sweepConfirmNote" class="text-xs text-gray-500 mb-5">Confirming will create a Open Port Scan job for each host above.</p>
                 <div class="flex gap-3 justify-end">
                     <button onclick="cancelSweepConfirm()" class="text-xs px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 transition">Cancel</button>
                     <button onclick="confirmSweep()" class="text-xs px-4 py-2 rounded-lg bg-cyan-700 hover:bg-cyan-600 text-white font-semibold transition">Assign Jobs</button>
@@ -2292,9 +2377,9 @@ def dashboard():
                         <label class="text-xs text-gray-400">Scan Type</label>
                         <select id="job_type" onchange="onJobTypeChange()"
                             class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
-                            <option value="nmap_scan">Port Scan</option>
+                            <option value="nmap_scan">Open Port Scan</option>
                             <option value="nikto_scan">Web Scan</option>
-                            <option value="nse_scan">Vuln Scan</option>
+                            <option value="nse_scan">Vulnerability Scan</option>
                         </select>
                     </div>
                     <div class="flex flex-col gap-1" id="portField" style="display:none">
@@ -2316,10 +2401,11 @@ def dashboard():
                     </div>
                     <div class="flex flex-col gap-1">
                         <label class="text-xs text-gray-400">Profile</label>
-                        <select id="profile" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                        <select id="profile" onchange="onProfileChange()" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
                             <option value="standard">Standard</option>
                             <option value="light">Light</option>
                             <option value="full">Full</option>
+                            <option value="custom">Custom</option>
                         </select>
                     </div>
                     <div class="flex flex-col gap-1">
@@ -2338,6 +2424,19 @@ def dashboard():
                         <p class="text-xs text-red-300"><strong class="text-red-200">Full profile with Vulnerability Scan</strong> uses <span class="font-mono">--script vuln,exploit</span> — intrusive scripts that may disrupt services.</p>
                     </div>
                     <button onclick="dismissExploitBanner()" class="text-red-500 hover:text-red-300 transition text-sm leading-none flex-shrink-0">✕</button>
+                </div>
+                <!-- Custom Profile — Capability Cards -->
+                <div id="customProfilePanel" class="hidden mt-5">
+                    <div class="flex items-center justify-between mb-3">
+                        <p class="text-xs font-semibold text-green-400 uppercase tracking-wider">Select Capabilities</p>
+                        <div class="flex items-center gap-3">
+                            <button onclick="selectAllCapabilities()" class="text-xs text-gray-500 hover:text-gray-300 transition">Select all</button>
+                            <button onclick="clearAllCapabilities()" class="text-xs text-gray-500 hover:text-gray-300 transition">Clear all</button>
+                            <span id="customScriptCount" class="text-xs text-gray-600">0 scripts selected</span>
+                        </div>
+                    </div>
+                    <div id="capabilityCards" class="space-y-2"></div>
+                    <p id="customProfileWarning" class="hidden mt-3 text-xs text-red-400">Select at least one capability before creating the job.</p>
                 </div>
             </div>
 
@@ -2492,9 +2591,9 @@ def dashboard():
                     <div class="flex flex-col gap-1">
                         <label class="text-xs text-gray-400">Scan Type</label>
                         <select id="sched_type" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
-                            <option value="nmap_scan">Port Scan</option>
+                            <option value="nmap_scan">Open Port Scan</option>
                             <option value="nikto_scan">Web Scan</option>
-                            <option value="nse_scan">Vuln Scan</option>
+                            <option value="nse_scan">Vulnerability Scan</option>
                         </select>
                     </div>
                     <div class="flex flex-col gap-1">
@@ -2658,7 +2757,7 @@ def dashboard():
                         <div class="text-center">
                             <div class="text-4xl mb-4 opacity-20">⌖</div>
                             <p class="text-gray-500 text-sm font-medium mb-1">No hosts mapped yet</p>
-                            <p class="text-gray-700 text-xs mb-4">Run a discovery sweep or a port scan to populate the map.</p>
+                            <p class="text-gray-700 text-xs mb-4">Run a discovery sweep or a open port scan to populate the map.</p>
                             <button onclick="switchTab('discovery')"
                                 class="text-xs px-4 py-2 rounded-lg bg-green-900 hover:bg-green-800 text-green-300 border border-green-800 transition font-medium">
                                 → Go to Discovery
@@ -2765,7 +2864,7 @@ def dashboard():
         
         // Friendly display names for scan types
         const SCAN_TYPE_LABELS = {
-            nmap_scan:   'Port Scan',
+            nmap_scan:   'Open Port Scan',
             nikto_scan:  'Web Scan',
             nse_scan:    'Vulnerability Scan',
         };
@@ -3015,7 +3114,12 @@ def dashboard():
             const type = document.getElementById("job_type").value;
             document.getElementById("portField").style.display = type === "nikto_scan" ? "flex" : "none";
             document.getElementById("portsField").style.display = type === "nse_scan" ? "flex" : "none";
+            // Hide ports field when custom profile is active (port derivation is automatic)
+            if (type === 'nse_scan' && document.getElementById('profile').value === 'custom') {
+                document.getElementById("portsField").style.display = "none";
+            }
             updateNseExploitBanner();
+            onProfileChange();
         }
         function dismissExploitBanner() {
             exploitBannerDismissed = true;
@@ -3031,7 +3135,483 @@ def dashboard():
                 document.getElementById('nseExploitBanner').classList.remove('hidden');
             }
         }
+        
+        // ── CUSTOM PROFILE CAPABILITY DATA ────────────────────────────────────
+        const CUSTOM_CAPABILITIES = [
+            {
+                id: "auth",
+                label: "Authentication & Access Control",
+                tooltip: "Checks for anonymous access, weak auth methods, and insecure credential handling across common services.",
+                scripts: [
+                    { id: "ftp-anon",               label: "FTP Anonymous",          desc: "Checks if the FTP server allows anonymous login.",                                     default: true  },
+                    { id: "http-auth-finder",        label: "HTTP Auth Finder",       desc: "Discovers HTTP authentication methods in use (Basic, Digest, NTLM, etc.).",           default: true  },
+                    { id: "ssh-auth-methods",        label: "SSH Auth Methods",       desc: "Lists authentication methods accepted by the SSH server.",                             default: true  },
+                    { id: "snmp-brute",              label: "SNMP Brute",             desc: "Attempts to guess SNMP community strings using default values only.",                  default: true  },
+                    { id: "smb-security-mode",       label: "SMB Security Mode",      desc: "Reports whether SMB message signing and plaintext auth are in use.",                   default: true  },
+                    { id: "http-open-proxy",         label: "HTTP Open Proxy",        desc: "Tests whether the HTTP server is acting as an open proxy.",                            default: false },
+                    { id: "irc-unrealircd-backdoor", label: "UnrealIRCd Backdoor",    desc: "Checks for the UnrealIRCd 3.2.8.1 backdoor (CVE-2010-2075).",                        default: false },
+                ],
+            },
+            {
+                id: "smb",
+                label: "Windows & SMB Enumeration",
+                tooltip: "Enumerates Windows host information, SMB shares, and checks for critical SMB vulnerabilities including EternalBlue.",
+                scripts: [
+                    { id: "smb-os-discovery",   label: "OS Discovery",       desc: "Attempts to determine the OS, computer name, domain, and workgroup via SMB.",    default: true  },
+                    { id: "smb-system-info",    label: "System Info",        desc: "Retrieves system information from the SMB server (OS version, build, etc.).",   default: true  },
+                    { id: "smb-enum-shares",    label: "Enum Shares",        desc: "Enumerates SMB shares and their access permissions.",                            default: true  },
+                    { id: "smb-security-mode",  label: "Security Mode",      desc: "Reports whether SMB signing is enabled and if plaintext passwords are used.",   default: true  },
+                    { id: "smb-vuln-ms17-010",  label: "EternalBlue",        desc: "Checks for MS17-010 (EternalBlue) — the vulnerability exploited by WannaCry.", default: true  },
+                    { id: "smb-vuln-ms10-054",  label: "MS10-054",           desc: "Checks for MS10-054, a remote memory corruption vulnerability in SMBv1.",       default: true  },
+                    { id: "smb-enum-users",     label: "Enum Users",         desc: "Enumerates local user accounts via SMB (may require credentials).",             default: false },
+                    { id: "smb-enum-groups",    label: "Enum Groups",        desc: "Enumerates local groups via SMB (may require credentials).",                    default: false },
+                    { id: "smb-enum-sessions",  label: "Enum Sessions",      desc: "Lists active SMB sessions on the server.",                                      default: false },
+                    { id: "smb-enum-domains",   label: "Enum Domains",       desc: "Enumerates domains visible through SMB.",                                       default: false },
+                ],
+            },
+            {
+                id: "snmp",
+                label: "SNMP & Network Device Enumeration",
+                tooltip: "Queries SNMP-enabled devices for system information, interface details, and running processes.",
+                scripts: [
+                    { id: "snmp-info",          label: "SNMP Info",          desc: "Retrieves basic system info from SNMP (sysDescr, sysUpTime, etc.).",            default: true  },
+                    { id: "snmp-sysdescr",      label: "System Description", desc: "Fetches the SNMP sysDescr OID — often reveals OS and firmware version.",       default: true  },
+                    { id: "snmp-interfaces",    label: "Interfaces",         desc: "Lists network interfaces and their IP addresses via SNMP.",                     default: true  },
+                    { id: "snmp-netstat",       label: "Netstat",            desc: "Retrieves the TCP/UDP connection table via SNMP.",                              default: false },
+                    { id: "snmp-processes",     label: "Processes",          desc: "Lists running processes on the target via SNMP.",                               default: false },
+                    { id: "snmp-win32-users",   label: "Win32 Users",        desc: "Enumerates Windows local user accounts via SNMP (Windows targets only).",      default: false },
+                    { id: "snmp-win32-shares",  label: "Win32 Shares",       desc: "Lists Windows file shares via SNMP (Windows targets only).",                   default: false },
+                ],
+            },
+            {
+                id: "ssl",
+                label: "SSL/TLS Analysis",
+                tooltip: "Analyses SSL/TLS configuration for weak ciphers, expired certificates, and known protocol vulnerabilities.",
+                scripts: [
+                    { id: "ssl-cert",           label: "Certificate",        desc: "Retrieves and displays the server's SSL certificate details.",                  default: true  },
+                    { id: "ssl-enum-ciphers",   label: "Cipher Suites",      desc: "Enumerates supported SSL/TLS cipher suites and grades their strength.",        default: true  },
+                    { id: "ssl-heartbleed",     label: "Heartbleed",         desc: "Tests for the OpenSSL Heartbleed vulnerability (CVE-2014-0160).",              default: true  },
+                    { id: "ssl-poodle",         label: "POODLE",             desc: "Checks for the POODLE vulnerability in SSLv3 (CVE-2014-3566).",               default: true  },
+                    { id: "ssl-dh-params",      label: "DH Parameters",      desc: "Checks Diffie-Hellman parameters for weaknesses (Logjam vulnerability).",      default: true  },
+                    { id: "ssl-ccs-injection",  label: "CCS Injection",      desc: "Tests for the OpenSSL CCS Injection vulnerability (CVE-2014-0224).",          default: true  },
+                    { id: "tls-ticketbleed",    label: "Ticketbleed",        desc: "Checks for the Ticketbleed vulnerability in F5 TLS session tickets.",          default: false },
+                    { id: "ssl-known-key",      label: "Known Key",          desc: "Checks whether the SSL key is in a known-compromised key database.",           default: false },
+                ],
+            },
+            {
+                id: "discovery",
+                label: "Network Service Discovery",
+                tooltip: "Probes common network services for misconfigurations — DNS zone transfers, NFS exports, RDP settings, and more.",
+                scripts: [
+                    { id: "dns-zone-transfer",       label: "DNS Zone Transfer",  desc: "Attempts a DNS zone transfer — reveals all DNS records if misconfigured.",    default: true  },
+                    { id: "dns-recursion",           label: "DNS Recursion",      desc: "Checks if the DNS server allows recursive queries (open resolver).",          default: true  },
+                    { id: "nfs-ls",                  label: "NFS List",           desc: "Lists files on NFS exports accessible without authentication.",               default: true  },
+                    { id: "nfs-showmount",           label: "NFS Showmount",      desc: "Shows the NFS server's export list.",                                        default: true  },
+                    { id: "rdp-enum-encryption",     label: "RDP Encryption",     desc: "Enumerates RDP security settings and supported encryption protocols.",        default: true  },
+                    { id: "telnet-encryption",       label: "Telnet Encryption",  desc: "Checks whether Telnet is offering encryption (rare — usually it isn't).",    default: true  },
+                    { id: "vnc-info",                label: "VNC Info",           desc: "Retrieves VNC server information including protocol version and auth type.",  default: true  },
+                    { id: "finger",                  label: "Finger",             desc: "Queries the finger service to enumerate user accounts.",                      default: false },
+                    { id: "broadcast-dhcp-discover", label: "DHCP Discover",      desc: "Sends a broadcast DHCP discover packet to identify DHCP servers.",           default: false },
+                    { id: "ldap-rootdse",            label: "LDAP Root DSE",      desc: "Retrieves the LDAP root DSE entry — reveals domain and server info.",        default: false },
+                ],
+            },
+        ];
 
+        // ── CUSTOM PROFILE STATE ───────────────────────────────────────────────
+        // capabilityState[capId][scriptId] = true/false
+        // Tracks individual script toggles independently of the top-level toggle.
+        let capabilityState = {};
+
+        function initCapabilityState() {
+            capabilityState = {};
+            CUSTOM_CAPABILITIES.forEach(cap => {
+                capabilityState[cap.id] = {};
+                cap.scripts.forEach(s => {
+                    capabilityState[cap.id][s.id] = false;
+                });
+            });
+        }
+
+        function isCapabilityOn(capId) {
+            // A capability is "on" if at least one script in it is checked
+            return Object.values(capabilityState[capId] || {}).some(v => v);
+        }
+
+        function areAllScriptsOn(capId) {
+            return Object.values(capabilityState[capId] || {}).every(v => v);
+        }
+
+        function getSelectedScripts() {
+            const selected = [];
+            CUSTOM_CAPABILITIES.forEach(cap => {
+                cap.scripts.forEach(s => {
+                    if (capabilityState[cap.id] && capabilityState[cap.id][s.id]) {
+                        selected.push(s.id);
+                    }
+                });
+            });
+            return selected;
+        }
+
+        function updateScriptCount() {
+            const n = getSelectedScripts().length;
+            const el = document.getElementById('customScriptCount');
+            if (el) el.textContent = n === 1 ? '1 script selected' : `${n} scripts selected`;
+        }
+
+        // ── CAPABILITY CARD RENDERING ──────────────────────────────────────────
+
+        function renderCapabilityCards() {
+            const container = document.getElementById('capabilityCards');
+            if (!container) return;
+
+            container.innerHTML = CUSTOM_CAPABILITIES.map(cap => {
+                const capOn = isCapabilityOn(cap.id);
+                const allOn = areAllScriptsOn(cap.id);
+
+                // Top-level toggle state
+                const toggleBg    = allOn ? 'bg-green-600 border-green-500' : (capOn ? 'bg-green-900 border-green-700' : 'bg-gray-700 border-gray-600');
+                const toggleKnob  = (allOn || capOn) ? 'translate-x-5' : 'translate-x-0';
+                const knobColor   = (allOn || capOn) ? 'bg-white' : 'bg-gray-400';
+
+                // Script rows (collapsed by default)
+                const scriptRows = cap.scripts.map(s => {
+                    const checked = capabilityState[cap.id][s.id];
+                    const defaultTag = s.default
+                        ? ''
+                        : '<span class="ml-1.5 text-xs px-1.5 py-0.5 rounded bg-gray-800 text-gray-600 border border-gray-700 font-mono leading-none">sensitive</span>';
+                    return `
+                    <div class="flex items-center justify-between py-1.5 border-b border-gray-800 last:border-0 group">
+                        <div class="flex items-center gap-2 min-w-0">
+                            <span class="text-xs text-gray-300 font-mono truncate" title="${escHtmlAttr(s.desc)}">${s.label}</span>
+                            ${defaultTag}
+                            <span class="hidden group-hover:inline text-xs text-gray-600 ml-1 truncate">${escHtmlAttr(s.desc)}</span>
+                        </div>
+                        <button
+                            onclick="toggleScript('${cap.id}', '${s.id}')"
+                            id="script-toggle-${cap.id}-${s.id}"
+                            class="flex-shrink-0 ml-3 relative w-8 h-4 rounded-full transition-colors duration-150 focus:outline-none ${checked ? 'bg-green-600 border border-green-500' : 'bg-gray-700 border border-gray-600'}"
+                            title="${escHtmlAttr(s.desc)}">
+                            <span class="absolute top-0.5 left-0.5 w-3 h-3 rounded-full transition-transform duration-150 ${checked ? 'bg-white translate-x-4' : 'bg-gray-400 translate-x-0'}"></span>
+                        </button>
+                    </div>`;
+                }).join('');
+
+                return `
+                <div class="capability-card bg-gray-800 border border-gray-700 rounded-xl overflow-hidden" id="cap-card-${cap.id}">
+
+                    <!-- Card header: top-level toggle + label + expand -->
+                    <div class="flex items-center gap-3 px-4 py-3">
+                        <!-- Top-level capability toggle -->
+                        <button
+                            onclick="toggleCapability('${cap.id}')"
+                            id="cap-toggle-${cap.id}"
+                            class="flex-shrink-0 relative w-10 h-5 rounded-full transition-colors duration-150 focus:outline-none border ${toggleBg}"
+                            title="${escHtmlAttr(cap.tooltip)}">
+                            <span class="absolute top-0.5 left-0.5 w-4 h-4 rounded-full transition-transform duration-150 ${knobColor} ${toggleKnob}"></span>
+                        </button>
+
+                        <!-- Label + tooltip -->
+                        <div class="flex-1 min-w-0 cursor-pointer" onclick="expandCapability('${cap.id}')" title="${escHtmlAttr(cap.tooltip)}">
+                            <span class="text-sm font-medium text-gray-200">${cap.label}</span>
+                            <span class="ml-2 text-xs text-gray-600">${Object.values(capabilityState[cap.id]).filter(v => v).length}/${cap.scripts.length} scripts</span>
+                        </div>
+
+                        <!-- Expand/collapse chevron -->
+                        <button onclick="expandCapability('${cap.id}')" class="text-gray-600 hover:text-gray-400 transition text-xs flex-shrink-0 px-1" id="cap-chevron-${cap.id}">▼</button>
+                    </div>
+
+                    <!-- Collapsible script list -->
+                    <div id="cap-scripts-${cap.id}" class="hidden px-4 pb-3 border-t border-gray-700 pt-3">
+                        ${scriptRows}
+                    </div>
+                </div>`;
+            }).join('');
+
+            updateScriptCount();
+        }
+
+        function escHtmlAttr(s) {
+            return String(s || '').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        // ── CAPABILITY INTERACTIONS ────────────────────────────────────────────
+
+        function toggleCapability(capId) {
+            const cap = CUSTOM_CAPABILITIES.find(c => c.id === capId);
+            if (!cap) return;
+
+            const allOn = areAllScriptsOn(capId);
+
+            if (allOn) {
+                // All on → turn all off
+                cap.scripts.forEach(s => { capabilityState[capId][s.id] = false; });
+            } else {
+                // Some or none on → turn all defaults on
+                // (if already had some on, turn ALL on; if fresh toggle, use defaults)
+                const anyOn = isCapabilityOn(capId);
+                cap.scripts.forEach(s => {
+                    capabilityState[capId][s.id] = anyOn ? true : s.default;
+                });
+            }
+
+            renderCapabilityCards();
+        }
+
+        function toggleScript(capId, scriptId) {
+            if (capabilityState[capId] === undefined) return;
+            capabilityState[capId][scriptId] = !capabilityState[capId][scriptId];
+            renderCapabilityCards();
+            // Keep the script list open after toggling
+            const scriptsEl = document.getElementById(`cap-scripts-${capId}`);
+            if (scriptsEl) scriptsEl.classList.remove('hidden');
+            const chevron = document.getElementById(`cap-chevron-${capId}`);
+            if (chevron) chevron.textContent = '▲';
+        }
+
+        function expandCapability(capId) {
+            const scriptsEl = document.getElementById(`cap-scripts-${capId}`);
+            const chevron   = document.getElementById(`cap-chevron-${capId}`);
+            if (!scriptsEl) return;
+            const isHidden = scriptsEl.classList.contains('hidden');
+            scriptsEl.classList.toggle('hidden', !isHidden);
+            if (chevron) chevron.textContent = isHidden ? '▲' : '▼';
+        }
+
+        function selectAllCapabilities() {
+            CUSTOM_CAPABILITIES.forEach(cap => {
+                cap.scripts.forEach(s => { capabilityState[cap.id][s.id] = true; });
+            });
+            renderCapabilityCards();
+        }
+
+        function clearAllCapabilities() {
+            CUSTOM_CAPABILITIES.forEach(cap => {
+                cap.scripts.forEach(s => { capabilityState[cap.id][s.id] = false; });
+            });
+            renderCapabilityCards();
+        }
+        
+        // ── SWEEP DIALOG: CUSTOM CAPABILITY STATE ─────────────────────────────
+        // Separate state from the Create Job panel — the sweep dialog has its
+        // own independent capability selections.
+        let sweepCapabilityState = {};
+
+        function initSweepCapabilityState() {
+            sweepCapabilityState = {};
+            CUSTOM_CAPABILITIES.forEach(cap => {
+                sweepCapabilityState[cap.id] = {};
+                cap.scripts.forEach(s => {
+                    sweepCapabilityState[cap.id][s.id] = false;
+                });
+            });
+        }
+
+        function getSweepSelectedScripts() {
+            const selected = [];
+            CUSTOM_CAPABILITIES.forEach(cap => {
+                cap.scripts.forEach(s => {
+                    if (sweepCapabilityState[cap.id] && sweepCapabilityState[cap.id][s.id]) {
+                        selected.push(s.id);
+                    }
+                });
+            });
+            return selected;
+        }
+
+        function updateSweepScriptCount() {
+            const n = getSweepSelectedScripts().length;
+            const el = document.getElementById('sweepScriptCount');
+            if (el) el.textContent = n === 1 ? '1 script selected' : `${n} scripts selected`;
+        }
+
+        function isSweepCapabilityOn(capId) {
+            return Object.values(sweepCapabilityState[capId] || {}).some(v => v);
+        }
+
+        function areAllSweepScriptsOn(capId) {
+            return Object.values(sweepCapabilityState[capId] || {}).every(v => v);
+        }
+
+        function renderSweepCapabilityCards() {
+            const container = document.getElementById('sweepCapabilityCards');
+            if (!container) return;
+
+            container.innerHTML = CUSTOM_CAPABILITIES.map(cap => {
+                const capOn = isSweepCapabilityOn(cap.id);
+                const allOn = areAllSweepScriptsOn(cap.id);
+
+                const toggleBg   = allOn ? 'bg-green-600 border-green-500' : (capOn ? 'bg-green-900 border-green-700' : 'bg-gray-700 border-gray-600');
+                const toggleKnob = (allOn || capOn) ? 'translate-x-5' : 'translate-x-0';
+                const knobColor  = (allOn || capOn) ? 'bg-white' : 'bg-gray-400';
+
+                const scriptRows = cap.scripts.map(s => {
+                    const checked = sweepCapabilityState[cap.id][s.id];
+                    const defaultTag = s.default ? '' : '<span class="ml-1.5 text-xs px-1 py-0.5 rounded bg-gray-800 text-gray-600 border border-gray-700 font-mono leading-none">sensitive</span>';
+                    return `
+                    <div class="flex items-center justify-between py-1 border-b border-gray-800 last:border-0">
+                        <span class="text-xs text-gray-300 font-mono" title="${escHtmlAttr(s.desc)}">${s.label}${defaultTag}</span>
+                        <button
+                            onclick="toggleSweepScript('${cap.id}', '${s.id}')"
+                            class="flex-shrink-0 ml-2 relative w-7 h-3.5 rounded-full transition-colors duration-150 focus:outline-none border ${checked ? 'bg-green-600 border-green-500' : 'bg-gray-700 border-gray-600'}">
+                            <span class="absolute top-0.5 left-0.5 w-2.5 h-2.5 rounded-full transition-transform duration-150 ${checked ? 'bg-white translate-x-3' : 'bg-gray-400 translate-x-0'}"></span>
+                        </button>
+                    </div>`;
+                }).join('');
+
+                const selectedCount = Object.values(sweepCapabilityState[cap.id]).filter(v => v).length;
+
+                return `
+                <div class="bg-gray-800 border border-gray-700 rounded-lg overflow-hidden">
+                    <div class="flex items-center gap-2 px-3 py-2">
+                        <button onclick="toggleSweepCapability('${cap.id}')"
+                            class="flex-shrink-0 relative w-9 h-4.5 rounded-full transition-colors duration-150 focus:outline-none border ${toggleBg}"
+                            style="width:2.25rem;height:1.25rem"
+                            title="${escHtmlAttr(cap.tooltip)}">
+                            <span class="absolute top-0.5 left-0.5 w-3.5 h-3.5 rounded-full transition-transform duration-150 ${knobColor} ${toggleKnob}" style="width:0.875rem;height:0.875rem"></span>
+                        </button>
+                        <div class="flex-1 min-w-0 cursor-pointer" onclick="expandSweepCapability('${cap.id}')">
+                            <span class="text-xs font-medium text-gray-200">${cap.label}</span>
+                            <span class="ml-2 text-xs text-gray-600">${selectedCount}/${cap.scripts.length}</span>
+                        </div>
+                        <button onclick="expandSweepCapability('${cap.id}')" class="text-gray-600 hover:text-gray-400 transition text-xs" id="sweep-chevron-${cap.id}">▼</button>
+                    </div>
+                    <div id="sweep-scripts-${cap.id}" class="hidden px-3 pb-2 border-t border-gray-700 pt-2">
+                        ${scriptRows}
+                    </div>
+                </div>`;
+            }).join('');
+
+            updateSweepScriptCount();
+        }
+
+        function toggleSweepCapability(capId) {
+            const cap = CUSTOM_CAPABILITIES.find(c => c.id === capId);
+            if (!cap) return;
+            const allOn = areAllSweepScriptsOn(capId);
+            if (allOn) {
+                cap.scripts.forEach(s => { sweepCapabilityState[capId][s.id] = false; });
+            } else {
+                const anyOn = isSweepCapabilityOn(capId);
+                cap.scripts.forEach(s => {
+                    sweepCapabilityState[capId][s.id] = anyOn ? true : s.default;
+                });
+            }
+            renderSweepCapabilityCards();
+        }
+
+        function toggleSweepScript(capId, scriptId) {
+            if (!sweepCapabilityState[capId]) return;
+            sweepCapabilityState[capId][scriptId] = !sweepCapabilityState[capId][scriptId];
+            renderSweepCapabilityCards();
+            // Keep expanded after toggle
+            const el = document.getElementById(`sweep-scripts-${capId}`);
+            if (el) el.classList.remove('hidden');
+            const chevron = document.getElementById(`sweep-chevron-${capId}`);
+            if (chevron) chevron.textContent = '▲';
+        }
+
+        function expandSweepCapability(capId) {
+            const el      = document.getElementById(`sweep-scripts-${capId}`);
+            const chevron = document.getElementById(`sweep-chevron-${capId}`);
+            if (!el) return;
+            const isHidden = el.classList.contains('hidden');
+            el.classList.toggle('hidden', !isHidden);
+            if (chevron) chevron.textContent = isHidden ? '▲' : '▼';
+        }
+
+        function sweepSelectAll() {
+            CUSTOM_CAPABILITIES.forEach(cap => {
+                cap.scripts.forEach(s => { sweepCapabilityState[cap.id][s.id] = true; });
+            });
+            renderSweepCapabilityCards();
+        }
+
+        function sweepClearAll() {
+            CUSTOM_CAPABILITIES.forEach(cap => {
+                cap.scripts.forEach(s => { sweepCapabilityState[cap.id][s.id] = false; });
+            });
+            renderSweepCapabilityCards();
+        }
+
+        // ── SWEEP DIALOG: TYPE/PROFILE CHANGE HANDLERS ────────────────────────
+
+        function onSweepJobTypeChange() {
+            onSweepProfileChange();
+            updateSweepConfirmNote();
+        }
+
+        function onSweepProfileChange() {
+            const type    = document.getElementById('sweepJobType').value;
+            const profile = document.getElementById('sweepProfile').value;
+            const isCustom = type === 'nse_scan' && profile === 'custom';
+            const isFull   = type === 'nse_scan' && profile === 'full';
+
+            // Custom profile panel
+            const customPanel = document.getElementById('sweepCustomPanel');
+            if (customPanel) {
+                customPanel.classList.toggle('hidden', !isCustom);
+                if (isCustom && Object.keys(sweepCapabilityState).length === 0) {
+                    initSweepCapabilityState();
+                    renderSweepCapabilityCards();
+                }
+            }
+
+            // Custom option only meaningful for nse_scan — disable it for other types
+            const profileSel = document.getElementById('sweepProfile');
+            const customOpt  = profileSel ? profileSel.querySelector('option[value="custom"]') : null;
+            if (customOpt) {
+                customOpt.disabled = type !== 'nse_scan';
+                // If switching away from nse_scan while custom is selected, revert to standard
+                if (type !== 'nse_scan' && profile === 'custom') {
+                    profileSel.value = 'standard';
+                }
+            }
+
+            // Full + Vulnerability Scanintrusive warning
+            const fullWarn = document.getElementById('sweepFullWarning');
+            if (fullWarn) fullWarn.classList.toggle('hidden', !isFull);
+
+            updateSweepConfirmNote();
+        }
+
+        function updateSweepConfirmNote() {
+            const type    = document.getElementById('sweepJobType')?.value || 'nmap_scan';
+            const profile = document.getElementById('sweepProfile')?.value || 'standard';
+            const label   = SCAN_TYPE_LABELS[type] || type;
+            const note    = document.getElementById('sweepConfirmNote');
+            if (!note) return;
+            const profileLabel = profile === 'custom' ? 'Custom' : profile.charAt(0).toUpperCase() + profile.slice(1);
+            note.textContent = `Confirming will create a ${profileLabel} ${label} job for each host above.`;
+        }
+
+        // ── PROFILE CHANGE HANDLER (replaces/extends existing) ────────────────
+        // Note: the existing profile select doesn't have onchange — we add it above.
+        // This function is called from onJobTypeChange() too for the banner check.
+
+        function onProfileChange() {
+            const type    = document.getElementById('job_type').value;
+            const profile = document.getElementById('profile').value;
+            const isCustom = profile === 'custom' && type === 'nse_scan';
+
+            // Show/hide custom panel
+            const panel = document.getElementById('customProfilePanel');
+            if (panel) {
+                panel.classList.toggle('hidden', !isCustom);
+                if (isCustom && Object.keys(capabilityState).length === 0) {
+                    initCapabilityState();
+                    renderCapabilityCards();
+                }
+            }
+
+            // Hide exploit banner when switching to custom
+            if (profile === 'custom') {
+                document.getElementById('nseExploitBanner').classList.add('hidden');
+            } else {
+                updateNseExploitBanner();
+            }
+        }
+        
         // ── JOB FILTERS ────────────────────────────────────────────────────
         function setJobFilter(filter) {
             jobFilter = filter;
@@ -3274,7 +3854,16 @@ def dashboard():
             let payload = { type, target, mode, profile, priority };
             if (agent_id) payload.agent_id = parseInt(agent_id);
             if (type === "nikto_scan" && port) payload.port = parseInt(port);
-            if (type === "nse_scan" && ports) payload.ports = ports;
+            if (type === "nse_scan" && ports && profile !== 'custom') payload.ports = ports;
+            if (type === "nse_scan" && profile === 'custom') {
+                const scripts = getSelectedScripts();
+                if (!scripts.length) {
+                    document.getElementById('customProfileWarning').classList.remove('hidden');
+                    return;
+                }
+                document.getElementById('customProfileWarning').classList.add('hidden');
+                payload.custom_scripts = scripts;
+            }
             const res = await apiFetch('/jobs/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
             if (!res) return;
             if (res.status === 400) { const err = await res.json(); alert(`Job creation failed: ${err.detail}`); return; }
@@ -3284,6 +3873,14 @@ def dashboard():
             document.getElementById("port").value = "";
             document.getElementById("ports").value = "";
             setTimeout(loadAll, 300);
+            
+            // Reset custom profile state
+            if (type === 'nse_scan' && profile === 'custom') {
+                initCapabilityState();
+                renderCapabilityCards();
+                document.getElementById('customProfilePanel').classList.add('hidden');
+                document.getElementById('profile').value = 'standard';
+            }
         }
 
         // ── RESULTS ────────────────────────────────────────────────────────
@@ -3575,7 +4172,7 @@ def dashboard():
                     // ── Expanded body ─────────────────────────────────────
                     + '<div id="result-body-' + r.id + '" class="hidden px-5 pb-5 border-t border-gray-700 pt-4">'
                     +     (isHistory ? renderJobInfo(r.job_info) : '')
-                    +     (out.nmap  ? '<div class="mb-4"><p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Port Scan</p>'          + renderNmapResult(out.nmap)   + '</div>' : '')
+                    +     (out.nmap  ? '<div class="mb-4"><p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Open Port Scan</p>'          + renderNmapResult(out.nmap)   + '</div>' : '')
                     +     (out.nikto ? '<div class="mb-4"><p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Web Scan</p>'         + renderNiktoResult(out.nikto) + '</div>' : '')
                     +     (out.nse   ? '<div class="mb-4"><p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">Vulnerability Scan</p>' + renderNseResult(out.nse)    + '</div>' : '')
                     +     (!out.nmap && !out.nikto && !out.nse ? '<pre class="text-xs text-gray-400 overflow-x-auto">' + JSON.stringify(out, null, 2) + '</pre>' : '')
@@ -3652,8 +4249,15 @@ def dashboard():
                     return;
                 }
 
-                // Show confirmation dialog
-                pendingSweepPayload = { subnet, mode, profile };
+                // Show confirmation dialog — store hosts list for direct job creation path
+                pendingSweepPayload = { subnet, hosts: data.hosts };
+                // Reset sweep dialog selectors to sensible defaults
+                const sweepJobType = document.getElementById('sweepJobType');
+                const sweepProfile = document.getElementById('sweepProfile');
+                if (sweepJobType) sweepJobType.value = 'nmap_scan';
+                if (sweepProfile) sweepProfile.value = 'standard';
+                onSweepProfileChange();
+                updateSweepConfirmNote();
                 document.getElementById("sweepConfirmMsg").textContent = `${data.count} host(s) found in ${subnet}:`;
                 const hostListEl = document.getElementById("sweepHostList");
                 hostListEl.innerHTML = data.hosts.map(h => `<div class="flex items-center gap-3 text-xs py-1 border-b border-gray-700 last:border-0"><span class="font-mono text-green-400 w-36">${h.ip}</span><span class="text-gray-500">${h.hostname || ''}</span></div>`).join('');
@@ -3667,16 +4271,63 @@ def dashboard():
             document.getElementById("sweepConfirmDialog").classList.add('hidden');
             pendingSweepPayload = null;
         }
-
+        
         async function confirmSweep() {
+            const jobType  = document.getElementById('sweepJobType')?.value  || 'nmap_scan';
+            const profile  = document.getElementById('sweepProfile')?.value  || 'standard';
+            const jobMode  = document.getElementById('sweepJobMode')?.value  || 'remote';
+            const priority = document.getElementById('sweepJobPriority')?.value || 'medium';
+
+            // Validate custom profile selection
+            if (jobType === 'nse_scan' && profile === 'custom') {
+                const scripts = getSweepSelectedScripts();
+                if (!scripts.length) {
+                    document.getElementById('sweepCustomWarning').classList.remove('hidden');
+                    return;
+                }
+                document.getElementById('sweepCustomWarning').classList.add('hidden');
+            }
+
             document.getElementById("sweepConfirmDialog").classList.add('hidden');
             if (!pendingSweepPayload) return;
-            const { subnet, mode, profile } = pendingSweepPayload;
+            const { subnet, hosts } = pendingSweepPayload;
             pendingSweepPayload = null;
 
-            showSweepStatus(`Sweeping ${subnet} and assigning jobs…`, 'bg-cyan-400 animate-pulse');
+            showSweepStatus(`Assigning ${SCAN_TYPE_LABELS[jobType] || jobType} jobs to ${hosts.length} host(s)…`, 'bg-cyan-400 animate-pulse');
 
-            const res = await apiFetch('/discover', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ subnet, mode, profile }) });
+            // For custom profile or non-nmap types, create individual jobs directly
+            // rather than using the sweep endpoint (which hardcodes nmap_scan).
+            if (jobType !== 'nmap_scan' || profile === 'custom') {
+                const customScripts = (jobType === 'nse_scan' && profile === 'custom')
+                    ? getSweepSelectedScripts()
+                    : undefined;
+
+                const results = await Promise.all(hosts.map(h =>
+                    apiFetch('/jobs/create', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            type:           jobType,
+                            target:         h.ip,
+                            mode:           jobMode,
+                            profile:        profile,
+                            priority:       priority,
+                            custom_scripts: customScripts || undefined,
+                        }),
+                    })
+                ));
+
+                const created = results.filter(r => r && r.ok).length;
+                showSweepStatus(`Done — ${created} job(s) created across ${hosts.length} host(s)`, 'bg-green-400');
+                loadJobs();
+
+                // Reset sweep custom state
+                initSweepCapabilityState();
+                return;
+            }
+
+            // Standard nmap_scan — use the existing sweep endpoint
+            const res = await apiFetch('/discover', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ subnet, mode: jobMode, profile }) });
             if (!res) return;
             const data = await res.json();
 

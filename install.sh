@@ -301,6 +301,14 @@ BEGIN
         ALTER TABLE jobs ADD COLUMN ports VARCHAR;
         RAISE NOTICE 'Added jobs.ports';
     END IF;
+    
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='jobs' AND column_name='custom_scripts'
+    ) THEN
+        ALTER TABLE jobs ADD COLUMN custom_scripts VARCHAR;
+        RAISE NOTICE 'Added jobs.custom_scripts';
+    END IF;
 
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns

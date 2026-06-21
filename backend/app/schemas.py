@@ -51,3 +51,4 @@ class JobCreate(BaseModel):
     profile: str | None = "standard"
     port: Optional[int] = None
     ports: Optional[str] = None
+    custom_scripts: Optional[list[str]] = None  # list of NSE script names — only used when profile='custom'
