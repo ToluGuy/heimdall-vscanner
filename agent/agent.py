@@ -434,9 +434,18 @@ def parse_nse_from_xml(xml_data: str) -> list:
     return findings
 
 
-def resolve_nse_ports(ports_str: str | None, profile: str) -> list[str]:
+def resolve_nse_ports(ports_str: str | None) -> tuple[list[str], str | None]:
+    """
+    Resolves the -p flag list for a standard NSE scan.
+
+    Web ports are no longer filtered out — users can scan any port they choose.
+    If the requested list includes web ports, a soft advisory is returned alongside
+    the port list so the result card can display it.
+
+    Returns (port_list, advisory_message | None).
+    """
     if not ports_str:
-        return []
+        return [], None
 
     requested = []
     for part in ports_str.split(","):
@@ -444,29 +453,38 @@ def resolve_nse_ports(ports_str: str | None, profile: str) -> list[str]:
         if part.isdigit():
             requested.append(int(part))
 
-    non_web = [p for p in requested if p not in WEB_PORTS]
-    return [str(p) for p in non_web]
+    if not requested:
+        return [], None
+
+    web_in_request = [p for p in requested if p in WEB_PORTS]
+    advisory = None
+    if web_in_request:
+        advisory = (
+            f"Port(s) {web_in_request} are web ports. NSE vulnerability scripts may have "
+            "limited coverage on web services — consider also running a Web Scan (Nikto) "
+            "for deeper web surface testing."
+        )
+
+    return [str(p) for p in requested], advisory
 
 
 def run_nse(target: str, profile: str = "standard", ports_str: str | None = None) -> dict:
+    """
+    Runs a standard NSE scan against target.
+    All requested ports are scanned — web ports are no longer excluded.
+    If web ports are included, a soft advisory is added to the result.
+    Returns a dict with 'findings' (list) and optionally 'advisory'.
+    """
     logger.info(f"Running NSE ({profile}) on {target}")
 
     nse_flags = get_nse_flags(profile)
-    port_list = resolve_nse_ports(ports_str, profile)
-
-    if ports_str and not port_list:
-        warning = (
-            "All specified ports are web ports (80, 443, 8080, 8443, 8000, 8888). "
-            "NSE skips these — use a Nikto scan for web surface testing."
-        )
-        logger.warning(f"NSE job on {target}: {warning}")
-        return {"findings": [], "warning": warning}
+    port_list, advisory = resolve_nse_ports(ports_str)
 
     cmd = ["nmap", "-sV", *nse_flags]
 
     if port_list:
         cmd += ["-p", ",".join(port_list)]
-        logger.info(f"NSE port list (web ports excluded): {port_list}")
+        logger.info(f"NSE port list: {port_list}")
     else:
         logger.info("NSE using profile default port range")
 
@@ -484,7 +502,10 @@ def run_nse(target: str, profile: str = "standard", ports_str: str | None = None
     findings = parse_nse_from_xml(result.stdout)
     logger.info(f"NSE complete — {len(findings)} finding(s) on {target}")
 
-    return {"findings": findings}
+    out: dict = {"findings": findings}
+    if advisory:
+        out["advisory"] = advisory
+    return out
 
 
 def run_custom_nse(target: str, scripts: list[str]) -> dict:
