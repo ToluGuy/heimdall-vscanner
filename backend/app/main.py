@@ -572,15 +572,16 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
             )
 
     # validate ports for nse jobs — warn if all are web ports, but still create the job
-    # (the actual filtering + warning is returned in the scan result by the agent/scanner) 
+    # (the actual filtering + warning is returned in the scan result by the agent/scanner)
+    
     nse_ports_warning = None
     if job.type == "nse_scan" and job.ports and job.profile != "custom":
         requested = [int(p.strip()) for p in job.ports.split(",") if p.strip().isdigit()]
-        non_web = [p for p in requested if p not in WEB_PORTS]
-        if requested and not non_web:
+        web_in_request = [p for p in requested if p in WEB_PORTS]
+        if web_in_request:
             nse_ports_warning = (
-                f"Warning: all specified ports {requested} are web ports. "
-                "NSE will have nothing to scan on those. Use a Nikto job for web surface testing."
+                f"Note: port(s) {web_in_request} are web ports. NSE will scan them but "
+                "consider also running a Web Scan for deeper web surface testing."
             )
 
     # Custom profile validation — must have at least one script selected
@@ -796,9 +797,12 @@ def heartbeat(
 ):
     agent = get_agent_by_api_key(x_api_key, db)
     agent.last_seen = datetime.utcnow()
+    # Auto-restore stale agents when they come back online
+    if agent.is_stale:
+        agent.is_stale = False
+        logger.info(f"Agent '{agent.name}' (id={agent.id}) came back online — stale flag cleared")
     db.commit()
     return {"status": "alive"}
-
 
 @app.post("/agents/job-status")
 def update_job_status(
