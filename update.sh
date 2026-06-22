@@ -61,6 +61,16 @@ else
     warn "If you downloaded manually, replace the files yourself and re-run this script."
 fi
 
+# ─── SELF-UPDATE CHECK ────────────────────────────────────────────────────────
+
+# If update.sh itself was modified by the pull, warn the user to run it again.
+# This ensures new migration steps in the updated script actually execute.
+if git -C "$INSTALL_DIR" diff HEAD@{1} HEAD -- update.sh 2>/dev/null | grep -q '^+'; then
+    warn "update.sh was modified in this pull."
+    warn "Running it again now to apply any new migration steps..."
+    exec "$INSTALL_DIR/update.sh"
+fi
+
 # ─── PYTHON DEPENDENCIES ──────────────────────────────────────────────────────
 
 section "Python Dependencies"
