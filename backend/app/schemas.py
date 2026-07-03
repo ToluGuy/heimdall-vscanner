@@ -51,4 +51,5 @@ class JobCreate(BaseModel):
     profile: str | None = "standard"
     port: Optional[int] = None
     ports: Optional[str] = None
-    custom_scripts: Optional[list[str]] = None  # list of NSE script names — only used when profile='custom'
+    custom_scripts: Optional[list[str]] = None  # list of NSE script names — only used when profile='custom' on nse_scan
+    nikto_tuning: Optional[list[str]] = None    # list of Nikto tuning category codes — only used when profile='custom' on nikto_scan

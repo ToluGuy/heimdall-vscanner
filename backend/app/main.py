@@ -116,6 +116,7 @@ def run_scheduler():
 SETTING_DEFAULTS = {
     "ai_auto_analyse":    "true",
     "stale_agent_hours":  "24",
+    "auto_nikto":         "true",   # automatically run Nikto after nmap_scan when web ports are found
 }
  
 def _init_default_settings():
@@ -143,6 +144,8 @@ def get_setting(db, key: str) -> str:
         return os.environ.get("STALE_AGENT_HOURS", "24")
     if key == "ai_auto_analyse":
         return "true" if AI_AUTO_ANALYSE else "false"
+    if key == "auto_nikto":
+        return os.environ.get("AUTO_NIKTO", "true")
     return SETTING_DEFAULTS.get(key, "")
 
 
@@ -592,10 +595,23 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
                 detail="Custom profile requires at least one script to be selected."
             )
 
+    # Custom profile validation for nikto_scan — must have at least one tuning category
+    if job.profile == "custom" and job.type == "nikto_scan":
+        if not job.nikto_tuning:
+            raise HTTPException(
+                status_code=400,
+                detail="Custom Web Scan profile requires at least one tuning category to be selected."
+            )
+
     # Serialise custom_scripts list to comma-separated string for DB storage
     custom_scripts_str = None
     if job.custom_scripts:
         custom_scripts_str = ",".join(s.strip() for s in job.custom_scripts if s.strip())
+
+    # Serialise nikto_tuning list to comma-separated string for DB storage
+    nikto_tuning_str = None
+    if job.nikto_tuning:
+        nikto_tuning_str = ",".join(s.strip() for s in job.nikto_tuning if s.strip())
 
     new_job = Job(
         type=job.type,
@@ -608,6 +624,7 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
         port=job.port if job.port else None,
         ports=job.ports if job.ports else None,
         custom_scripts=custom_scripts_str,
+        nikto_tuning=nikto_tuning_str,
     )
     db.add(new_job)
     db.commit()
@@ -618,6 +635,33 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
         response["warning"] = nse_ports_warning
 
     return response
+
+
+@app.post("/scanners/register")
+def register_scanner(
+    agent: AgentCreate,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    """
+    Dashboard-initiated scanner registration. Creates an Agent record and
+    returns the API key plus ready-to-use setup instructions.
+    This is auth-gated (unlike /agents/register which is open for self-registration).
+    """
+    new_agent = Agent(
+        name=agent.name,
+        capabilities=agent.capabilities or "nmap_scan,nikto_scan,nse_scan",
+    )
+    db.add(new_agent)
+    db.commit()
+    db.refresh(new_agent)
+    logger.info(f"Scanner '{agent.name}' registered from dashboard (id={new_agent.id})")
+    return {
+        "id": new_agent.id,
+        "name": new_agent.name,
+        "api_key": new_agent.api_key,
+        "capabilities": new_agent.capabilities,
+    }
 
 
 @app.get("/agents")
@@ -641,6 +685,7 @@ def get_agents(
             "id": a.id,
             "name": a.name,
             "api_key": a.api_key,
+            "capabilities": a.capabilities or "",
             "status": status,
             "last_seen": a.last_seen,
             "is_stale": a.is_stale,
@@ -779,6 +824,14 @@ def get_next_job(
     if job.custom_scripts:
         custom_scripts_list = [s.strip() for s in job.custom_scripts.split(",") if s.strip()]
 
+    # Deserialise nikto_tuning from comma-separated DB string back to a list
+    nikto_tuning_list = None
+    if job.nikto_tuning:
+        nikto_tuning_list = [s.strip() for s in job.nikto_tuning.split(",") if s.strip()]
+
+    # Read auto_nikto setting so agents/scanner can respect it
+    auto_nikto = get_setting(db, "auto_nikto") == "true"
+
     return {
         "id": job.id,
         "type": job.type,
@@ -788,6 +841,8 @@ def get_next_job(
         "port": job.port,
         "ports": job.ports,
         "custom_scripts": custom_scripts_list,
+        "nikto_tuning": nikto_tuning_list,
+        "auto_nikto": auto_nikto,
     }
 
 @app.post("/agents/heartbeat")
@@ -1037,6 +1092,12 @@ def run_ping_sweep(sweep_id: int, subnet: str, mode: str, profile: str):
             except ET.ParseError as e:
                 logger.error(f"Sweep {sweep_id} XML parse error: {e}")
 
+        # Check if sweep was cancelled while nmap was running — discard results if so
+        sweep = db.query(DiscoverySweep).filter(DiscoverySweep.id == sweep_id).first()
+        if sweep and sweep.status == "cancelled":
+            logger.info(f"Sweep {sweep_id} was cancelled — discarding results")
+            return
+
         jobs_created = 0
         for host_ip in hosts:
             new_job = Job(
@@ -1045,7 +1106,8 @@ def run_ping_sweep(sweep_id: int, subnet: str, mode: str, profile: str):
                 status="pending",
                 mode=mode,
                 profile=profile,
-                priority="medium"
+                priority="medium",
+                sweep_id=sweep_id
             )
             db.add(new_job)
             jobs_created += 1
@@ -1132,6 +1194,70 @@ def get_sweep_status(
         "hosts": json.loads(sweep.result) if sweep.result else [],
         "started_at": sweep.started_at.isoformat() if sweep.started_at else None,
         "completed_at": sweep.completed_at.isoformat() if sweep.completed_at else None,
+    }
+
+
+@app.post("/discover/{sweep_id}/cancel")
+def cancel_sweep(
+    sweep_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth)
+):
+    """Mark a running sweep as cancelled. The background thread checks this flag
+    before committing jobs and will discard results if it sees 'cancelled'."""
+    sweep = db.query(DiscoverySweep).filter(DiscoverySweep.id == sweep_id).first()
+    if not sweep:
+        raise HTTPException(status_code=404, detail="Sweep not found")
+    if sweep.status != "running":
+        raise HTTPException(status_code=400, detail=f"Sweep is not running (status: {sweep.status})")
+    sweep.status = "cancelled"
+    sweep.completed_at = datetime.utcnow()
+    db.commit()
+    logger.info(f"Sweep {sweep_id} cancelled by user")
+    return {"ok": True, "sweep_id": sweep_id, "status": "cancelled"}
+
+
+@app.get("/sweeps/{sweep_id}/results")
+def get_sweep_results(
+    sweep_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth)
+):
+    """Return all jobs and their results for a given sweep, grouped by host."""
+    sweep = db.query(DiscoverySweep).filter(DiscoverySweep.id == sweep_id).first()
+    if not sweep:
+        raise HTTPException(status_code=404, detail="Sweep not found")
+
+    jobs = db.query(Job).filter(Job.sweep_id == sweep_id).all()
+
+    hosts = []
+    for job in jobs:
+        result = db.query(Result).filter(Result.job_id == job.id).first()
+        output = None
+        if result:
+            try:
+                output = json.loads(result.output)
+            except Exception:
+                output = result.output
+
+        hosts.append({
+            "job_id": job.id,
+            "target": job.target,
+            "status": job.status,
+            "profile": job.profile,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "result_id": result.id if result else None,
+            "output": output,
+        })
+
+    return {
+        "sweep_id": sweep.id,
+        "subnet": sweep.subnet,
+        "status": sweep.status,
+        "started_at": sweep.started_at.isoformat() if sweep.started_at else None,
+        "completed_at": sweep.completed_at.isoformat() if sweep.completed_at else None,
+        "hosts": hosts,
     }
 
 
@@ -2293,6 +2419,18 @@ def dashboard():
                                     class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-gray-400 transition-transform duration-200"></span>
                             </button>
                         </div>
+
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <p class="text-sm text-gray-300">Auto web scan after port scan</p>
+                                <p class="text-xs text-gray-600 mt-0.5">Automatically run Nikto when web ports are found in an Open Port Scan. Disable to make port scans faster.</p>
+                            </div>
+                            <button id="setting-nikto-toggle" onclick="toggleServerSetting('auto_nikto')"
+                                class="relative w-11 h-6 rounded-full transition-colors duration-200 focus:outline-none bg-gray-700 border border-gray-600">
+                                <span id="setting-nikto-knob"
+                                    class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-gray-400 transition-transform duration-200"></span>
+                            </button>
+                        </div>
  
                         <div class="flex items-center justify-between gap-3">
                             <div>
@@ -2368,8 +2506,8 @@ def dashboard():
                 <h2 class="text-lg font-semibold text-green-400 mb-4">Create Job</h2>
                 <div class="flex flex-wrap gap-3 items-end">
                     <div class="flex flex-col gap-1">
-                        <label class="text-xs text-gray-400">Target IP</label>
-                        <input id="target" placeholder="127.0.0.1"
+                        <label class="text-xs text-gray-400">Target</label>
+                        <input id="target" placeholder="IP, hostname, or URL"
                             class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-44">
                     </div>
                     <div class="flex flex-col gap-1">
@@ -2442,16 +2580,82 @@ def dashboard():
                     <div id="capabilityCards" class="space-y-2"></div>
                     <p id="customProfileWarning" class="hidden mt-3 text-xs text-red-400">Select at least one capability before creating the job.</p>
                 </div>
+
+                <!-- Custom Nikto Profile — Tuning Category Cards -->
+                <div id="niktoCustomPanel" class="hidden mt-5">
+                    <div class="flex items-center justify-between mb-3">
+                        <p class="text-xs font-semibold text-purple-400 uppercase tracking-wider">Select Test Categories</p>
+                        <div class="flex items-center gap-3">
+                            <button onclick="selectAllNiktoCategories()" class="text-xs text-gray-500 hover:text-gray-300 transition">Select all</button>
+                            <button onclick="clearAllNiktoCategories()" class="text-xs text-gray-500 hover:text-gray-300 transition">Clear all</button>
+                            <span id="niktoCategoryCount" class="text-xs text-gray-600">0 categories selected</span>
+                        </div>
+                    </div>
+                    <div id="niktoCategoryCards" class="grid grid-cols-2 gap-2"></div>
+                    <p id="niktoCustomWarning" class="hidden mt-3 text-xs text-red-400">Select at least one category before creating the job.</p>
+                </div>
             </div>
 
             <!-- Agents -->
             <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
                 <div class="flex items-center justify-between mb-4">
                     <h2 class="text-lg font-semibold text-green-400">Agents</h2>
-                    <button onclick="toggleStaleAgents()" id="staleAgentsBtn"
-                        class="text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-yellow-500 transition">Show Stale</button>
+                    <div class="flex items-center gap-2">
+                        <button onclick="openRegisterScanner()"
+                            class="text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-green-500 hover:text-green-400 transition">+ Register Scanner</button>
+                        <button onclick="toggleStaleAgents()" id="staleAgentsBtn"
+                            class="text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-yellow-500 transition">Show Stale</button>
+                    </div>
                 </div>
                 <div id="agents" class="overflow-x-auto"></div>
+            </div>
+
+            <!-- Register Scanner Modal -->
+            <div id="registerScannerBackdrop" class="hidden fixed inset-0 bg-black bg-opacity-60 z-40" onclick="closeRegisterScanner()"></div>
+            <div id="registerScannerModal" class="hidden fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-lg">
+                <div class="flex items-center justify-between px-6 py-4 border-b border-gray-800">
+                    <h3 class="text-sm font-semibold text-green-400">Register New Scanner</h3>
+                    <button onclick="closeRegisterScanner()" class="text-gray-500 hover:text-gray-300 transition text-lg leading-none">✕</button>
+                </div>
+                <div id="registerScannerForm" class="px-6 py-5 space-y-4">
+                    <div>
+                        <label class="text-xs text-gray-400 block mb-1">Scanner name</label>
+                        <input id="scannerName" placeholder="scanner-2" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                    </div>
+                    <div>
+                        <label class="text-xs text-gray-400 block mb-1">Capabilities</label>
+                        <input id="scannerCaps" value="nmap_scan,nikto_scan,nse_scan" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                        <p class="text-xs text-gray-600 mt-1">Comma-separated. Options: <span class="font-mono">nmap_scan</span>, <span class="font-mono">nikto_scan</span>, <span class="font-mono">nse_scan</span></p>
+                    </div>
+                    <button onclick="submitRegisterScanner()" class="w-full bg-green-700 hover:bg-green-600 text-white text-sm font-medium py-2 rounded-lg transition">Register</button>
+                </div>
+                <div id="registerScannerResult" class="hidden px-6 pb-6 space-y-4">
+                    <div class="p-3 bg-green-950 border border-green-800 rounded-lg text-xs text-green-300">
+                        Scanner registered. Copy the setup commands below and run them on the server.
+                    </div>
+                    <div>
+                        <div class="flex items-center justify-between mb-1">
+                            <p class="text-xs text-gray-400">API key</p>
+                            <button onclick="copyText('resultApiKey')" class="text-xs text-gray-500 hover:text-gray-300 transition">Copy</button>
+                        </div>
+                        <pre id="resultApiKey" class="text-xs font-mono bg-gray-800 rounded-lg p-3 text-cyan-300 overflow-x-auto select-all whitespace-pre-wrap break-all"></pre>
+                    </div>
+                    <div>
+                        <div class="flex items-center justify-between mb-1">
+                            <p class="text-xs text-gray-400">Setup commands</p>
+                            <button onclick="copyText('resultSetupCmds')" class="text-xs text-gray-500 hover:text-gray-300 transition">Copy</button>
+                        </div>
+                        <pre id="resultSetupCmds" class="text-xs font-mono bg-gray-800 rounded-lg p-3 text-gray-300 overflow-x-auto whitespace-pre-wrap break-all"></pre>
+                    </div>
+                    <div>
+                        <div class="flex items-center justify-between mb-1">
+                            <p class="text-xs text-gray-400">Systemd service (save as <span class="font-mono">/etc/systemd/system/vapt-scanner-<span id="resultServiceName"></span>.service</span>)</p>
+                            <button onclick="copyText('resultServiceFile')" class="text-xs text-gray-500 hover:text-gray-300 transition">Copy</button>
+                        </div>
+                        <pre id="resultServiceFile" class="text-xs font-mono bg-gray-800 rounded-lg p-3 text-gray-300 overflow-x-auto whitespace-pre-wrap break-all"></pre>
+                    </div>
+                    <button onclick="closeRegisterScanner()" class="w-full border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-gray-200 text-sm py-2 rounded-lg transition">Done</button>
+                </div>
             </div>
 
             <!-- Jobs -->
@@ -2549,6 +2753,7 @@ def dashboard():
                 <div id="sweepStatus" class="hidden mb-4 p-3 bg-gray-800 rounded-lg border border-gray-700 text-xs text-gray-300 flex items-center gap-3">
                     <div id="sweepSpinner" class="w-3 h-3 rounded-full bg-cyan-400 animate-pulse flex-shrink-0"></div>
                     <span id="sweepStatusText" class="flex-1">Working...</span>
+                    <button id="cancelSweepBtn" onclick="cancelActiveSweep()" class="hidden text-xs px-2 py-1 rounded bg-red-900 hover:bg-red-800 text-red-300 hover:text-red-200 transition">Cancel Sweep</button>
                     <button onclick="dismissSweepStatus()" class="text-gray-500 hover:text-gray-300 transition text-base leading-none">✕</button>
                 </div>
 
@@ -2559,6 +2764,15 @@ def dashboard():
                         <button onclick="dismissPingResults()" class="text-gray-500 hover:text-gray-300 transition text-sm">✕</button>
                     </div>
                     <div id="pingResultsList" class="space-y-1 max-h-48 overflow-y-auto"></div>
+                </div>
+
+                <!-- Sweep result detail panel -->
+                <div id="sweepResultPanel" class="hidden mb-4 bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+                    <div class="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+                        <p class="text-xs font-semibold text-cyan-400" id="sweepResultTitle">Sweep Results</p>
+                        <button onclick="closeSweepResultPanel()" class="text-gray-500 hover:text-gray-300 transition text-sm">✕</button>
+                    </div>
+                    <div id="sweepResultBody" class="p-4 overflow-x-auto max-h-80 overflow-y-auto text-xs"></div>
                 </div>
 
             </div>
@@ -2588,8 +2802,8 @@ def dashboard():
                             class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-48">
                     </div>
                     <div class="flex flex-col gap-1">
-                        <label class="text-xs text-gray-400">Target IP</label>
-                        <input id="sched_target" placeholder="192.168.1.1"
+                        <label class="text-xs text-gray-400">Target</label>
+                        <input id="sched_target" placeholder="IP, hostname, or URL"
                             class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-36">
                     </div>
                     <div class="flex flex-col gap-1">
@@ -2865,6 +3079,14 @@ def dashboard():
 
         // Tracks job statuses from last poll — used to detect completions
         let lastJobStatuses = {};
+
+        // ── PAGINATION STATE ──────────────────────────────────────────────
+        // Each tab has its own current page. Page size is shared but can be
+        // overridden per tab. All are 1-indexed.
+        const PAGE_SIZES = { results: 10, jobs: 20, agents: 20, sweeps: 10 };
+        let pages = { results: 1, jobs: 1, agents: 1, sweeps: 1 };
+        // Store the last-fetched data so pagination can re-render without re-fetching
+        let pageData = { results: [], jobs: [], agents: [], sweeps: [] };
         
         // Friendly display names for scan types
         const SCAN_TYPE_LABELS = {
@@ -2876,11 +3098,77 @@ def dashboard():
             return SCAN_TYPE_LABELS[type] || type;
         }
 
+        // ── PAGINATION HELPERS ─────────────────────────────────────────────
+        /**
+         * Returns the slice of `items` for the current page of `tab`.
+         */
+        function getPage(tab, items) {
+            const size  = PAGE_SIZES[tab];
+            const start = (pages[tab] - 1) * size;
+            return items.slice(start, start + size);
+        }
+
+        /**
+         * Builds and returns the pagination bar HTML for a given tab.
+         * `total` is the total number of items (before slicing).
+         * Calls `goPage_<tab>(n)` on click.
+         */
+        function paginationBar(tab, total) {
+            const size     = PAGE_SIZES[tab];
+            const numPages = Math.ceil(total / size);
+            if (numPages <= 1) return '';
+
+            const cur = pages[tab];
+            const fn  = `goPage_${tab}`;
+
+            // Build page number buttons — show at most 5 around current page
+            let pageNums = '';
+            const lo = Math.max(1, cur - 2);
+            const hi = Math.min(numPages, cur + 2);
+            if (lo > 1) pageNums += `<button onclick="${fn}(1)" class="pagination-num px-2 py-1 rounded text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-700 transition">1</button>`;
+            if (lo > 2) pageNums += `<span class="text-gray-600 text-xs px-1">…</span>`;
+            for (let p = lo; p <= hi; p++) {
+                const active = p === cur ? 'bg-gray-700 text-gray-100' : 'text-gray-400 hover:text-gray-200 hover:bg-gray-700';
+                pageNums += `<button onclick="${fn}(${p})" class="pagination-num px-2 py-1 rounded text-xs ${active} transition">${p}</button>`;
+            }
+            if (hi < numPages - 1) pageNums += `<span class="text-gray-600 text-xs px-1">…</span>`;
+            if (hi < numPages) pageNums += `<button onclick="${fn}(${numPages})" class="pagination-num px-2 py-1 rounded text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-700 transition">${numPages}</button>`;
+
+            const start = (cur - 1) * size + 1;
+            const end   = Math.min(cur * size, total);
+
+            return `<div class="flex items-center justify-between mt-4 pt-3 border-t border-gray-800">
+                <span class="text-xs text-gray-600">${start}–${end} of ${total}</span>
+                <div class="flex items-center gap-1">
+                    <button onclick="${fn}(${cur - 1})" ${cur === 1 ? 'disabled' : ''} class="px-2 py-1 rounded text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-700 transition disabled:opacity-30 disabled:cursor-not-allowed">‹</button>
+                    ${pageNums}
+                    <button onclick="${fn}(${cur + 1})" ${cur === numPages ? 'disabled' : ''} class="px-2 py-1 rounded text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-700 transition disabled:opacity-30 disabled:cursor-not-allowed">›</button>
+                </div>
+                <select onchange="changePageSize('${tab}', parseInt(this.value))" class="text-xs bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-400 focus:outline-none">
+                    ${[10, 20, 50].map(n => `<option value="${n}" ${n === size ? 'selected' : ''}>${n} per page</option>`).join('')}
+                </select>
+            </div>`;
+        }
+
+        function goPage_results(n) { pages.results = n; renderResults(); }
+        function goPage_jobs(n)    { pages.jobs    = n; renderJobs();    }
+        function goPage_agents(n)  { pages.agents  = n; renderAgents();  }
+        function goPage_sweeps(n)  { pages.sweeps  = n; renderSweeps();  }
+
+        function changePageSize(tab, size) {
+            PAGE_SIZES[tab] = size;
+            pages[tab] = 1;  // reset to page 1 on size change
+            if (tab === 'results') renderResults();
+            if (tab === 'jobs')    renderJobs();
+            if (tab === 'agents')  renderAgents();
+            if (tab === 'sweeps')  renderSweeps();
+        }
+
         // Pending sweep payload (hosts + params) waiting for user confirmation
         let pendingSweepPayload = null;
-        
+
         // ── SETTINGS ──────────────────────────────────────────────────────────
- 
+
         // Server settings cache
         let serverSettings = {};
  
@@ -3009,7 +3297,21 @@ def dashboard():
                 toggleKnob.classList.toggle('bg-white',    aiOn);
                 toggleKnob.classList.toggle('bg-gray-400', !aiOn);
             }
- 
+
+            // Auto-Nikto toggle
+            const niktoOn = serverSettings['auto_nikto'] !== 'false'; // default true
+            const niktoBtn  = document.getElementById('setting-nikto-toggle');
+            const niktoKnob = document.getElementById('setting-nikto-knob');
+            if (niktoBtn && niktoKnob) {
+                niktoBtn.classList.toggle('bg-green-600',    niktoOn);
+                niktoBtn.classList.toggle('border-green-500', niktoOn);
+                niktoBtn.classList.toggle('bg-gray-700',    !niktoOn);
+                niktoBtn.classList.toggle('border-gray-600', !niktoOn);
+                niktoKnob.style.transform = niktoOn ? 'translateX(20px)' : 'translateX(0)';
+                niktoKnob.classList.toggle('bg-white',    niktoOn);
+                niktoKnob.classList.toggle('bg-gray-400', !niktoOn);
+            }
+
             // Stale agent hours
             const staleInput = document.getElementById('setting-stale-hours');
             if (staleInput) {
@@ -3254,7 +3556,7 @@ def dashboard():
                     }
                 });
             });
-            return selected;
+            return [...new Set(selected)];
         }
 
         function updateScriptCount() {
@@ -3589,6 +3891,79 @@ def dashboard():
             note.textContent = `Confirming will create a ${profileLabel} ${label} job for each host above.`;
         }
 
+        // ── NIKTO CUSTOM PROFILE ───────────────────────────────────────────
+        const NIKTO_CATEGORIES = [
+            { id: '0', label: 'File Upload',                  desc: 'Tests for arbitrary file upload vulnerabilities.' },
+            { id: '1', label: 'Interesting Files',            desc: 'Looks for files commonly seen in server logs or left by developers.' },
+            { id: '2', label: 'Misconfiguration',             desc: 'Checks for default files, default credentials, and misconfigurations.' },
+            { id: '3', label: 'Information Disclosure',       desc: 'Identifies responses that leak server or application information.' },
+            { id: '4', label: 'Injection (XSS/HTML/Script)',  desc: 'Tests for cross-site scripting and script/HTML injection.' },
+            { id: '5', label: 'Remote File Retrieval (Web)',  desc: 'Attempts to retrieve files from inside the web root.' },
+            { id: '6', label: 'Denial of Service',            desc: 'Tests for DoS vectors — use with caution in production.' },
+            { id: '7', label: 'Remote File Retrieval (Wide)', desc: 'Attempts to retrieve files from anywhere on the server.' },
+            { id: '8', label: 'Command Execution',            desc: 'Tests for remote command execution and shell upload vectors.' },
+            { id: '9', label: 'SQL Injection',                desc: 'Tests for SQL injection vulnerabilities in parameters.' },
+            { id: 'a', label: 'Authentication Bypass',        desc: 'Checks for authentication bypass and weak credential issues.' },
+            { id: 'b', label: 'Software Identification',      desc: 'Identifies server software, CMS, and framework versions.' },
+            { id: 'c', label: 'Remote Source Inclusion',      desc: 'Tests for remote file/source inclusion vulnerabilities.' },
+            { id: 'x', label: 'Reverse Tuning',               desc: 'Run all test categories EXCEPT those additionally selected.' },
+        ];
+
+        // Default: all enabled except DoS (6) and Reverse Tuning (x)
+        let niktoCategoryState = {};
+        function initNiktoCategoryState() {
+            niktoCategoryState = {};
+            NIKTO_CATEGORIES.forEach(c => {
+                niktoCategoryState[c.id] = (c.id !== '6' && c.id !== 'x');
+            });
+        }
+
+        function renderNiktoCategoryCards() {
+            const container = document.getElementById('niktoCategoryCards');
+            if (!container) return;
+            container.innerHTML = NIKTO_CATEGORIES.map(c => {
+                const checked = niktoCategoryState[c.id];
+                const danger  = c.id === '6';
+                const border  = checked ? (danger ? 'border-red-600' : 'border-purple-600') : 'border-gray-700';
+                const bg      = checked ? (danger ? 'bg-red-950' : 'bg-gray-800') : 'bg-gray-900';
+                return `<div class="rounded-lg border ${border} ${bg} p-3 transition cursor-pointer" onclick="toggleNiktoCategory('${c.id}')">
+                    <div class="flex items-start gap-2">
+                        <input type="checkbox" ${checked ? 'checked' : ''} onchange="toggleNiktoCategory('${c.id}')" onclick="event.stopPropagation()" class="mt-0.5 accent-purple-500 flex-shrink-0">
+                        <div>
+                            <p class="text-xs font-medium text-gray-200">${c.label} <span class="text-gray-600 font-mono">[${c.id}]</span></p>
+                            <p class="text-xs text-gray-500 mt-0.5">${c.desc}</p>
+                        </div>
+                    </div>
+                </div>`;
+            }).join('');
+            updateNiktoCategoryCount();
+        }
+
+        function toggleNiktoCategory(id) {
+            niktoCategoryState[id] = !niktoCategoryState[id];
+            renderNiktoCategoryCards();
+        }
+
+        function updateNiktoCategoryCount() {
+            const count = Object.values(niktoCategoryState).filter(Boolean).length;
+            const el = document.getElementById('niktoCategoryCount');
+            if (el) el.textContent = `${count} categor${count === 1 ? 'y' : 'ies'} selected`;
+        }
+
+        function getSelectedNiktoCategories() {
+            return NIKTO_CATEGORIES.filter(c => niktoCategoryState[c.id]).map(c => c.id);
+        }
+
+        function selectAllNiktoCategories() {
+            NIKTO_CATEGORIES.forEach(c => { niktoCategoryState[c.id] = true; });
+            renderNiktoCategoryCards();
+        }
+
+        function clearAllNiktoCategories() {
+            NIKTO_CATEGORIES.forEach(c => { niktoCategoryState[c.id] = false; });
+            renderNiktoCategoryCards();
+        }
+
         // ── PROFILE CHANGE HANDLER (replaces/extends existing) ────────────────
         // Note: the existing profile select doesn't have onchange — we add it above.
         // This function is called from onJobTypeChange() too for the banner check.
@@ -3596,15 +3971,26 @@ def dashboard():
         function onProfileChange() {
             const type    = document.getElementById('job_type').value;
             const profile = document.getElementById('profile').value;
-            const isCustom = profile === 'custom' && type === 'nse_scan';
+            const isCustomNse   = profile === 'custom' && type === 'nse_scan';
+            const isCustomNikto = profile === 'custom' && type === 'nikto_scan';
 
-            // Show/hide custom panel
+            // Show/hide NSE custom panel
             const panel = document.getElementById('customProfilePanel');
             if (panel) {
-                panel.classList.toggle('hidden', !isCustom);
-                if (isCustom && Object.keys(capabilityState).length === 0) {
+                panel.classList.toggle('hidden', !isCustomNse);
+                if (isCustomNse && Object.keys(capabilityState).length === 0) {
                     initCapabilityState();
                     renderCapabilityCards();
+                }
+            }
+
+            // Show/hide Nikto custom panel
+            const niktoPanel = document.getElementById('niktoCustomPanel');
+            if (niktoPanel) {
+                niktoPanel.classList.toggle('hidden', !isCustomNikto);
+                if (isCustomNikto && Object.keys(niktoCategoryState).length === 0) {
+                    initNiktoCategoryState();
+                    renderNiktoCategoryCards();
                 }
             }
 
@@ -3619,10 +4005,11 @@ def dashboard():
         // ── JOB FILTERS ────────────────────────────────────────────────────
         function setJobFilter(filter) {
             jobFilter = filter;
+            pages.jobs = 1;
             document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active-filter', 'border-green-500', 'text-green-400'));
             const active = document.getElementById('filter-' + filter);
             if (active) active.classList.add('active-filter', 'border-green-500', 'text-green-400');
-            loadJobs();
+            renderJobs();
         }
         function toggleJobHistory() {
             showJobHistory = !showJobHistory;
@@ -3643,6 +4030,7 @@ def dashboard():
         // ── RESULT TABS ────────────────────────────────────────────────────
         function setResultTab(tab) {
             resultTab = tab;
+            pages.results = 1;
             document.querySelectorAll('.result-tab').forEach(b => { b.classList.remove('bg-gray-700', 'text-white'); b.classList.add('text-gray-400'); });
             document.getElementById('tab-' + tab).classList.add('bg-gray-700', 'text-white');
             document.getElementById('tab-' + tab).classList.remove('text-gray-400');
@@ -3771,25 +4159,107 @@ def dashboard():
             if (!res) return;
             const data = await res.json();
             data.sort((a, b) => a.id - b.id);
-            let html = `<table class="w-full text-sm"><thead><tr class="text-left text-gray-400 border-b border-gray-800"><th class="pb-2 pr-4">ID</th><th class="pb-2 pr-4">Name</th><th class="pb-2 pr-4">Status</th><th class="pb-2 pr-4">Last Seen</th><th class="pb-2">Action</th></tr></thead><tbody>`;
-            if (!data.length) html += `<tr><td colspan="5" class="py-4 text-gray-500 text-sm">No agents registered.</td></tr>`;
-            data.forEach((a, idx) => {
+            pageData.agents = data;
+            pages.agents = 1;
+            renderAgents();
+        }
+
+        function renderAgents() {
+            const data   = pageData.agents;
+            const paged  = getPage('agents', data);
+            let html = `<table class="w-full text-sm"><thead><tr class="text-left text-gray-400 border-b border-gray-800"><th class="pb-2 pr-4">ID</th><th class="pb-2 pr-4">Name</th><th class="pb-2 pr-4">Status</th><th class="pb-2 pr-4">Capabilities</th><th class="pb-2 pr-4">Last Seen</th><th class="pb-2">Action</th></tr></thead><tbody>`;
+            if (!data.length) html += `<tr><td colspan="6" class="py-4 text-gray-500 text-sm">No agents registered.</td></tr>`;
+            paged.forEach((a) => {
                 const isStale = a.is_stale;
                 const rowClass = isStale ? 'border-b border-gray-800 bg-gray-900 opacity-60' : 'border-b border-gray-800 hover:bg-gray-800 transition';
                 const dot = a.status === 'online' ? '<span class="inline-block w-2 h-2 rounded-full bg-green-400 mr-2"></span>' : '<span class="inline-block w-2 h-2 rounded-full bg-red-500 mr-2"></span>';
                 const staleTag = isStale ? '<span class="ml-2 text-xs px-1.5 py-0.5 rounded bg-yellow-900 text-yellow-400 border border-yellow-700">stale</span>' : '';
+                const caps = (a.capabilities || '').split(',').map(c => `<span class="inline-block mr-1 text-xs font-mono text-blue-300">${c.trim()}</span>`).join('');
+                const setupBtn = `<button onclick="showAgentSetup(${a.id}, '${a.name}', '${a.api_key}', '${a.capabilities || ''}')" class="text-xs text-gray-500 hover:text-gray-300 transition mr-3" title="Show setup commands">Setup</button>`;
                 const action = isStale
                     ? `<div class="flex gap-3"><button onclick="restoreAgent(${a.id})" class="text-xs text-blue-400 hover:text-blue-300 transition">Restore</button><button onclick="dismissAgent(${a.id})" class="text-xs text-red-400 hover:text-red-300 transition">Dismiss</button></div>`
-                    : '<span class="text-xs text-gray-600">—</span>';
-                html += `<tr class="${rowClass}"><td class="py-2 pr-4 text-gray-400">#${idx + 1}</td><td class="py-2 pr-4 font-medium">${a.name}${staleTag}</td><td class="py-2 pr-4">${dot}${a.status}</td><td class="py-2 pr-4 text-gray-400 text-xs">${formatTimestamp(a.last_seen)}</td><td class="py-2">${action}</td></tr>`;
+                    : setupBtn;
+                html += `<tr class="${rowClass}"><td class="py-2 pr-4 text-gray-400">#${a.id}</td><td class="py-2 pr-4 font-medium">${a.name}${staleTag}</td><td class="py-2 pr-4">${dot}${a.status}</td><td class="py-2 pr-4">${caps}</td><td class="py-2 pr-4 text-gray-400 text-xs">${formatTimestamp(a.last_seen)}</td><td class="py-2">${action}</td></tr>`;
             });
             html += '</tbody></table>';
+            html += paginationBar('agents', data.length);
             document.getElementById("agents").innerHTML = html;
         }
         async function dismissAgent(agent_id) {
             showConfirm('Permanently remove this stale agent?', async () => { await apiFetch(`/agents/${agent_id}/dismiss`, { method: 'POST' }); loadAgents(); }, 'Remove');
         }
         async function restoreAgent(agent_id) { await apiFetch(`/agents/${agent_id}/restore`, { method: 'POST' }); loadAgents(); }
+
+        // ── SCANNER REGISTRATION ───────────────────────────────────────────
+        function openRegisterScanner() {
+            document.getElementById('registerScannerBackdrop').classList.remove('hidden');
+            document.getElementById('registerScannerModal').classList.remove('hidden');
+            document.getElementById('registerScannerForm').classList.remove('hidden');
+            document.getElementById('registerScannerResult').classList.add('hidden');
+            document.getElementById('scannerName').value = '';
+            document.getElementById('scannerCaps').value = 'nmap_scan,nikto_scan,nse_scan';
+            document.getElementById('scannerName').focus();
+        }
+
+        function closeRegisterScanner() {
+            document.getElementById('registerScannerBackdrop').classList.add('hidden');
+            document.getElementById('registerScannerModal').classList.add('hidden');
+            loadAgents();
+        }
+
+        async function submitRegisterScanner() {
+            const name = document.getElementById('scannerName').value.trim();
+            const caps = document.getElementById('scannerCaps').value.trim();
+            if (!name) { alert('Scanner name is required.'); return; }
+            const res = await apiFetch('/scanners/register', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, capabilities: caps }),
+            });
+            if (!res) return;
+            const data = await res.json();
+
+            // Build the setup output
+            const serverUrl = window.location.origin;
+            const setupCmds = `# 1. Make sure scanner.py is on this server (it's in backend/app/scanner.py)\n# 2. Save your API key\necho "${data.api_key}" > ${name}_key.txt\n\n# 3. Run the scanner\nVAPT_AGENT_NAME=${name} \\\nVAPT_SERVER_URL=${serverUrl} \\\nVAPT_CAPABILITIES=${data.capabilities} \\\nVAPT_KEY_FILE=${name}_key.txt \\\npython3 backend/app/scanner.py`;
+
+            const serviceFile = `[Unit]\nDescription=Heimdall V-Scanner — ${name}\nAfter=network.target vapt-server.service\nWants=vapt-server.service\n\n[Service]\nType=simple\nUser=$USER\nWorkingDirectory=/opt/vapt-scanner-project\nEnvironmentFile=/opt/vapt-scanner-project/.env\nEnvironment=VAPT_AGENT_NAME=${name}\nEnvironment=VAPT_SERVER_URL=${serverUrl}\nEnvironment=VAPT_CAPABILITIES=${data.capabilities}\nEnvironment=VAPT_KEY_FILE=/opt/vapt-scanner-project/${name}_key.txt\nExecStart=/opt/vapt-scanner-project/venv/bin/python /opt/vapt-scanner-project/backend/app/scanner.py\nRestart=on-failure\nRestartSec=10\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=multi-user.target`;
+
+            document.getElementById('resultApiKey').textContent    = data.api_key;
+            document.getElementById('resultSetupCmds').textContent  = setupCmds;
+            document.getElementById('resultServiceFile').textContent = serviceFile;
+            document.getElementById('resultServiceName').textContent = name;
+
+            document.getElementById('registerScannerForm').classList.add('hidden');
+            document.getElementById('registerScannerResult').classList.remove('hidden');
+        }
+
+        function showAgentSetup(id, name, apiKey, caps) {
+            // Reuse the modal to show setup for an already-registered agent/scanner
+            document.getElementById('registerScannerBackdrop').classList.remove('hidden');
+            document.getElementById('registerScannerModal').classList.remove('hidden');
+            document.getElementById('registerScannerForm').classList.add('hidden');
+            document.getElementById('registerScannerResult').classList.remove('hidden');
+
+            const serverUrl = window.location.origin;
+            const setupCmds = `# Save API key\necho "${apiKey}" > ${name}_key.txt\n\n# Run scanner\nVAPT_AGENT_NAME=${name} \\\nVAPT_SERVER_URL=${serverUrl} \\\nVAPT_CAPABILITIES=${caps} \\\nVAPT_KEY_FILE=${name}_key.txt \\\npython3 backend/app/scanner.py`;
+
+            const serviceFile = `[Unit]\nDescription=Heimdall V-Scanner — ${name}\nAfter=network.target vapt-server.service\nWants=vapt-server.service\n\n[Service]\nType=simple\nUser=$USER\nWorkingDirectory=/opt/vapt-scanner-project\nEnvironmentFile=/opt/vapt-scanner-project/.env\nEnvironment=VAPT_AGENT_NAME=${name}\nEnvironment=VAPT_SERVER_URL=${serverUrl}\nEnvironment=VAPT_CAPABILITIES=${caps}\nEnvironment=VAPT_KEY_FILE=/opt/vapt-scanner-project/${name}_key.txt\nExecStart=/opt/vapt-scanner-project/venv/bin/python /opt/vapt-scanner-project/backend/app/scanner.py\nRestart=on-failure\nRestartSec=10\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=multi-user.target`;
+
+            document.getElementById('resultApiKey').textContent    = apiKey;
+            document.getElementById('resultSetupCmds').textContent  = setupCmds;
+            document.getElementById('resultServiceFile').textContent = serviceFile;
+            document.getElementById('resultServiceName').textContent = name;
+        }
+
+        function copyText(elementId) {
+            const el = document.getElementById(elementId);
+            navigator.clipboard.writeText(el.textContent).then(() => {
+                // Brief visual flash on the element
+                el.style.outline = '1px solid #22c55e';
+                setTimeout(() => { el.style.outline = ''; }, 800);
+            });
+        }
 
         // ── JOBS ───────────────────────────────────────────────────────────
         async function loadJobs() {
@@ -3808,18 +4278,29 @@ def dashboard():
             });
             if (anyNewlyDone && resultTab === 'active') loadResults();
 
+            pageData.jobs = data;
+            pages.jobs = 1;
+            renderJobs();
+        }
+
+        function renderJobs() {
+            const data     = pageData.jobs;
             const filtered = jobFilter === 'all' ? data : data.filter(j => j.status === jobFilter);
+            const paged    = getPage('jobs', filtered);
+
             if (!filtered.length) { document.getElementById("jobs").innerHTML = '<p class="text-gray-500 text-sm">No jobs found.</p>'; return; }
 
             let html = `<table class="w-full text-sm"><thead><tr class="text-left text-gray-400 border-b border-gray-800"><th class="pb-2 pr-3">#</th><th class="pb-2 pr-3">DB ID</th><th class="pb-2 pr-3">Type</th><th class="pb-2 pr-3">Target</th><th class="pb-2 pr-3">Status</th><th class="pb-2 pr-3">Priority</th><th class="pb-2 pr-3">Mode</th><th class="pb-2 pr-3">Profile</th><th class="pb-2 pr-3">Agent</th><th class="pb-2 pr-3">Time</th><th class="pb-2">Action</th></tr></thead><tbody>`;
-            filtered.forEach((j, idx) => {
+            paged.forEach((j, idx) => {
+                const rowNum = (pages.jobs - 1) * PAGE_SIZES.jobs + idx + 1;
                 let action;
                 if (j.cleared) action = '<span class="text-xs text-gray-500 italic">archived</span>';
                 else if (j.status === 'pending' || j.status === 'failed') action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-red-500 hover:text-red-400 transition font-medium">Delete</button>`;
                 else action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button>`;
-                html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition"><td class="py-2 pr-3 text-gray-500 text-xs">${idx + 1}</td><td class="py-2 pr-3 text-gray-500 text-xs font-mono">${j.id}</td><td class="py-2 pr-3 text-xs text-blue-300">${scanTypeLabel(j.type)}</td><td class="py-2 pr-3 font-mono text-xs">${j.target}</td><td class="py-2 pr-3" data-field="status">${statusBadge(j.status)}</td><td class="py-2 pr-3">${priorityBadge(j.priority)}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.mode}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.profile}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.agent}</td><td class="py-2 pr-3 text-xs text-gray-400 tabular-nums" id="job-time-${j.id}" data-started-at="${j.started_at || ''}">${j.status === 'running' ? elapsedDisplay(j.started_at) : formatTimestamp(j.completed_at)}</td><td class="py-2">${action}</td></tr>`;
+                html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition"><td class="py-2 pr-3 text-gray-500 text-xs">${rowNum}</td><td class="py-2 pr-3 text-gray-500 text-xs font-mono">${j.id}</td><td class="py-2 pr-3 text-xs text-blue-300">${scanTypeLabel(j.type)}</td><td class="py-2 pr-3 font-mono text-xs">${j.target}</td><td class="py-2 pr-3" data-field="status">${statusBadge(j.status)}</td><td class="py-2 pr-3">${priorityBadge(j.priority)}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.mode}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.profile}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.agent}</td><td class="py-2 pr-3 text-xs text-gray-400 tabular-nums" id="job-time-${j.id}" data-started-at="${j.started_at || ''}">${j.status === 'running' ? elapsedDisplay(j.started_at) : formatTimestamp(j.completed_at)}</td><td class="py-2">${action}</td></tr>`;
             });
             html += '</tbody></table>';
+            html += paginationBar('jobs', filtered.length);
             document.getElementById("jobs").innerHTML = html;
         }
         async function clearJob(job_id, status) {
@@ -3868,21 +4349,37 @@ def dashboard():
                 document.getElementById('customProfileWarning').classList.add('hidden');
                 payload.custom_scripts = scripts;
             }
+            if (type === "nikto_scan" && profile === 'custom') {
+                const categories = getSelectedNiktoCategories();
+                if (!categories.length) {
+                    document.getElementById('niktoCustomWarning').classList.remove('hidden');
+                    return;
+                }
+                document.getElementById('niktoCustomWarning').classList.add('hidden');
+                payload.nikto_tuning = categories;
+            }
             const res = await apiFetch('/jobs/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
             if (!res) return;
             if (res.status === 400) { const err = await res.json(); alert(`Job creation failed: ${err.detail}`); return; }
             const data = await res.json();
-            if (data.warning) alert(`Job created with warning:\\n\\n${data.warning}`);
+            if (data.warning) alert(`Job created with warning:\n\n${data.warning}`);
             document.getElementById("target").value = "";
             document.getElementById("port").value = "";
             document.getElementById("ports").value = "";
             setTimeout(loadAll, 300);
-            
-            // Reset custom profile state
+
+            // Reset custom NSE profile state
             if (type === 'nse_scan' && profile === 'custom') {
                 initCapabilityState();
                 renderCapabilityCards();
                 document.getElementById('customProfilePanel').classList.add('hidden');
+                document.getElementById('profile').value = 'standard';
+            }
+            // Reset custom Nikto profile state
+            if (type === 'nikto_scan' && profile === 'custom') {
+                initNiktoCategoryState();
+                renderNiktoCategoryCards();
+                document.getElementById('niktoCustomPanel').classList.add('hidden');
                 document.getElementById('profile').value = 'standard';
             }
         }
@@ -4004,9 +4501,22 @@ def dashboard():
             const res = await apiFetch(isHistory ? '/results?show_history=true' : '/results');
             if (!res) return;
             const data = await res.json();
-            if (!data.length) { document.getElementById("results").innerHTML = `<p class="text-gray-500 text-sm">${isHistory ? 'No archived results.' : 'No results yet.'}</p>`; return; }
-            
-            const html = data.slice().sort((a, b) => b.id - a.id).map(r => {
+            pageData.results = data.slice().sort((a, b) => b.id - a.id);
+            pages.results = 1;
+            renderResults();
+        }
+
+        function renderResults() {
+            const isHistory = resultTab === 'history';
+            const data  = pageData.results;
+            const paged = getPage('results', data);
+
+            if (!data.length) {
+                document.getElementById("results").innerHTML = `<p class="text-gray-500 text-sm">${isHistory ? 'No archived results.' : 'No results yet.'}</p>`;
+                return;
+            }
+
+            const html = paged.map(r => {
                 const out = r.output;
  
                 // ── Counts ────────────────────────────────────────────────
@@ -4185,15 +4695,36 @@ def dashboard():
                             : '<div class="mb-2"><span class="text-xs text-gray-600 italic">Analysis pending — click Analyse above to generate assessment</span></div>'
                           )
                     + '</div>'
- 
+
                 + '</div>';
             }).join('');
-            document.getElementById("results").innerHTML = html;
+            document.getElementById("results").innerHTML = html + paginationBar('results', data.length);
         }
 
         // ── DISCOVERY ──────────────────────────────────────────────────────
         function dismissSweepStatus() { document.getElementById("sweepStatus").classList.add('hidden'); }
         function dismissPingResults() { document.getElementById("pingResults").classList.add('hidden'); }
+
+        async function cancelActiveSweep() {
+            if (!activeSweepId) return;
+            const sweepId = activeSweepId;
+            // Stop polling immediately so we don't race with the status update
+            if (sweepPollInterval) { clearInterval(sweepPollInterval); sweepPollInterval = null; }
+            activeSweepId = null;
+            document.getElementById('cancelSweepBtn').classList.add('hidden');
+            showSweepStatus('Cancelling sweep…', 'bg-yellow-400 animate-pulse');
+            try {
+                const res = await apiFetch(`/discover/${sweepId}/cancel`, { method: 'POST' });
+                if (res && res.ok) {
+                    showSweepStatus('Sweep cancelled.', 'bg-yellow-400');
+                } else {
+                    showSweepStatus('Cancel request failed — sweep may have already finished.', 'bg-red-500');
+                }
+            } catch(e) {
+                showSweepStatus('Cancel request failed.', 'bg-red-500');
+            }
+            loadSweepHistory();
+        }
 
         function showSweepStatus(text, color = 'bg-cyan-400') {
             const el = document.getElementById("sweepStatus");
@@ -4229,6 +4760,7 @@ def dashboard():
         }
 
         let sweepPollInterval = null;
+        let activeSweepId = null;
 
         async function startSweep() {
             const subnet = document.getElementById("discoverSubnet").value.trim();
@@ -4335,17 +4867,31 @@ def dashboard():
             if (!res) return;
             const data = await res.json();
 
+            // Track the active sweep so cancelActiveSweep() knows which one to cancel
+            activeSweepId = data.sweep_id;
+            document.getElementById('cancelSweepBtn').classList.remove('hidden');
+
             sweepPollInterval = setInterval(async () => {
                 const r = await apiFetch(`/discover/${data.sweep_id}`);
                 if (!r) return;
                 const s = await r.json();
                 if (s.status === 'done') {
-                    clearInterval(sweepPollInterval);
+                    clearInterval(sweepPollInterval); sweepPollInterval = null;
+                    activeSweepId = null;
+                    document.getElementById('cancelSweepBtn').classList.add('hidden');
                     showSweepStatus(`Sweep complete — ${s.hosts_found} host(s) found, ${s.jobs_created} job(s) created`, 'bg-green-400');
                     loadSweepHistory(); loadJobs();
                 } else if (s.status === 'failed') {
-                    clearInterval(sweepPollInterval);
+                    clearInterval(sweepPollInterval); sweepPollInterval = null;
+                    activeSweepId = null;
+                    document.getElementById('cancelSweepBtn').classList.add('hidden');
                     showSweepStatus('Sweep failed. Check server logs.', 'bg-red-500');
+                    loadSweepHistory();
+                } else if (s.status === 'cancelled') {
+                    clearInterval(sweepPollInterval); sweepPollInterval = null;
+                    activeSweepId = null;
+                    document.getElementById('cancelSweepBtn').classList.add('hidden');
+                    showSweepStatus('Sweep cancelled.', 'bg-yellow-400');
                     loadSweepHistory();
                 }
             }, 3000);
@@ -4355,22 +4901,105 @@ def dashboard():
             const res = await apiFetch('/discover');
             if (!res) return;
             const sweeps = await res.json();
-            const el = document.getElementById("sweepHistory");
+            pageData.sweeps = sweeps;
+            pages.sweeps = 1;
+            renderSweeps();
+        }
+
+        function renderSweeps() {
+            const el     = document.getElementById("sweepHistory");
+            const sweeps = pageData.sweeps;
             if (!sweeps.length) { el.innerHTML = '<p class="text-gray-600 text-xs">No sweeps yet.</p>'; return; }
-            const statusColor = { running: 'text-blue-400', done: 'text-green-400', failed: 'text-red-400' };
-            const rows = sweeps.map(s => `<tr class="border-b border-gray-800 hover:bg-gray-800 transition text-xs">
-            <td class="py-2 pr-4 text-gray-400">#${s.id}</td>
-            <td class="py-2 pr-4 font-mono">${s.subnet}</td>
-            <td class="py-2 pr-4 ${statusColor[s.status] || 'text-gray-400'}">${s.status}</td>
-            <td class="py-2 pr-4 text-gray-300">${s.hosts_found} host(s)</td>
-            <td class="py-2 pr-4 text-gray-300">${s.jobs_created} job(s)</td>
-            <td class="py-2 pr-4 text-gray-500">${formatTimestamp(s.started_at)}</td>
-            <td class="py-2"><button onclick="deleteSweep(${s.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button></td></tr>`).join('');
+            const paged = getPage('sweeps', sweeps);
+            const statusColor = { running: 'text-blue-400', done: 'text-green-400', failed: 'text-red-400', cancelled: 'text-yellow-400' };
+            const rows = paged.map(s => {
+                const viewBtn = (s.status === 'done' && s.jobs_created > 0)
+                    ? `<button onclick="viewSweepResults(${s.id})" class="text-xs text-cyan-400 hover:text-cyan-300 transition mr-3">View Results</button>`
+                    : '';
+                return `<tr class="border-b border-gray-800 hover:bg-gray-800 transition text-xs">
+                <td class="py-2 pr-4 text-gray-400">#${s.id}</td>
+                <td class="py-2 pr-4 font-mono">${s.subnet}</td>
+                <td class="py-2 pr-4 ${statusColor[s.status] || 'text-gray-400'}">${s.status}</td>
+                <td class="py-2 pr-4 text-gray-300">${s.hosts_found} host(s)</td>
+                <td class="py-2 pr-4 text-gray-300">${s.jobs_created} job(s)</td>
+                <td class="py-2 pr-4 text-gray-500">${formatTimestamp(s.started_at)}</td>
+                <td class="py-2 whitespace-nowrap">${viewBtn}<button onclick="deleteSweep(${s.id})" class="text-xs text-red-400 hover:text-red-300 transition">Delete</button></td></tr>`;
+            }).join('');
             el.innerHTML = `<table class="w-full text-sm"><thead>
             <tr class="text-left text-gray-500 border-b border-gray-800">
             <th class="pb-2 pr-4">ID</th><th class="pb-2 pr-4">Subnet</th><th class="pb-2 pr-4">Status</th><th class="pb-2 pr-4">Hosts</th>
             <th class="pb-2 pr-4">Jobs</th><th class="pb-2 pr-4">Started</th>
-            <th class="pb-2">Action</th></tr></thead><tbody>${rows}</tbody></table>`;
+            <th class="pb-2">Actions</th></tr></thead><tbody>${rows}</tbody></table>`
+            + paginationBar('sweeps', sweeps.length);
+        }
+
+        async function viewSweepResults(sweepId) {
+            const panel = document.getElementById('sweepResultPanel');
+            const body  = document.getElementById('sweepResultBody');
+            body.innerHTML = '<p class="text-gray-500 text-xs animate-pulse">Loading…</p>';
+            panel.classList.remove('hidden');
+
+            const res = await apiFetch(`/sweeps/${sweepId}/results`);
+            if (!res) { body.innerHTML = '<p class="text-red-400 text-xs">Failed to load results.</p>'; return; }
+            const data = await res.json();
+
+            document.getElementById('sweepResultTitle').textContent = `Sweep #${data.sweep_id} — ${data.subnet}`;
+
+            if (!data.hosts || data.hosts.length === 0) {
+                body.innerHTML = '<p class="text-gray-500 text-xs">No jobs were created for this sweep.</p>';
+                return;
+            }
+
+            const statusBadge = s => {
+                const map = { done: 'text-green-400', pending: 'text-blue-400', running: 'text-cyan-400', failed: 'text-red-400' };
+                return `<span class="${map[s] || 'text-gray-400'}">${s}</span>`;
+            };
+
+            const rows = data.hosts.map(h => {
+                // Summarise open ports if available
+                let portSummary = '—';
+                if (h.output && h.output.nmap && h.output.nmap.ports) {
+                    const open = h.output.nmap.ports.filter(p => p.state === 'open');
+                    portSummary = open.length ? open.map(p => `${p.port}/${p.protocol}`).join(', ') : 'None open';
+                }
+
+                // Count findings
+                let findings = '—';
+                if (h.output && h.output.nse) {
+                    const f = h.output.nse.findings;
+                    findings = Array.isArray(f) ? `${f.length} finding${f.length !== 1 ? 's' : ''}` : '—';
+                }
+
+                const resultLink = h.result_id
+                    ? `<button onclick="closeSweepResultPanel(); switchTab('results'); setTimeout(()=>{ const el=document.getElementById('result-${h.result_id}'); if(el){ el.scrollIntoView({behavior:'smooth'}); el.classList.add('ring-1','ring-cyan-500'); setTimeout(()=>el.classList.remove('ring-1','ring-cyan-500'),2000); }},300);" class="text-xs text-cyan-400 hover:text-cyan-300 transition">View</button>`
+                    : '<span class="text-gray-600 text-xs">—</span>';
+
+                return `<tr class="border-b border-gray-800 hover:bg-gray-800 transition text-xs">
+                    <td class="py-2 pr-4 font-mono text-gray-200">${h.target}</td>
+                    <td class="py-2 pr-4">${statusBadge(h.status)}</td>
+                    <td class="py-2 pr-4 text-gray-400 font-mono text-xs max-w-xs truncate" title="${portSummary}">${portSummary}</td>
+                    <td class="py-2 pr-4 text-gray-400">${findings}</td>
+                    <td class="py-2 pr-4 text-gray-500">${h.completed_at ? formatTimestamp(h.completed_at) : '—'}</td>
+                    <td class="py-2">${resultLink}</td>
+                </tr>`;
+            }).join('');
+
+            body.innerHTML = `
+                <table class="w-full text-sm">
+                    <thead><tr class="text-left text-gray-500 border-b border-gray-800 text-xs">
+                        <th class="pb-2 pr-4">Host</th>
+                        <th class="pb-2 pr-4">Status</th>
+                        <th class="pb-2 pr-4">Open Ports</th>
+                        <th class="pb-2 pr-4">Findings</th>
+                        <th class="pb-2 pr-4">Completed</th>
+                        <th class="pb-2">Result</th>
+                    </tr></thead>
+                    <tbody>${rows}</tbody>
+                </table>`;
+        }
+
+        function closeSweepResultPanel() {
+            document.getElementById('sweepResultPanel').classList.add('hidden');
         }
 
         async function deleteSweep(sweep_id) {

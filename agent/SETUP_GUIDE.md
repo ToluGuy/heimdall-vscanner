@@ -48,6 +48,8 @@ python3 agent.py
 
 The agent registers automatically on first run and saves its API key to a local file (`{agent-name}_key.txt`). If this file is deleted, the agent re-registers as a new entry on the server.
 
+If an agent goes offline and comes back, it automatically clears its own stale flag on the next heartbeat — no manual intervention needed in the dashboard.
+
 ### Environment variables
 
 | Variable | Description | Default |
@@ -109,7 +111,7 @@ The `setup_agent.ps1` script handles the full setup in one go.
 - Creates Desktop shortcuts for both the agent and the local scanner
 - Optionally installs the agent as a Windows service via NSSM (runs at startup)
 
-Nikto is not included in the Windows agent setup — it requires Perl, which is an unnecessary dependency for most Windows endpoints. The agent is configured with `nmap_scan,nse_scan` capabilities by default.
+Nikto is not included in the Windows agent setup — it requires Perl, which is an unnecessary dependency for most Windows endpoints. The agent is configured with `nmap_scan,nse_scan` capabilities by default. Linux agents with Nikto installed handle `nikto_scan` jobs correctly.
 
 ### How to run it
 
@@ -159,10 +161,8 @@ Results live in memory for the duration of the session and can be exported as JS
 
 ### Supported scan types
 
-- **Nmap Scan** — Port discovery and service detection
-- **NSE Scan** — Nmap Scripting Engine vulnerability checks against non-web ports
-
-Nikto is not included in the local scanner — it requires Perl, which is not a dependency we want to impose on endpoints.
+- **Open Port Scan** — Port discovery and service detection. Automatically runs a Nikto web scan on any web ports found, if Nikto is installed.
+- **Vulnerability Scan** — Nmap Scripting Engine checks against discovered services.
 
 ### Run it
 
@@ -197,9 +197,9 @@ When registering an agent, the `VAPT_CAPABILITIES` variable controls which job t
 
 | Capability | Tool | Notes |
 |------------|------|-------|
-| `nmap_scan` | Nmap + Nikto | Port scan; Nikto auto-runs on any web ports found |
-| `nikto_scan` | Nikto | Standalone web scan against a specified port |
-| `nse_scan` | Nmap NSE | Script-based vulnerability scan; web ports excluded |
+| `nmap_scan` | Nmap + Nikto | Open Port Scan; Nikto auto-runs on any web ports found |
+| `nikto_scan` | Nikto | Standalone Web Scan against a specified port; target can be an IP, hostname, or URL |
+| `nse_scan` | Nmap NSE | Vulnerability Scan; all discovered ports are scanned, with a blue advisory shown if web ports are included |
 
 For Windows agents, set `VAPT_CAPABILITIES=nmap_scan,nse_scan` (omit `nikto_scan` unless Perl and Nikto are installed).
 
@@ -208,7 +208,7 @@ For Windows agents, set `VAPT_CAPABILITIES=nmap_scan,nse_scan` (omit `nikto_scan
 ## Troubleshooting
 
 **Agent shows offline in the dashboard**
-The heartbeat timeout is 30 seconds. If the agent has not sent a heartbeat within that window it shows offline. Check that the agent process is running and that port 8000 on the server is reachable from the endpoint.
+The heartbeat timeout is 30 seconds. If the agent has not sent a heartbeat within that window it shows offline. Check that the agent process is running and that port 8000 on the server is reachable from the endpoint. When the agent comes back online, it will automatically clear its stale flag on the next heartbeat.
 
 **`nmap: command not found`**
 Install Nmap and ensure it is on the system PATH. On Linux: `sudo apt install nmap`. On Windows: download from nmap.org and tick "Add to PATH" during install, or restart PowerShell after installation.

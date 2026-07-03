@@ -44,6 +44,8 @@ class Job(Base):
     port = Column(Integer, nullable=True)        # single port — used by nikto_scan
     ports = Column(String, nullable=True)        # comma-separated — used by nse_scan and multi-port nikto
     custom_scripts = Column(String, nullable=True)  # comma-separated NSE script names — used when profile='custom'
+    nikto_tuning = Column(String, nullable=True)    # comma-separated Nikto tuning categories — used when profile='custom' on nikto_scan
+    sweep_id = Column(Integer, ForeignKey("discovery_sweeps.id"), nullable=True)  # set when job was created by a sweep
     cleared = Column(Boolean, default=False)
 
 

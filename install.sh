@@ -312,6 +312,22 @@ BEGIN
 
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
+        WHERE table_name='jobs' AND column_name='sweep_id'
+    ) THEN
+        ALTER TABLE jobs ADD COLUMN sweep_id INTEGER REFERENCES discovery_sweeps(id) ON DELETE SET NULL;
+        RAISE NOTICE 'Added jobs.sweep_id';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='jobs' AND column_name='nikto_tuning'
+    ) THEN
+        ALTER TABLE jobs ADD COLUMN nikto_tuning VARCHAR;
+        RAISE NOTICE 'Added jobs.nikto_tuning';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
         WHERE table_name='agents' AND column_name='is_stale'
     ) THEN
         ALTER TABLE agents ADD COLUMN is_stale BOOLEAN DEFAULT FALSE;

@@ -28,7 +28,7 @@ Heimdall chains three tools together automatically:
 
 - **Nmap** — Port discovery and service detection. Runs first on every scan.
 - **Nikto** — Web vulnerability scanning. Triggered automatically when Nmap finds open web ports.
-- **NSE (Nmap Scripting Engine)** — Vulnerability script scanning against non-web services (SSH, SMB, RDP, databases, etc.).
+- **NSE (Nmap Scripting Engine)** — Vulnerability script scanning against discovered services.
 
 The dashboard uses plain language for scan types. The internal names (used in the API and database) are shown in brackets for reference.
 
@@ -38,9 +38,9 @@ The dashboard uses plain language for scan types. The internal names (used in th
 
 | Dashboard label | Internal name | Description |
 |-----------------|---------------|-------------|
-| Port Scan | `nmap_scan` | Discovers open ports; automatically runs a fast Web Scan (light profile) on any web ports found. To run a thorough web scan, create a Web Scan job explicitly. |
-| Web Scan | `nikto_scan` | Standalone web vulnerability scan against a specific port |
-| Vulnerability Scan | `nse_scan` | Script-based vulnerability checks against non-web services; web ports are excluded |
+| Open Port Scan | `nmap_scan` | Discovers open ports and services. If web ports (80, 443, 8080, etc.) are found, Nikto runs automatically on each one before the job completes. This can be disabled from the Settings panel if you want faster port scans without the web scan overhead. |
+| Web Scan | `nikto_scan` | Standalone web vulnerability scan against a specific port. The target field accepts an IP, hostname, or full URL. |
+| Vulnerability Scan | `nse_scan` | Script-based vulnerability checks against discovered services. Web ports are included — a blue advisory is shown in the result if web ports are scanned, suggesting a dedicated Web Scan for deeper coverage. |
 
 ## Scan Profiles
 
@@ -49,6 +49,17 @@ The dashboard uses plain language for scan types. The internal names (used in th
 | Light | `-F` | `-Tuning 1` | `safe` | Top 100 ports, fast, non-intrusive |
 | Standard | `-sV` | default | `vuln` | Top 1000 ports with service detection |
 | Full | `-sV -O -p-` | `-Tuning x6` | `vuln,exploit` ⚠️ | All ports, deep scan — exploit scripts are intrusive |
+| Custom | user-defined | user-defined | user-defined | Select individual NSE scripts (Vulnerability Scan) or Nikto test categories (Web Scan) from the capability cards in the dashboard |
+
+---
+
+## Network Discovery (Sweep)
+
+The Network Discovery tab lets you sweep a subnet in CIDR notation (e.g. `192.168.1.0/24`) to find live hosts before assigning scan jobs.
+
+- **Ping** — Fast host discovery with no job creation. Use it to preview what's on the network before committing to a full sweep.
+- **Sweep** — Full discovery that creates an Open Port Scan job for every live host found. Once a sweep is running, a **Cancel Sweep** button appears in the status bar — clicking it stops job creation even if Nmap has already finished scanning.
+- **Sweep history** — All completed sweeps are listed with host and job counts. Click **View Results** on any completed sweep to see a host-by-host summary of port findings and vulnerability counts, with a direct link to jump to each individual result card.
 
 ---
 
@@ -173,6 +184,9 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS next_run_at TIMESTAMP;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS port INTEGER;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ports VARCHAR;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS custom_scripts VARCHAR;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS nikto_tuning VARCHAR;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sweep_id INTEGER REFERENCES discovery_sweeps(id) ON DELETE SET NULL;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS is_stale BOOLEAN DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS schedules (
@@ -294,16 +308,17 @@ Access the dashboard at `/dashboard`. You will be prompted for credentials on fi
 
 From the dashboard you can:
 
-- **Network Discovery** — Sweep a subnet in CIDR notation to find live hosts; review results before assigning scan jobs
+- **Network Discovery** — Sweep a subnet in CIDR notation to find live hosts; ping first to preview, then sweep to create jobs. Cancel a running sweep at any time from the status bar. View grouped results per sweep showing all hosts, ports, and findings in one place.
 - **Schedules** — Set up recurring scans on a configurable interval; pause, resume, or delete schedules at any time
-- **Create Jobs** — Submit scan jobs manually for any IP, with control over scan type, profile, mode, and priority
-- **Agents** — Monitor registered agents, their online/offline status, and last heartbeat; show or hide stale agents; restore or dismiss them
-- **Jobs** — View the job queue with live elapsed timers on running jobs; filter by status; delete pending and failed jobs in bulk
-- **Scan Results** — Expand results to view port tables, vulnerability findings, and web scan findings; toggle between active results and history
+- **Create Jobs** — Submit scan jobs manually for any IP, hostname, or URL; control scan type, profile, mode, and priority. Select the Custom profile to choose individual NSE scripts or Nikto test categories.
+- **Agents** — Monitor registered agents and scanners, their online/offline status, capabilities, and last heartbeat. Register new scanner instances directly from the dashboard with the **+ Register Scanner** button — generates an API key and ready-to-use setup commands and systemd service file. Click **Setup** on any existing agent to retrieve its setup commands again. Show or hide stale agents; restore or dismiss them.
+- **Jobs** — View the job queue with live elapsed timers on running jobs; filter by status; delete pending and failed jobs in bulk. All tabs are paginated — use the navigation bar at the bottom of each panel to move between pages or change the number of items shown (10 / 20 / 50).
+- **Scan Results** — Expand results to view port tables, vulnerability findings, and web scan findings; toggle between active results and history. Results are paginated (10 per page by default).
 - **Insights** — Analytics dashboard showing scan activity over time, risk distribution, and per-host drilldowns
 - **Topology** — Interactive D3 network map showing all discovered hosts, clustered by subnet, coloured by risk level
 - **Reports** — Generate a printable HTML report for any scan result, exportable as PDF via the browser print dialog
 - **Export** — Download scan results as structured JSON, individually or in bulk
+- **Settings** — Toggle AI auto-analysis and the auto-Nikto web scan on/off at runtime; configure the stale agent threshold
 
 ---
 
@@ -361,7 +376,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 python3 agent/local_scanner.py
 ```
 
-Opens a browser-based scan UI at `http://127.0.0.1:9731`. Supports Port Scans and Vulnerability Scans. Results live in memory for the session and can be exported as JSON before closing.
+Opens a browser-based scan UI at `http://127.0.0.1:9731`. Supports Open Port Scans and Vulnerability Scans. Results live in memory for the session and can be exported as JSON before closing.
 
 ---
 
@@ -376,6 +391,8 @@ Schedules fire immediately on creation, then repeat at the configured interval. 
 ## Stale Agent Cleanup
 
 Agents that have not sent a heartbeat within the configurable threshold (default 24 hours) are automatically flagged as stale by a background cleanup thread. Stale agents are hidden from the default agents view but can be shown via the "Show Stale" toggle. From there they can be restored or permanently dismissed.
+
+When an agent comes back online and sends a heartbeat, its stale flag is automatically cleared — it returns to the active agents list without any manual intervention.
 
 The threshold can be adjusted from the Settings panel in the dashboard, or by setting `STALE_AGENT_HOURS` in `.env`.
 
@@ -474,7 +491,7 @@ GRANT USAGE, SELECT ON SEQUENCE schedules_id_seq TO vapt_user;
 Caused by a CIRT.net update prompt in Nikto 2.6.x. The scanner suppresses it automatically with `input="n\n"`. If scans still hang, check Nikto is installed correctly with `nikto -Version`.
 
 **Vulnerability Scan returns no findings**
-Normal if the target has no non-web services running on discoverable ports. Vulnerability Scans deliberately skip web ports (80, 443, 8080, 8443, 8000, 8888) — use a Web Scan for web surface testing.
+Normal if the target has no vulnerable services running on discoverable ports. If you were expecting web findings, note that Vulnerability Scan will include web ports but a dedicated Web Scan will give deeper coverage — this is shown as a blue advisory in the result.
 
 **Port 8000 unreachable from agents**
 Check the server firewall: `sudo ufw status`. If active, run `sudo ufw allow 8000/tcp`.

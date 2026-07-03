@@ -574,8 +574,11 @@ def run_custom_nse(target: str, scripts: list[str]) -> dict:
 
 # --- NIKTO ---
 
-def get_nikto_flags(profile: str) -> list:
-    if profile == "light":
+def get_nikto_flags(profile: str, nikto_tuning: list = None) -> list:
+    if profile == "custom" and nikto_tuning:
+        # Join selected tuning codes into a single string e.g. "049" for categories 0, 4, 9
+        return ["-Tuning", "".join(nikto_tuning)]
+    elif profile == "light":
         return ["-Tuning", "1"]
     elif profile == "full":
         return ["-Tuning", "x6"]
@@ -583,10 +586,10 @@ def get_nikto_flags(profile: str) -> list:
         return []
 
 
-def run_nikto(target: str, port: int, profile: str = "standard") -> dict:
+def run_nikto(target: str, port: int, profile: str = "standard", nikto_tuning: list = None) -> dict:
     logger.info(f"Running Nikto ({profile}) on {target}:{port}")
 
-    flags = get_nikto_flags(profile)
+    flags = get_nikto_flags(profile, nikto_tuning)
 
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         tmp_path = tmp.name
@@ -634,6 +637,8 @@ def execute_job(job: dict, api_key: str):
     port = job.get("port")            # single port (nikto_scan)
     ports = job.get("ports")          # comma-separated (nse_scan / multi-port nikto)
     custom_scripts = job.get("custom_scripts")  # list of script names (custom profile)
+    nikto_tuning = job.get("nikto_tuning")      # list of tuning category codes (custom nikto profile)
+    auto_nikto = job.get("auto_nikto", True)    # whether to auto-run Nikto after nmap_scan
 
     if mode != "remote":
         logger.info(f"Job {job_id} is mode='{mode}', not for this scanner")
@@ -655,8 +660,8 @@ def execute_job(job: dict, api_key: str):
 
             output = {"nmap": nmap_output}
 
-            if web_ports:
-                logger.info(f"Web ports found: {web_ports} — running Nikto")
+            if web_ports and auto_nikto:
+                logger.info(f"Web ports found: {web_ports} — running Nikto (auto_nikto=on)")
                 nikto_results = {}
                 for wp in web_ports:
                     if wp in NIKTO_SKIP_PORTS:
@@ -668,13 +673,15 @@ def execute_job(job: dict, api_key: str):
                         nikto_results[str(wp)] = {"error": str(e)}
                 if nikto_results:
                     output["nikto"] = nikto_results
+            elif web_ports and not auto_nikto:
+                logger.info(f"Web ports found: {web_ports} — skipping Nikto (auto_nikto=off)")
             else:
                 logger.debug(f"No web ports found on {target}, skipping Nikto")
 
         elif job_type == "nikto_scan":
             scan_port = int(port) if port else 80
             logger.info(f"Standalone Nikto scan on {target}:{scan_port}")
-            nikto_result = run_nikto(target, scan_port, profile)
+            nikto_result = run_nikto(target, scan_port, profile, nikto_tuning)
             output = {"nikto": {str(scan_port): nikto_result}}
 
         elif job_type == "nse_scan":
