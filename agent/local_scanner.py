@@ -520,7 +520,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="panel-body">
       <div class="form-grid">
         <div class="field">
-          <label>Target IP / Host</label>
+          <label id="targetLabel">Target IP / Host</label>
           <input id="target" type="text" placeholder="192.168.1.1">
         </div>
         <div class="field">
@@ -672,7 +672,7 @@ function initCapState() {
   capState = {};
   CUSTOM_CAPABILITIES.forEach(cap => {
     capState[cap.id] = {};
-    cap.scripts.forEach(s => { capState[cap.id][s.id] = false; });
+    cap.scripts.forEach(s => { capState[cap.id][s.id] = s.def; });
   });
 }
 
@@ -683,7 +683,7 @@ function getSelectedScripts() {
       if (capState[cap.id]?.[s.id]) out.push(s.id);
     });
   });
-  return out;
+  return [...new Set(out)];
 }
 
 function updateScriptCount() {
@@ -787,6 +787,11 @@ function onTypeChange() {
     profileSel.value = 'standard';
   }
   document.getElementById('portsField').classList.toggle('visible', type === 'nse_scan' && profile !== 'custom');
+  // Nikto accepts URLs; nmap/nse accept IP or hostname only
+  const targetInput = document.getElementById('target');
+  const targetLabel = document.getElementById('targetLabel');
+  if (targetInput) targetInput.placeholder = '192.168.1.1';
+  if (targetLabel) targetLabel.textContent  = 'Target IP / Host';
   updateExploitWarn();
   updateCustomPanel();
 }
@@ -915,7 +920,7 @@ function toggleSelect(id) {
   else selectedIds.add(id);
 }
 
-function buildSummary(out) {
+function buildSummary(out, scan_type) {
   const pills = [];
   if (out.nmap) {
     const open = out.nmap.reduce((a, h) => a + h.ports.filter(p => p.state === 'open').length, 0);
@@ -923,7 +928,9 @@ function buildSummary(out) {
   }
   if (out.nse) {
     const n = (out.nse.findings || []).length;
-    if (n > 0) pills.push(`<span class="pill pill-vuln">${n} vulnerability finding${n !== 1 ? 's' : ''}</span>`);
+    pills.push(`<span class="pill pill-vuln">${n} vuln finding${n !== 1 ? 's' : ''}</span>`);
+  } else if (scan_type === 'nse_scan') {
+    pills.push(`<span class="pill pill-vuln">0 vuln findings</span>`);
   }
   if (out.error) pills.push('<span class="pill pill-error">error</span>');
   return pills.length ? `<div class="pills">${pills.join('')}</div>` : '';
@@ -951,7 +958,7 @@ function renderResults() {
   body.innerHTML = results.map((r, idx) => {
     const num     = results.length - idx;
     const out     = r.output || {};
-    const summary = buildSummary(out);
+    const summary = buildSummary(out, r.scan_type);
     const statusCls = r.status === 'done' ? 'badge-done' : 'badge-failed';
     // Show both scan counter and session ID
     const profileLabel = r.profile === 'custom' ? 'Custom' : r.profile;
