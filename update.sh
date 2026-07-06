@@ -252,6 +252,35 @@ log "Migrations complete"
 
 section "Restart Services"
 
+# ── Ensure sudoers rule for scanner auto-spawn is present ─────────────────────
+SUDOERS_FILE="/etc/sudoers.d/vapt-scanner-spawn"
+if [[ ! -f "$SUDOERS_FILE" ]]; then
+    CURRENT_USER="$(whoami)"
+    cat > /tmp/vapt-sudoers <<EOF
+# Heimdall V-Scanner — scanner auto-spawn permissions
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl start vapt-scanner-*
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop vapt-scanner-*
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl enable vapt-scanner-*
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl disable vapt-scanner-*
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl daemon-reload
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/mv /tmp/vapt-scanner-*.service /etc/systemd/system/
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/rm -f /etc/systemd/system/vapt-scanner-*.service
+EOF
+    if visudo -c -f /tmp/vapt-sudoers 2>/dev/null; then
+        sudo mv /tmp/vapt-sudoers "$SUDOERS_FILE"
+        sudo chmod 440 "$SUDOERS_FILE"
+        log "Sudoers rule installed for scanner auto-spawn"
+        ENV_FILE="$(dirname "$(realpath "$0")")/.env"
+        if [[ -f "$ENV_FILE" ]] && ! grep -q "SCANNER_AUTOSTART" "$ENV_FILE"; then
+            echo "SCANNER_AUTOSTART=true" >> "$ENV_FILE"
+            log "SCANNER_AUTOSTART=true added to .env"
+        fi
+    else
+        warn "Could not install sudoers rule — scanner auto-spawn will require manual setup"
+        rm -f /tmp/vapt-sudoers
+    fi
+fi
+
 # Only restart services that are actually installed and enabled
 for svc in vapt-server vapt-scanner; do
     if systemctl is-enabled --quiet "$svc" 2>/dev/null; then

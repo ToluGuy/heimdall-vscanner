@@ -420,7 +420,7 @@ Type=simple
 User=${CURRENT_USER}
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
-Environment=VAPT_AGENT_NAME=scanner-1
+Environment=VAPT_AGENT_NAME=scanner-default
 Environment=VAPT_SERVER_URL=http://127.0.0.1:8000
 Environment=VAPT_CAPABILITIES=nmap_scan,nikto_scan,nse_scan
 ExecStart=${PYTHON_BIN} ${INSTALL_DIR}/backend/app/scanner.py
@@ -438,6 +438,30 @@ sudo mv /tmp/vapt-scanner.service /etc/systemd/system/vapt-scanner.service
 sudo systemctl daemon-reload
 
 log "Service files installed"
+
+# ── Sudoers rule for scanner auto-spawn ──────────────────────────────────────
+SUDOERS_FILE="/etc/sudoers.d/vapt-scanner-spawn"
+cat > /tmp/vapt-sudoers <<EOF
+# Heimdall V-Scanner — scanner auto-spawn permissions
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl start vapt-scanner-*
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop vapt-scanner-*
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl enable vapt-scanner-*
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl disable vapt-scanner-*
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl daemon-reload
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/mv /tmp/vapt-scanner-*.service /etc/systemd/system/
+${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/rm -f /etc/systemd/system/vapt-scanner-*.service
+EOF
+if visudo -c -f /tmp/vapt-sudoers 2>/dev/null; then
+    sudo mv /tmp/vapt-sudoers "$SUDOERS_FILE"
+    sudo chmod 440 "$SUDOERS_FILE"
+    log "Sudoers rule installed — dashboard can auto-spawn scanner instances"
+    if ! grep -q "SCANNER_AUTOSTART" "$ENV_FILE"; then
+        echo "SCANNER_AUTOSTART=true" >> "$ENV_FILE"
+    fi
+else
+    warn "Could not install sudoers rule — scanner auto-spawn will require manual setup"
+    rm -f /tmp/vapt-sudoers
+fi
 
 read -rp "  Start and enable services now? [Y/n]: " start_services
 if [[ ! "$start_services" =~ ^[Nn]$ ]]; then
@@ -944,7 +968,7 @@ Type=simple
 User=${CURRENT_USER}
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
-Environment=VAPT_AGENT_NAME=scanner-1
+Environment=VAPT_AGENT_NAME=scanner-default
 Environment=VAPT_SERVER_URL=http://127.0.0.1:8000
 Environment=VAPT_CAPABILITIES=nmap_scan,nikto_scan,nse_scan
 ExecStart=${PYTHON_BIN} ${INSTALL_DIR}/backend/app/scanner.py
