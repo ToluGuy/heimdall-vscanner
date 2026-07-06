@@ -251,6 +251,21 @@ def send_job_status(api_key: str, job_id: int, status: str):
     )
 
 
+def is_job_cancelled(api_key: str, job_id: int) -> bool:
+    """Poll the server to check if a job has been cancelled mid-execution."""
+    try:
+        res = requests.get(
+            f"{SERVER_URL}/jobs/{job_id}/status",
+            headers={"x-api-key": api_key},
+            timeout=5,
+        )
+        if res.status_code == 200:
+            return res.json().get("status") == "cancelled"
+    except Exception:
+        pass
+    return False
+
+
 def send_heartbeat(api_key):
     headers = {"x-api-key": api_key}
 
@@ -636,6 +651,12 @@ def execute_job(job: dict, api_key: str):
 
             output = {"nmap": nmap_output}
 
+            # Check for cancellation before starting Nikto (which can be slow)
+            if is_job_cancelled(api_key, job_id):
+                logger.info(f"Job {job_id} was cancelled — stopping after nmap")
+                send_job_status(api_key, job_id, "cancelled")
+                return
+
             if web_ports and auto_nikto:
                 logger.info(f"Web ports found: {web_ports} — running Nikto (auto_nikto=on)")
                 nikto_results = {}
@@ -698,6 +719,22 @@ def heartbeat_loop(api_key):
         _time.sleep(10)
 
 
+def recover_interrupted_jobs(api_key: str):
+    """Mark any jobs left 'running' by this agent on a previous run as failed."""
+    try:
+        res = requests.post(
+            f"{SERVER_URL}/agents/recover",
+            headers={"x-api-key": api_key},
+            timeout=10,
+        )
+        if res.status_code == 200:
+            recovered = res.json().get("recovered", 0)
+            if recovered:
+                logger.warning(f"Crash recovery: marked {recovered} interrupted job(s) as failed")
+    except Exception as e:
+        logger.debug(f"Crash recovery check failed: {e}")
+
+
 def main():
     api_key = load_api_key()
 
@@ -705,6 +742,9 @@ def main():
         api_key = register()
 
     logger.info(f"Starting job polling as '{AGENT_NAME}'...")
+
+    # Recover any jobs left 'running' from a previous crash
+    recover_interrupted_jobs(api_key)
 
     hb_thread = threading.Thread(target=heartbeat_loop, args=(api_key,), daemon=True)
     hb_thread.start()
