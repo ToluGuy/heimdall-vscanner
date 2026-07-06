@@ -29,6 +29,17 @@ STALE_AGENT_HOURS = int(os.environ.get("STALE_AGENT_HOURS", "24"))
 
 SCHEDULE_TICK_SECONDS = 60   # how often the scheduler wakes up to check
 
+# ── Scanner auto-spawn settings ───────────────────────────────────────────────
+# INSTALL_DIR: the project root (two levels up from this file: backend/app/main.py)
+import sys as _sys
+INSTALL_DIR  = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+PYTHON_BIN   = _sys.executable
+ENV_FILE     = os.path.join(INSTALL_DIR, ".env")
+SCANNER_PY   = os.path.join(INSTALL_DIR, "backend", "app", "scanner.py")
+# Set SCANNER_AUTOSTART=true in .env to allow the dashboard to spawn scanner
+# instances via systemctl. Requires the sudoers rule added by install.sh.
+SCANNER_AUTOSTART = os.environ.get("SCANNER_AUTOSTART", "false").lower() == "true"
+
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
@@ -644,23 +655,101 @@ def register_scanner(
     username: str = Depends(require_auth),
 ):
     """
-    Dashboard-initiated scanner registration. Creates an Agent record and
-    returns the API key plus ready-to-use setup instructions.
-    This is auth-gated (unlike /agents/register which is open for self-registration).
+    Dashboard-initiated scanner registration.
+    Creates an Agent record and — if SCANNER_AUTOSTART=true and systemd is
+    available — writes a service file and starts it automatically.
+    Returns the API key, service name, and spawn status.
     """
-    new_agent = Agent(
-        name=agent.name,
-        capabilities=agent.capabilities or "nmap_scan,nikto_scan,nse_scan",
-    )
+    name = agent.name.strip()
+    caps = agent.capabilities or "nmap_scan,nikto_scan,nse_scan"
+
+    import re as _re
+    if not _re.match(r'^[a-zA-Z0-9_-]+$', name):
+        raise HTTPException(status_code=400, detail="Scanner name may only contain letters, numbers, hyphens, and underscores.")
+    if name == 'scanner-default':
+        raise HTTPException(status_code=400, detail="'scanner-default' is the system scanner name and cannot be used for new registrations.")
+    if db.query(Agent).filter(Agent.name == name).first():
+        raise HTTPException(status_code=409, detail=f"An agent named '{name}' already exists.")
+
+    new_agent = Agent(name=name, capabilities=caps)
     db.add(new_agent)
     db.commit()
     db.refresh(new_agent)
-    logger.info(f"Scanner '{agent.name}' registered from dashboard (id={new_agent.id})")
+
+    api_key      = new_agent.api_key
+    service_name = f"vapt-scanner-{name}"
+    key_file     = os.path.join(INSTALL_DIR, f"{name}_key.txt")
+
+    spawn_status = "manual"   # default: user must start it themselves
+    spawn_error  = None
+
+    if SCANNER_AUTOSTART:
+        try:
+            # Write the API key to disk so the scanner process can load it
+            with open(key_file, "w") as f:
+                f.write(api_key)
+
+            # Build the systemd service file content
+            current_user = os.environ.get("USER", "vapt")
+            service_content = (
+                f"[Unit]\n"
+                f"Description=Heimdall V-Scanner — {name}\n"
+                f"After=network.target vapt-server.service\n"
+                f"Wants=vapt-server.service\n\n"
+                f"[Service]\n"
+                f"Type=simple\n"
+                f"User={current_user}\n"
+                f"WorkingDirectory={INSTALL_DIR}\n"
+                f"EnvironmentFile={ENV_FILE}\n"
+                f"Environment=VAPT_AGENT_NAME={name}\n"
+                f"Environment=VAPT_SERVER_URL=http://127.0.0.1:8000\n"
+                f"Environment=VAPT_CAPABILITIES={caps}\n"
+                f"Environment=VAPT_KEY_FILE={key_file}\n"
+                f"ExecStart={PYTHON_BIN} {SCANNER_PY}\n"
+                f"Restart=on-failure\n"
+                f"RestartSec=10\n"
+                f"StandardOutput=journal\n"
+                f"StandardError=journal\n\n"
+                f"[Install]\n"
+                f"WantedBy=multi-user.target\n"
+            )
+
+            # Write to a temp file then sudo mv into place
+            tmp_path = f"/tmp/{service_name}.service"
+            with open(tmp_path, "w") as f:
+                f.write(service_content)
+
+            cmds = [
+                ["sudo", "mv", tmp_path, f"/etc/systemd/system/{service_name}.service"],
+                ["sudo", "systemctl", "daemon-reload"],
+                ["sudo", "systemctl", "enable", service_name],
+                ["sudo", "systemctl", "start", service_name],
+            ]
+            for cmd in cmds:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                if result.returncode != 0:
+                    raise RuntimeError(f"{' '.join(cmd)} failed: {result.stderr.strip()}")
+
+            spawn_status = "started"
+            logger.info(f"Scanner '{name}' registered and started as {service_name}")
+
+        except Exception as e:
+            spawn_status = "failed"
+            spawn_error  = str(e)
+            logger.error(f"Scanner auto-spawn failed for '{name}': {e}")
+    else:
+        logger.info(f"Scanner '{name}' registered (SCANNER_AUTOSTART=false — manual start required)")
+
     return {
-        "id": new_agent.id,
-        "name": new_agent.name,
-        "api_key": new_agent.api_key,
-        "capabilities": new_agent.capabilities,
+        "id":           new_agent.id,
+        "name":         name,
+        "api_key":      api_key,
+        "capabilities": caps,
+        "service_name": service_name,
+        "key_file":     key_file,
+        "spawn_status": spawn_status,   # "started" | "manual" | "failed"
+        "spawn_error":  spawn_error,
+        "autostart":    SCANNER_AUTOSTART,
     }
 
 
@@ -726,6 +815,53 @@ def restore_agent(
     agent.is_stale = False
     db.commit()
     return {"ok": True}
+
+
+@app.delete("/scanners/{agent_id}")
+def delete_scanner(
+    agent_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    """
+    Delete a dashboard-registered scanner.
+    If SCANNER_AUTOSTART is true, also stops and removes its systemd service.
+    scanner-default cannot be deleted — it is the primary system scanner.
+    """
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    protected = {"scanner-default"}
+    # An offline scanner-default (duplicate/stale) can be deleted
+    is_online = agent.last_seen and (datetime.utcnow() - agent.last_seen).total_seconds() < 35
+    if agent.name in protected and is_online:
+        raise HTTPException(status_code=403, detail=f"'{agent.name}' is the active system scanner and cannot be deleted while online.")
+
+    service_name = f"vapt-scanner-{agent.name}"
+    key_file     = os.path.join(INSTALL_DIR, f"{agent.name}_key.txt")
+    stop_status  = "skipped"
+
+    if SCANNER_AUTOSTART:
+        try:
+            # Stop and disable the service — ignore errors if it never started
+            subprocess.run(["sudo", "systemctl", "stop",    service_name], capture_output=True, timeout=10)
+            subprocess.run(["sudo", "systemctl", "disable", service_name], capture_output=True, timeout=10)
+            service_file = f"/etc/systemd/system/{service_name}.service"
+            subprocess.run(["sudo", "rm", "-f", service_file],             capture_output=True, timeout=10)
+            subprocess.run(["sudo", "systemctl", "daemon-reload"],         capture_output=True, timeout=10)
+            # Remove the key file
+            if os.path.exists(key_file):
+                os.remove(key_file)
+            stop_status = "stopped"
+            logger.info(f"Scanner '{agent.name}' service stopped and removed")
+        except Exception as e:
+            stop_status = f"error: {e}"
+            logger.warning(f"Could not fully stop scanner '{agent.name}': {e}")
+
+    db.delete(agent)
+    db.commit()
+    return {"ok": True, "service_name": service_name, "stop_status": stop_status}
 
 
 @app.get("/jobs")
@@ -859,6 +995,30 @@ def heartbeat(
     db.commit()
     return {"status": "alive"}
 
+
+@app.post("/agents/recover")
+def agent_recover(
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Called by scanner/agent on startup. Marks any jobs that were left in
+    'running' status (assigned to this agent) as 'failed'. This handles
+    the case where the process was killed mid-execution and the job was
+    never completed or reported back.
+    """
+    agent = get_agent_by_api_key(x_api_key, db)
+    orphaned = db.query(Job).filter(
+        Job.agent_id == agent.id,
+        Job.status == "running"
+    ).all()
+    for job in orphaned:
+        job.status = "failed"
+        job.completed_at = datetime.utcnow()
+        logger.warning(f"Crash recovery: job {job.id} (target={job.target}) marked failed — was running when agent restarted")
+    db.commit()
+    return {"recovered": len(orphaned)}
+
 @app.post("/agents/job-status")
 def update_job_status(
     data: dict,
@@ -935,6 +1095,38 @@ def clear_job(job_id: int, db: Session = Depends(get_db)):
     job.cleared = True
     db.commit()
     return {"ok": True, "action": "archived"}
+
+
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status not in ("pending", "running"):
+        raise HTTPException(status_code=400, detail=f"Cannot cancel job with status '{job.status}'")
+    job.status = "cancelled"
+    job.completed_at = datetime.utcnow()
+    db.commit()
+    logger.info(f"Job {job_id} cancelled by user")
+    return {"ok": True, "job_id": job_id, "status": "cancelled"}
+
+
+@app.get("/jobs/{job_id}/status")
+def get_job_status(
+    job_id: int,
+    db: Session = Depends(get_db),
+    x_api_key: str = Header(None),
+):
+    """Lightweight endpoint for scanners/agents to poll job status mid-execution."""
+    # Accepts both agent api key and dashboard auth
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"job_id": job.id, "status": job.status}
 
 
 @app.post("/results/{result_id}/analyse")
@@ -1217,7 +1409,34 @@ def cancel_sweep(
     return {"ok": True, "sweep_id": sweep_id, "status": "cancelled"}
 
 
-@app.get("/sweeps/{sweep_id}/results")
+@app.post("/sweeps/{sweep_id}/cancel-jobs")
+def cancel_sweep_jobs(
+    sweep_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    """
+    Cancel all pending and running jobs that were created by a sweep.
+    Useful for aborting a large sweep after it has already created many jobs.
+    """
+    sweep = db.query(DiscoverySweep).filter(DiscoverySweep.id == sweep_id).first()
+    if not sweep:
+        raise HTTPException(status_code=404, detail="Sweep not found")
+
+    cancellable = db.query(Job).filter(
+        Job.sweep_id == sweep_id,
+        Job.status.in_(["pending", "running"])
+    ).all()
+
+    count = 0
+    for job in cancellable:
+        job.status = "cancelled"
+        job.completed_at = datetime.utcnow()
+        count += 1
+
+    db.commit()
+    logger.info(f"Bulk cancelled {count} job(s) from sweep {sweep_id}")
+    return {"ok": True, "sweep_id": sweep_id, "cancelled": count}
 def get_sweep_results(
     sweep_id: int,
     db: Session = Depends(get_db),
@@ -1812,6 +2031,41 @@ def get_insights(
             "result_id":  d["result_id"],
         })
     hosts_list.sort(key=lambda x: x["findings"], reverse=True)
+
+    # ── Scan type breakdown ────────────────────────────────────────────────────
+    scan_type_counts = {}
+    for j in jobs:
+        label = {"nmap_scan": "Open Port Scan", "nikto_scan": "Web Scan", "nse_scan": "Vulnerability Scan"}.get(j.type, j.type)
+        scan_type_counts[label] = scan_type_counts.get(label, 0) + 1
+
+    # ── Port frequency ─────────────────────────────────────────────────────────
+    port_host_map: dict = {}
+    for r in results:
+        try:
+            out = json.loads(r.output)
+        except Exception:
+            continue
+        j_ref = job_map.get(r.job_id)
+        target_ip = j_ref.target if j_ref else "unknown"
+        for h in out.get("nmap", []):
+            host_ip = h.get("host") or target_ip
+            for p in h.get("ports", []):
+                if p.get("state") == "open":
+                    port_num = str(p["port"])
+                    if port_num not in port_host_map:
+                        port_host_map[port_num] = set()
+                    port_host_map[port_num].add(host_ip)
+
+    top_ports = sorted(
+        [{"port": k, "host_count": len(v)} for k, v in port_host_map.items()],
+        key=lambda x: x["host_count"],
+        reverse=True
+    )[:15]
+
+    # ── Coverage gaps ──────────────────────────────────────────────────────────
+    nmap_hosts = set(j.target for j in jobs if j.type == "nmap_scan")
+    nse_hosts  = set(j.target for j in jobs if j.type == "nse_scan")
+    coverage_gaps = sorted(nmap_hosts - nse_hosts)
  
     # ── Per-host drilldown ────────────────────────────────────────────────────
     scan_history = []
@@ -1869,9 +2123,12 @@ def get_insights(
             "total_open_ports": total_open_ports,
             "risk_counts":      risk_counts,
         },
-        "scan_activity": scan_activity,
-        "hosts":         hosts_list,
-        "scan_history":  scan_history,
+        "scan_activity":    scan_activity,
+        "scan_type_counts": scan_type_counts,
+        "top_ports":        top_ports,
+        "coverage_gaps":    coverage_gaps,
+        "hosts":            hosts_list,
+        "scan_history":     scan_history,
     }
 
 
@@ -2173,6 +2430,12 @@ def dashboard():
                     <h3 class="text-sm font-semibold text-white">Assign Scan Jobs?</h3>
                 </div>
                 <p id="sweepConfirmMsg" class="text-xs text-gray-400 mb-2"></p>
+                <!-- Large sweep warning — shown when host count exceeds threshold -->
+                <div id="sweepLargeWarning" class="hidden mb-3 p-3 bg-yellow-950 border border-yellow-700 rounded-lg text-xs text-yellow-300 space-y-1">
+                    <p class="font-semibold">⚠ Large sweep detected</p>
+                    <p id="sweepLargeWarningMsg"></p>
+                    <p>For faster results, consider registering additional scanner instances from the Agents tab.</p>
+                </div>
                 <div id="sweepHostList" class="max-h-32 overflow-y-auto mb-4 space-y-1"></div>
 
                 <!-- Job type + profile selectors -->
@@ -2408,27 +2671,27 @@ def dashboard():
                     <p class="text-xs text-gray-600 mb-3">These are saved to the database and take effect immediately.</p>
  
                     <div class="space-y-4">
-                        <div class="flex items-center justify-between">
-                            <div>
+                        <div class="flex items-center justify-between gap-4">
+                            <div class="min-w-0">
                                 <p class="text-sm text-gray-300">AI auto-analysis</p>
                                 <p class="text-xs text-gray-600 mt-0.5">Analyse results automatically after each scan</p>
                             </div>
                             <button id="setting-ai-toggle" onclick="toggleServerSetting('ai_auto_analyse')"
-                                class="relative w-11 h-6 rounded-full transition-colors duration-200 focus:outline-none bg-gray-700 border border-gray-600">
+                                class="relative w-11 h-6 rounded-full transition-colors duration-200 focus:outline-none flex-shrink-0">
                                 <span id="setting-ai-knob"
-                                    class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-gray-400 transition-transform duration-200"></span>
+                                    class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform duration-200"></span>
                             </button>
                         </div>
 
-                        <div class="flex items-center justify-between">
-                            <div>
+                        <div class="flex items-center justify-between gap-4">
+                            <div class="min-w-0">
                                 <p class="text-sm text-gray-300">Auto web scan after port scan</p>
                                 <p class="text-xs text-gray-600 mt-0.5">Automatically run Nikto when web ports are found in an Open Port Scan. Disable to make port scans faster.</p>
                             </div>
                             <button id="setting-nikto-toggle" onclick="toggleServerSetting('auto_nikto')"
-                                class="relative w-11 h-6 rounded-full transition-colors duration-200 focus:outline-none bg-gray-700 border border-gray-600">
+                                class="relative w-11 h-6 rounded-full transition-colors duration-200 focus:outline-none flex-shrink-0">
                                 <span id="setting-nikto-knob"
-                                    class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-gray-400 transition-transform duration-200"></span>
+                                    class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform duration-200"></span>
                             </button>
                         </div>
  
@@ -2507,7 +2770,7 @@ def dashboard():
                 <div class="flex flex-wrap gap-3 items-end">
                     <div class="flex flex-col gap-1">
                         <label class="text-xs text-gray-400">Target</label>
-                        <input id="target" placeholder="IP, hostname, or URL"
+                        <input id="target" placeholder="IP or hostname"
                             class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-44">
                     </div>
                     <div class="flex flex-col gap-1">
@@ -2621,6 +2884,7 @@ def dashboard():
                     <div>
                         <label class="text-xs text-gray-400 block mb-1">Scanner name</label>
                         <input id="scannerName" placeholder="scanner-2" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                        <p class="text-xs text-gray-600 mt-1">Leave blank to use the suggested name.</p>
                     </div>
                     <div>
                         <label class="text-xs text-gray-400 block mb-1">Capabilities</label>
@@ -2628,10 +2892,11 @@ def dashboard():
                         <p class="text-xs text-gray-600 mt-1">Comma-separated. Options: <span class="font-mono">nmap_scan</span>, <span class="font-mono">nikto_scan</span>, <span class="font-mono">nse_scan</span></p>
                     </div>
                     <button onclick="submitRegisterScanner()" class="w-full bg-green-700 hover:bg-green-600 text-white text-sm font-medium py-2 rounded-lg transition">Register</button>
+                    <p class="text-xs text-gray-600 text-center">Registration creates the agent record and API key. To enable auto-start on this server, add <span class="font-mono text-gray-500">SCANNER_AUTOSTART=true</span> to your <span class="font-mono text-gray-500">.env</span> file and restart the server.</p>
                 </div>
                 <div id="registerScannerResult" class="hidden px-6 pb-6 space-y-4">
-                    <div class="p-3 bg-green-950 border border-green-800 rounded-lg text-xs text-green-300">
-                        Scanner registered. Copy the setup commands below and run them on the server.
+                    <div id="registerScannerStatusBanner" class="mb-3 p-3 bg-green-950 border border-green-800 rounded-lg text-xs text-green-300">
+                        Scanner registered.
                     </div>
                     <div>
                         <div class="flex items-center justify-between mb-1">
@@ -2770,7 +3035,10 @@ def dashboard():
                 <div id="sweepResultPanel" class="hidden mb-4 bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
                     <div class="flex items-center justify-between px-4 py-3 border-b border-gray-700">
                         <p class="text-xs font-semibold text-cyan-400" id="sweepResultTitle">Sweep Results</p>
-                        <button onclick="closeSweepResultPanel()" class="text-gray-500 hover:text-gray-300 transition text-sm">✕</button>
+                        <div class="flex items-center gap-3">
+                            <button id="sweepCancelJobsBtn" onclick="cancelSweepJobs()" class="hidden text-xs px-2 py-1 rounded bg-red-900 hover:bg-red-800 text-red-300 hover:text-red-200 transition">Cancel All Jobs</button>
+                            <button onclick="closeSweepResultPanel()" class="text-gray-500 hover:text-gray-300 transition text-sm">✕</button>
+                        </div>
                     </div>
                     <div id="sweepResultBody" class="p-4 overflow-x-auto max-h-80 overflow-y-auto text-xs"></div>
                 </div>
@@ -2803,16 +3071,21 @@ def dashboard():
                     </div>
                     <div class="flex flex-col gap-1">
                         <label class="text-xs text-gray-400">Target</label>
-                        <input id="sched_target" placeholder="IP, hostname, or URL"
+                        <input id="sched_target" placeholder="IP or hostname"
                             class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-36">
                     </div>
                     <div class="flex flex-col gap-1">
                         <label class="text-xs text-gray-400">Scan Type</label>
-                        <select id="sched_type" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                        <select id="sched_type" onchange="onSchedTypeChange()" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
                             <option value="nmap_scan">Open Port Scan</option>
                             <option value="nikto_scan">Web Scan</option>
                             <option value="nse_scan">Vulnerability Scan</option>
                         </select>
+                    </div>
+                    <div class="flex flex-col gap-1" id="schedPortField" style="display:none">
+                        <label class="text-xs text-gray-400">Port</label>
+                        <input id="sched_port" type="number" placeholder="80"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-20">
                     </div>
                     <div class="flex flex-col gap-1">
                         <label class="text-xs text-gray-400">Profile</label>
@@ -2906,9 +3179,36 @@ def dashboard():
                 </div>
             </div>
 
+            <!-- Scan type breakdown + Port frequency side by side -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6" id="insightExtraCharts">
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                    <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Scan Type Breakdown</h3>
+                    <div class="relative h-48 flex items-center justify-center">
+                        <canvas id="chartScanTypes"></canvas>
+                    </div>
+                </div>
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                    <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Top Open Ports (by host count)</h3>
+                    <div class="relative h-48">
+                        <canvas id="chartTopPorts"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Coverage gaps -->
+            <div id="insightCoverageGaps" class="hidden bg-gray-900 rounded-xl border border-yellow-900 p-5">
+                <div class="flex items-center gap-2 mb-3">
+                    <h3 class="text-xs font-semibold text-yellow-400 uppercase tracking-wider">Coverage Gaps</h3>
+                    <span class="text-xs text-gray-600">— hosts with an Open Port Scan but no Vulnerability Scan in this window</span>
+                </div>
+                <div id="insightCoverageGapsBody" class="flex flex-wrap gap-2"></div>
+            </div>
+
             <!-- Host table (aggregate) or scan timeline (per-host) -->
             <div id="insightHostTable" class="bg-gray-900 rounded-xl border border-gray-800 p-5">
-                <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Scanned Hosts</h3>
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Scanned Hosts</h3>
+                </div>
                 <div id="insightHostTableBody"></div>
             </div>
 
@@ -3032,7 +3332,20 @@ def dashboard():
             resultTab = 'active';
             switchTab('dashboard');
             setTimeout(async () => {
+                // First do a full load to get all results into pageData
                 await loadResults();
+
+                // Find which page the result is on and jump to it
+                const allResults = pageData.results;
+                const idx = allResults.findIndex(r => r.id === resultId);
+                if (idx >= 0) {
+                    const targetPage = Math.floor(idx / PAGE_SIZES.results) + 1;
+                    if (pages.results !== targetPage) {
+                        pages.results = targetPage;
+                        renderResults();
+                    }
+                }
+
                 setTimeout(() => {
                     const cards = document.querySelectorAll('#results > div');
                     let targetCard = null;
@@ -3270,7 +3583,7 @@ def dashboard():
             if (ms > 0) {
                 autoRefreshTimer = setInterval(() => {
                     loadAgents();
-                    loadJobs();
+                    refreshJobs();
                 }, ms);
             }
         }
@@ -3284,39 +3597,33 @@ def dashboard():
         }
  
         function renderServerSettings() {
-            // AI auto-analysis toggle
-            const aiOn = serverSettings['ai_auto_analyse'] === 'true';
-            const toggleBtn  = document.getElementById('setting-ai-toggle');
-            const toggleKnob = document.getElementById('setting-ai-knob');
-            if (toggleBtn && toggleKnob) {
-                toggleBtn.classList.toggle('bg-green-600',  aiOn);
-                toggleBtn.classList.toggle('border-green-500', aiOn);
-                toggleBtn.classList.toggle('bg-gray-700',  !aiOn);
-                toggleBtn.classList.toggle('border-gray-600', !aiOn);
-                toggleKnob.style.transform = aiOn ? 'translateX(20px)' : 'translateX(0)';
-                toggleKnob.classList.toggle('bg-white',    aiOn);
-                toggleKnob.classList.toggle('bg-gray-400', !aiOn);
+            function applyToggle(btnId, knobId, isOn) {
+                const btn  = document.getElementById(btnId);
+                const knob = document.getElementById(knobId);
+                if (!btn || !knob) return;
+
+                // Track classes (button)
+                const onClasses  = ['bg-green-600', 'border', 'border-green-500'];
+                const offClasses = ['bg-gray-700',  'border', 'border-gray-600'];
+                if (isOn) {
+                    offClasses.forEach(c => btn.classList.remove(c));
+                    onClasses.forEach(c  => btn.classList.add(c));
+                } else {
+                    onClasses.forEach(c  => btn.classList.remove(c));
+                    offClasses.forEach(c => btn.classList.add(c));
+                }
+
+                // Knob position and colour
+                knob.style.transform = isOn ? 'translateX(20px)' : 'translateX(0)';
+                knob.classList.remove('bg-white', 'bg-gray-400');
+                knob.classList.add(isOn ? 'bg-white' : 'bg-gray-400');
             }
 
-            // Auto-Nikto toggle
-            const niktoOn = serverSettings['auto_nikto'] !== 'false'; // default true
-            const niktoBtn  = document.getElementById('setting-nikto-toggle');
-            const niktoKnob = document.getElementById('setting-nikto-knob');
-            if (niktoBtn && niktoKnob) {
-                niktoBtn.classList.toggle('bg-green-600',    niktoOn);
-                niktoBtn.classList.toggle('border-green-500', niktoOn);
-                niktoBtn.classList.toggle('bg-gray-700',    !niktoOn);
-                niktoBtn.classList.toggle('border-gray-600', !niktoOn);
-                niktoKnob.style.transform = niktoOn ? 'translateX(20px)' : 'translateX(0)';
-                niktoKnob.classList.toggle('bg-white',    niktoOn);
-                niktoKnob.classList.toggle('bg-gray-400', !niktoOn);
-            }
+            applyToggle('setting-ai-toggle',    'setting-ai-knob',    serverSettings['ai_auto_analyse'] === 'true');
+            applyToggle('setting-nikto-toggle', 'setting-nikto-knob', serverSettings['auto_nikto'] !== 'false');
 
-            // Stale agent hours
             const staleInput = document.getElementById('setting-stale-hours');
-            if (staleInput) {
-                staleInput.value = serverSettings['stale_agent_hours'] || '24';
-            }
+            if (staleInput) staleInput.value = serverSettings['stale_agent_hours'] || '24';
         }
  
         async function toggleServerSetting(key) {
@@ -3370,6 +3677,7 @@ def dashboard():
                 } else {
                     document.getElementById("loginOverlay").classList.add('hidden');
                     loadAll();
+                    loadServerSettings();
                 }
             });
         }
@@ -3423,6 +3731,11 @@ def dashboard():
             // Hide ports field when custom profile is active (port derivation is automatic)
             if (type === 'nse_scan' && document.getElementById('profile').value === 'custom') {
                 document.getElementById("portsField").style.display = "none";
+            }
+            // Update target placeholder — Nikto accepts URLs, nmap/nse do not
+            const targetInput = document.getElementById('target');
+            if (targetInput) {
+                targetInput.placeholder = type === 'nikto_scan' ? 'IP, hostname, or URL' : 'IP or hostname';
             }
             updateNseExploitBanner();
             onProfileChange();
@@ -4167,19 +4480,27 @@ def dashboard():
         function renderAgents() {
             const data   = pageData.agents;
             const paged  = getPage('agents', data);
-            let html = `<table class="w-full text-sm"><thead><tr class="text-left text-gray-400 border-b border-gray-800"><th class="pb-2 pr-4">ID</th><th class="pb-2 pr-4">Name</th><th class="pb-2 pr-4">Status</th><th class="pb-2 pr-4">Capabilities</th><th class="pb-2 pr-4">Last Seen</th><th class="pb-2">Action</th></tr></thead><tbody>`;
-            if (!data.length) html += `<tr><td colspan="6" class="py-4 text-gray-500 text-sm">No agents registered.</td></tr>`;
+            let html = `<table class="w-full text-sm"><thead><tr class="text-left text-gray-400 border-b border-gray-800"><th class="pb-2 pr-4">ID</th><th class="pb-2 pr-4">Name</th><th class="pb-2 pr-4">Status</th><th class="pb-2 pr-4">Last Seen</th><th class="pb-2">Action</th></tr></thead><tbody>`;
+            if (!data.length) html += `<tr><td colspan="5" class="py-4 text-gray-500 text-sm">No agents registered.</td></tr>`;
             paged.forEach((a) => {
                 const isStale = a.is_stale;
                 const rowClass = isStale ? 'border-b border-gray-800 bg-gray-900 opacity-60' : 'border-b border-gray-800 hover:bg-gray-800 transition';
                 const dot = a.status === 'online' ? '<span class="inline-block w-2 h-2 rounded-full bg-green-400 mr-2"></span>' : '<span class="inline-block w-2 h-2 rounded-full bg-red-500 mr-2"></span>';
                 const staleTag = isStale ? '<span class="ml-2 text-xs px-1.5 py-0.5 rounded bg-yellow-900 text-yellow-400 border border-yellow-700">stale</span>' : '';
-                const caps = (a.capabilities || '').split(',').map(c => `<span class="inline-block mr-1 text-xs font-mono text-blue-300">${c.trim()}</span>`).join('');
-                const setupBtn = `<button onclick="showAgentSetup(${a.id}, '${a.name}', '${a.api_key}', '${a.capabilities || ''}')" class="text-xs text-gray-500 hover:text-gray-300 transition mr-3" title="Show setup commands">Setup</button>`;
+                // Setup button only shown for agents/scanners that have never checked in
+                const neverSeen = !a.last_seen;
+                const isProtected = (a.name === 'scanner-default' && a.status === 'online');
+                const setupBtn = neverSeen
+                    ? `<button onclick="showAgentSetup(${a.id}, '${a.name}', '${a.api_key}', '${a.capabilities || ''}')" class="text-xs text-yellow-500 hover:text-yellow-300 transition mr-2" title="Agent not yet seen — show setup commands">Setup ⚠</button>`
+                    : '';
+                const deleteBtn = !isProtected
+                    ? `<button onclick="deleteScanner(${a.id}, '${a.name}')" class="text-xs text-red-500 hover:text-red-400 transition">Delete</button>`
+                    : '';
+                const noAction = !setupBtn && !deleteBtn ? '<span class="text-xs text-gray-600">—</span>' : '';
                 const action = isStale
                     ? `<div class="flex gap-3"><button onclick="restoreAgent(${a.id})" class="text-xs text-blue-400 hover:text-blue-300 transition">Restore</button><button onclick="dismissAgent(${a.id})" class="text-xs text-red-400 hover:text-red-300 transition">Dismiss</button></div>`
-                    : setupBtn;
-                html += `<tr class="${rowClass}"><td class="py-2 pr-4 text-gray-400">#${a.id}</td><td class="py-2 pr-4 font-medium">${a.name}${staleTag}</td><td class="py-2 pr-4">${dot}${a.status}</td><td class="py-2 pr-4">${caps}</td><td class="py-2 pr-4 text-gray-400 text-xs">${formatTimestamp(a.last_seen)}</td><td class="py-2">${action}</td></tr>`;
+                    : `${setupBtn}${deleteBtn}${noAction}`;
+                html += `<tr class="${rowClass}"><td class="py-2 pr-4 text-gray-400">#${a.id}</td><td class="py-2 pr-4 font-medium">${a.name}${staleTag}</td><td class="py-2 pr-4">${dot}${a.status}</td><td class="py-2 pr-4 text-gray-400 text-xs">${formatTimestamp(a.last_seen)}</td><td class="py-2">${action}</td></tr>`;
             });
             html += '</tbody></table>';
             html += paginationBar('agents', data.length);
@@ -4190,15 +4511,40 @@ def dashboard():
         }
         async function restoreAgent(agent_id) { await apiFetch(`/agents/${agent_id}/restore`, { method: 'POST' }); loadAgents(); }
 
+        async function deleteScanner(agent_id, name) {
+            showConfirm(
+                `Delete scanner '${name}'? This will stop its systemd service (if auto-spawn is enabled) and remove it permanently.`,
+                async () => {
+                    const res = await apiFetch(`/scanners/${agent_id}`, { method: 'DELETE' });
+                    if (res && (res.ok || res.status === 200)) {
+                        loadAgents();
+                    } else if (res) {
+                        const err = await res.json().catch(() => ({}));
+                        alert(`Delete failed: ${err.detail || 'unknown error'}`);
+                    }
+                },
+                'Delete Scanner'
+            );
+        }
+
         // ── SCANNER REGISTRATION ───────────────────────────────────────────
         function openRegisterScanner() {
             document.getElementById('registerScannerBackdrop').classList.remove('hidden');
             document.getElementById('registerScannerModal').classList.remove('hidden');
             document.getElementById('registerScannerForm').classList.remove('hidden');
             document.getElementById('registerScannerResult').classList.add('hidden');
-            document.getElementById('scannerName').value = '';
+
+            // Compute next available scanner name from the current agents list
+            const existing = new Set((pageData.agents || []).map(a => a.name));
+            let nextNum = 2;
+            while (existing.has(`scanner-${nextNum}`)) nextNum++;
+            const suggested = `scanner-${nextNum}`;
+
+            const nameInput = document.getElementById('scannerName');
+            nameInput.value = '';
+            nameInput.placeholder = suggested;
             document.getElementById('scannerCaps').value = 'nmap_scan,nikto_scan,nse_scan';
-            document.getElementById('scannerName').focus();
+            nameInput.focus();
         }
 
         function closeRegisterScanner() {
@@ -4208,7 +4554,9 @@ def dashboard():
         }
 
         async function submitRegisterScanner() {
-            const name = document.getElementById('scannerName').value.trim();
+            const nameInput = document.getElementById('scannerName');
+            // Use typed value, or fall back to the placeholder suggestion
+            const name = nameInput.value.trim() || nameInput.placeholder;
             const caps = document.getElementById('scannerCaps').value.trim();
             if (!name) { alert('Scanner name is required.'); return; }
             const res = await apiFetch('/scanners/register', {
@@ -4217,13 +4565,31 @@ def dashboard():
                 body: JSON.stringify({ name, capabilities: caps }),
             });
             if (!res) return;
+            if (res.status === 400 || res.status === 409) {
+                const err = await res.json();
+                alert(`Registration failed: ${err.detail}`);
+                return;
+            }
             const data = await res.json();
 
-            // Build the setup output
             const serverUrl = window.location.origin;
-            const setupCmds = `# 1. Make sure scanner.py is on this server (it's in backend/app/scanner.py)\n# 2. Save your API key\necho "${data.api_key}" > ${name}_key.txt\n\n# 3. Run the scanner\nVAPT_AGENT_NAME=${name} \\\nVAPT_SERVER_URL=${serverUrl} \\\nVAPT_CAPABILITIES=${data.capabilities} \\\nVAPT_KEY_FILE=${name}_key.txt \\\npython3 backend/app/scanner.py`;
 
-            const serviceFile = `[Unit]\nDescription=Heimdall V-Scanner — ${name}\nAfter=network.target vapt-server.service\nWants=vapt-server.service\n\n[Service]\nType=simple\nUser=$USER\nWorkingDirectory=/opt/vapt-scanner-project\nEnvironmentFile=/opt/vapt-scanner-project/.env\nEnvironment=VAPT_AGENT_NAME=${name}\nEnvironment=VAPT_SERVER_URL=${serverUrl}\nEnvironment=VAPT_CAPABILITIES=${data.capabilities}\nEnvironment=VAPT_KEY_FILE=/opt/vapt-scanner-project/${name}_key.txt\nExecStart=/opt/vapt-scanner-project/venv/bin/python /opt/vapt-scanner-project/backend/app/scanner.py\nRestart=on-failure\nRestartSec=10\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=multi-user.target`;
+            // Status banner
+            const statusBannerEl = document.getElementById('registerScannerStatusBanner');
+            if (data.spawn_status === 'started') {
+                statusBannerEl.className = 'mb-3 p-3 bg-green-950 border border-green-800 rounded-lg text-xs text-green-300';
+                statusBannerEl.textContent = `✓ Scanner registered and started as ${data.service_name}. It should appear online in the agents table within 30 seconds.`;
+            } else if (data.spawn_status === 'failed') {
+                statusBannerEl.className = 'mb-3 p-3 bg-red-950 border border-red-800 rounded-lg text-xs text-red-300';
+                statusBannerEl.textContent = `Scanner registered but failed to start automatically: ${data.spawn_error || 'unknown error'}. Use the manual commands below.`;
+            } else {
+                statusBannerEl.className = 'mb-3 p-3 bg-blue-950 border border-blue-800 rounded-lg text-xs text-blue-300';
+                statusBannerEl.textContent = `Scanner registered. Auto-spawn is disabled — use the commands below to start it manually.`;
+            }
+
+            const setupCmds = `# Save your API key\necho "${data.api_key}" > ${data.key_file || name + '_key.txt'}\n\n# Run the scanner\nVAPT_AGENT_NAME=${name} \\\nVAPT_SERVER_URL=${serverUrl} \\\nVAPT_CAPABILITIES=${data.capabilities} \\\nVAPT_KEY_FILE=${data.key_file || name + '_key.txt'} \\\npython3 backend/app/scanner.py`;
+
+            const serviceFile = `[Unit]\nDescription=Heimdall V-Scanner — ${name}\nAfter=network.target vapt-server.service\nWants=vapt-server.service\n\n[Service]\nType=simple\nUser=$USER\nWorkingDirectory=${data.key_file ? data.key_file.replace(/\\/[^/]+$/, '') : '/opt/vapt-scanner-project'}\nEnvironmentFile=${data.key_file ? data.key_file.replace(/\\/[^/]+$/, '') + '/.env' : '/opt/vapt-scanner-project/.env'}\nEnvironment=VAPT_AGENT_NAME=${name}\nEnvironment=VAPT_SERVER_URL=${serverUrl}\nEnvironment=VAPT_CAPABILITIES=${data.capabilities}\nEnvironment=VAPT_KEY_FILE=${data.key_file || name + '_key.txt'}\nExecStart=${data.key_file ? data.key_file.replace(/\\/[^/]+$/, '') + '/venv/bin/python ' + data.key_file.replace(/\\/[^/]+$/, '') + '/backend/app/scanner.py' : '/opt/vapt-scanner-project/venv/bin/python /opt/vapt-scanner-project/backend/app/scanner.py'}\nRestart=on-failure\nRestartSec=10\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=multi-user.target`;
 
             document.getElementById('resultApiKey').textContent    = data.api_key;
             document.getElementById('resultSetupCmds').textContent  = setupCmds;
@@ -4279,7 +4645,29 @@ def dashboard():
             if (anyNewlyDone && resultTab === 'active') loadResults();
 
             pageData.jobs = data;
-            pages.jobs = 1;
+            pages.jobs = 1;   // explicit load — reset to page 1
+            renderJobs();
+        }
+
+        // Background refresh: updates data but preserves the current page.
+        // Used by the polling interval so navigating to page 3 doesn't snap back.
+        async function refreshJobs() {
+            const url = showJobHistory ? '/jobs?show_history=true' : '/jobs';
+            const res = await apiFetch(url);
+            if (!res) return;
+            const data = await res.json();
+            data.sort((a, b) => b.id - a.id);
+
+            let anyNewlyDone = false;
+            data.forEach(j => {
+                const prev = lastJobStatuses[j.id];
+                if (prev === 'running' && j.status === 'done') anyNewlyDone = true;
+                lastJobStatuses[j.id] = j.status;
+            });
+            if (anyNewlyDone && resultTab === 'active') loadResults();
+
+            pageData.jobs = data;
+            // Do NOT reset pages.jobs — preserve current page
             renderJobs();
         }
 
@@ -4295,7 +4683,9 @@ def dashboard():
                 const rowNum = (pages.jobs - 1) * PAGE_SIZES.jobs + idx + 1;
                 let action;
                 if (j.cleared) action = '<span class="text-xs text-gray-500 italic">archived</span>';
-                else if (j.status === 'pending' || j.status === 'failed') action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-red-500 hover:text-red-400 transition font-medium">Delete</button>`;
+                else if (j.status === 'running')  action = `<button onclick="cancelJob(${j.id})" class="text-xs text-orange-400 hover:text-orange-300 transition font-medium">Cancel</button>`;
+                else if (j.status === 'pending')  action = `<div class="flex gap-2"><button onclick="cancelJob(${j.id})" class="text-xs text-orange-400 hover:text-orange-300 transition">Cancel</button><button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-red-500 hover:text-red-400 transition font-medium">Delete</button></div>`;
+                else if (j.status === 'failed')   action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-red-500 hover:text-red-400 transition font-medium">Delete</button>`;
                 else action = `<button onclick="clearJob(${j.id}, '${j.status}')" class="text-xs text-gray-400 hover:text-red-400 transition">Clear</button>`;
                 html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition"><td class="py-2 pr-3 text-gray-500 text-xs">${rowNum}</td><td class="py-2 pr-3 text-gray-500 text-xs font-mono">${j.id}</td><td class="py-2 pr-3 text-xs text-blue-300">${scanTypeLabel(j.type)}</td><td class="py-2 pr-3 font-mono text-xs">${j.target}</td><td class="py-2 pr-3" data-field="status">${statusBadge(j.status)}</td><td class="py-2 pr-3">${priorityBadge(j.priority)}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.mode}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.profile}</td><td class="py-2 pr-3 text-xs text-gray-300">${j.agent}</td><td class="py-2 pr-3 text-xs text-gray-400 tabular-nums" id="job-time-${j.id}" data-started-at="${j.started_at || ''}">${j.status === 'running' ? elapsedDisplay(j.started_at) : formatTimestamp(j.completed_at)}</td><td class="py-2">${action}</td></tr>`;
             });
@@ -4307,6 +4697,12 @@ def dashboard():
             if (status === 'pending' || status === 'failed') {
                 showConfirm(`Permanently delete this ${status} job?`, async () => { await apiFetch(`/jobs/${job_id}/clear`, { method: 'POST' }); loadJobs(); }, 'Delete');
             } else { await apiFetch(`/jobs/${job_id}/clear`, { method: 'POST' }); loadJobs(); }
+        }
+        async function cancelJob(job_id) {
+            showConfirm('Cancel this job? The scanner will stop after its current tool finishes.', async () => {
+                await apiFetch(`/jobs/${job_id}/cancel`, { method: 'POST' });
+                loadJobs();
+            }, 'Cancel Job');
         }
         async function clearAllByStatus(status) {
             showConfirm(`Permanently delete ALL ${status} jobs?`, async () => {
@@ -4595,7 +4991,7 @@ def dashboard():
                 // Build tooltip content
                 const tipRisk = r.analysis
                     ? (() => {
-                        const rm = r.analysis.match(/##\\s*Risk Level\\s*\\n+(\w+)/i);
+                        const rm = r.analysis.match(/##\\s*Risk Level\\s*\\n+(\\w+)/i);
                         return rm ? rm[1].toUpperCase() : 'INFO';
                       })()
                     : null;
@@ -4642,9 +5038,9 @@ def dashboard():
                 let tipAnalysisHtml = '';
                 if (r.analysis) {
                     // Extract the Summary section — first meaningful sentence after ## Summary
-                    const summaryMatch = r.analysis.match(/##\\s*Summary\\s*\\n+([\\s\\S]+?)(?=\\n##|\\n\*\*|$)/i);
+                    const summaryMatch = r.analysis.match(/##\\s*Summary\\s*\\n+([\\s\\S]+?)(?=\\n##|\\\\n\\*\\*|$)/i);
                     if (summaryMatch) {
-                        const summaryText = summaryMatch[1].trim().split(/\.\\s+/)[0] + '.';
+                        const summaryText = summaryMatch[1].trim().split(/\\.\\s+/)[0] + '.';
                         tipAnalysisHtml = '<div style="border-top:1px solid #1e2535;padding-top:6px;margin-top:2px">'
                             + '<div style="font-size:9px;letter-spacing:0.08em;text-transform:uppercase;color:#4b5563;margin-bottom:3px">AI Summary</div>'
                             + `<div style="font-size:10px;color:#9ca3af;line-height:1.5;white-space:normal">${summaryText}</div>`
@@ -4795,6 +5191,22 @@ def dashboard():
                 onSweepProfileChange();
                 updateSweepConfirmNote();
                 document.getElementById("sweepConfirmMsg").textContent = `${data.count} host(s) found in ${subnet}:`;
+
+                // Large-sweep warning — show if host count is high relative to online scanner count
+                const LARGE_SWEEP_THRESHOLD = 20;
+                const warningEl  = document.getElementById('sweepLargeWarning');
+                const warningMsg = document.getElementById('sweepLargeWarningMsg');
+                const onlineScanners = (pageData.agents || []).filter(a => a.status === 'online').length;
+                if (data.count >= LARGE_SWEEP_THRESHOLD) {
+                    const estTime = onlineScanners > 0
+                        ? `With ${onlineScanners} scanner(s) online, this could take ${Math.ceil(data.count / onlineScanners)} sequential batches.`
+                        : 'No scanners appear to be online.';
+                    warningMsg.textContent = `${data.count} jobs will be created. ${estTime}`;
+                    warningEl.classList.remove('hidden');
+                } else {
+                    warningEl.classList.add('hidden');
+                }
+
                 const hostListEl = document.getElementById("sweepHostList");
                 hostListEl.innerHTML = data.hosts.map(h => `<div class="flex items-center gap-3 text-xs py-1 border-b border-gray-700 last:border-0"><span class="font-mono text-green-400 w-36">${h.ip}</span><span class="text-gray-500">${h.hostname || ''}</span></div>`).join('');
                 document.getElementById("sweepConfirmDialog").classList.remove('hidden');
@@ -4938,12 +5350,18 @@ def dashboard():
             const body  = document.getElementById('sweepResultBody');
             body.innerHTML = '<p class="text-gray-500 text-xs animate-pulse">Loading…</p>';
             panel.classList.remove('hidden');
+            activeSweepResultId = sweepId;
 
             const res = await apiFetch(`/sweeps/${sweepId}/results`);
             if (!res) { body.innerHTML = '<p class="text-red-400 text-xs">Failed to load results.</p>'; return; }
             const data = await res.json();
 
             document.getElementById('sweepResultTitle').textContent = `Sweep #${data.sweep_id} — ${data.subnet}`;
+
+            // Show Cancel All Jobs button if any jobs are still pending or running
+            const hasActiveJobs = data.hosts && data.hosts.some(h => h.status === 'pending' || h.status === 'running');
+            const cancelBtn = document.getElementById('sweepCancelJobsBtn');
+            if (cancelBtn) cancelBtn.classList.toggle('hidden', !hasActiveJobs);
 
             if (!data.hosts || data.hosts.length === 0) {
                 body.innerHTML = '<p class="text-gray-500 text-xs">No jobs were created for this sweep.</p>';
@@ -5000,6 +5418,27 @@ def dashboard():
 
         function closeSweepResultPanel() {
             document.getElementById('sweepResultPanel').classList.add('hidden');
+            document.getElementById('sweepCancelJobsBtn').classList.add('hidden');
+            activeSweepResultId = null;
+        }
+
+        let activeSweepResultId = null;
+
+        async function cancelSweepJobs() {
+            if (!activeSweepResultId) return;
+            showConfirm(
+                'Cancel all pending and running jobs from this sweep? This cannot be undone.',
+                async () => {
+                    const res = await apiFetch(`/sweeps/${activeSweepResultId}/cancel-jobs`, { method: 'POST' });
+                    if (!res) return;
+                    const data = await res.json();
+                    document.getElementById('sweepCancelJobsBtn').classList.add('hidden');
+                    // Refresh the panel to show updated statuses
+                    viewSweepResults(activeSweepResultId);
+                    loadJobs();
+                },
+                'Cancel All Jobs'
+            );
         }
 
         async function deleteSweep(sweep_id) {
@@ -5053,6 +5492,12 @@ def dashboard():
             html += '</tbody></table>';
             el.innerHTML = html;
         }
+        function onSchedTypeChange() {
+            const type = document.getElementById('sched_type').value;
+            document.getElementById('schedPortField').style.display = type === 'nikto_scan' ? 'flex' : 'none';
+            const targetInput = document.getElementById('sched_target');
+            if (targetInput) targetInput.placeholder = type === 'nikto_scan' ? 'IP, hostname, or URL' : 'IP or hostname';
+        }
         async function createSchedule() {
             const name = document.getElementById("sched_name").value.trim();
             const target = document.getElementById("sched_target").value.trim();
@@ -5061,22 +5506,27 @@ def dashboard():
             const mode = document.getElementById("sched_mode").value;
             const priority = document.getElementById("sched_priority").value;
             const interval = document.getElementById("sched_interval").value.trim();
-            
+            const port = document.getElementById("sched_port")?.value.trim();
+
             if (!name || !target || !interval) { alert("Name, target, and interval are required."); return; }
             if (parseInt(interval) < 1) { alert("Interval must be at least 1 hour."); return; }
-            
-            const res = await apiFetch('/schedules', { 
-            method: 'POST', 
-            headers: { 'Content-Type': 'application/json' }, 
-            body: JSON.stringify({ name, target, type, profile, mode, priority, interval_hours: parseInt(interval) }) 
+
+            const payload = { name, target, type, profile, mode, priority, interval_hours: parseInt(interval) };
+            if (type === 'nikto_scan' && port) payload.port = parseInt(port);
+
+            const res = await apiFetch('/schedules', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
             });
-            
+
             if (!res) return;
-            
+
             if (res.status === 400) { const err = await res.json(); alert(`Failed: ${err.detail}`); return; }
             document.getElementById("sched_name").value = "";
             document.getElementById("sched_target").value = "";
             document.getElementById("sched_interval").value = "";
+            if (document.getElementById("sched_port")) document.getElementById("sched_port").value = "";
             loadSchedules();
         }
         async function pauseSchedule(id) { await apiFetch(`/schedules/${id}/pause`, { method: 'POST' }); loadSchedules(); }
@@ -5089,6 +5539,11 @@ def dashboard():
         let insightWindow = '7d';
         let insightHost = null;
         let chartActivity = null, chartRisk = null, chartTopHosts = null, chartScanHistory = null;
+        let chartScanTypes = null, chartTopPorts = null;
+        // Insight host table pagination (separate from main pageData since it's a sub-view)
+        let insightHostsData = [];
+        let insightHostPage  = 1;
+        const INSIGHT_HOST_PAGE_SIZE = 15;
 
         function setInsightWindow(w) {
             insightWindow = w;
@@ -5132,6 +5587,98 @@ def dashboard():
         }
 
         function destroyChart(ref) { if (ref) { ref.destroy(); } return null; }
+
+        function goPage_insightHosts(n) { insightHostPage = n; renderInsightHostTable(); }
+
+        function renderInsightHostTable() {
+            const tbody  = document.getElementById('insightHostTableBody');
+            const total  = insightHostsData.length;
+            const size   = INSIGHT_HOST_PAGE_SIZE;
+            const start  = (insightHostPage - 1) * size;
+            const paged  = insightHostsData.slice(start, start + size);
+
+            if (!total) {
+                tbody.innerHTML = '<p class="text-xs text-gray-600">No hosts found in this window.</p>';
+                return;
+            }
+
+            let hostRows = '';
+            for (const h of paged) {
+                const nameCell = h.hostname
+                    ? '<span class="text-gray-300">' + h.hostname + '</span>'
+                    : (h.agent_name
+                        ? '<span class="text-blue-400">agent: ' + h.agent_name + '</span>'
+                        : '<span class="text-gray-700 italic">unknown</span>');
+                const macCell  = h.mac ? '<div class="text-gray-600 font-mono text-xs">' + h.mac + '</div>' : '';
+                const osCell   = h.os  ? '<div class="text-gray-600 text-xs">' + h.os + '</div>' : '';
+                const ipWarn   = h.ip_changed ? ' <span class="text-yellow-500" title="IP changed from ' + (h.previous_ip || '') + '">⚠</span>' : '';
+                const lastScan = h.last_scan ? h.last_scan.split('T')[0] : '—';
+                const actionCell = h.result_id
+                    ? '<div class="flex gap-1.5 flex-wrap">'
+                        + '<a href="/report/' + h.result_id + '" target="_blank" '
+                        + 'class="text-xs px-2 py-1 rounded bg-cyan-900 hover:bg-cyan-800 text-cyan-300 border border-cyan-800 transition whitespace-nowrap">Report ↗</a>'
+                        + '<button onclick="goToResult(' + h.result_id + ')" '
+                        + 'class="text-xs px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-green-400 border border-gray-700 transition whitespace-nowrap">→ Result</button>'
+                        + '</div>'
+                    : '<span class="text-xs text-gray-700 italic">no result</span>';
+
+                hostRows +=
+                    '<tr class="border-b border-gray-800 hover:bg-gray-800 transition insight-host-row" data-ip="' + h.ip + '">'
+                    + '<td class="py-2 pr-4 cursor-pointer">'
+                    +     '<div class="font-mono text-green-400 text-xs">' + h.ip + ipWarn + '</div>' + osCell
+                    + '</td>'
+                    + '<td class="py-2 pr-4 cursor-pointer">'
+                    +     '<div class="text-xs">' + nameCell + '</div>' + macCell
+                    + '</td>'
+                    + '<td class="py-2 pr-4 text-xs text-gray-300 cursor-pointer">' + h.scan_count + '</td>'
+                    + '<td class="py-2 pr-4 text-xs text-gray-300 cursor-pointer">' + h.open_ports + '</td>'
+                    + '<td class="py-2 pr-4 text-xs text-gray-300 cursor-pointer">' + h.findings   + '</td>'
+                    + '<td class="py-2 pr-4 cursor-pointer">' + riskBadgeHtml(h.risk) + '</td>'
+                    + '<td class="py-2 pr-4 text-xs text-gray-500 cursor-pointer">' + lastScan + '</td>'
+                    + '<td class="py-2" onclick="event.stopPropagation()">' + actionCell + '</td>'
+                    + '</tr>';
+            }
+
+            // Pagination bar for insights host table
+            const numPages = Math.ceil(total / size);
+            let pagBar = '';
+            if (numPages > 1) {
+                const cur  = insightHostPage;
+                const prev = cur > 1 ? `<button onclick="goPage_insightHosts(${cur-1})" class="px-2 py-1 rounded text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-700 transition">‹</button>` : '<span class="px-2 py-1 text-xs text-gray-700">‹</span>';
+                const next = cur < numPages ? `<button onclick="goPage_insightHosts(${cur+1})" class="px-2 py-1 rounded text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-700 transition">›</button>` : '<span class="px-2 py-1 text-xs text-gray-700">›</span>';
+                const startN = start + 1, endN = Math.min(start + size, total);
+                pagBar = `<div class="flex items-center justify-between mt-4 pt-3 border-t border-gray-800">
+                    <span class="text-xs text-gray-600">${startN}–${endN} of ${total}</span>
+                    <div class="flex items-center gap-1">${prev}
+                        <span class="text-xs text-gray-500 px-2">Page ${cur} of ${numPages}</span>
+                    ${next}</div></div>`;
+            }
+
+            tbody.innerHTML =
+                '<table class="w-full text-sm">'
+                + '<thead><tr class="text-left text-gray-500 border-b border-gray-800 text-xs">'
+                + '<th class="pb-2 pr-4">Host</th>'
+                + '<th class="pb-2 pr-4">Identity</th>'
+                + '<th class="pb-2 pr-4">Scans</th>'
+                + '<th class="pb-2 pr-4">Open Ports</th>'
+                + '<th class="pb-2 pr-4">Findings</th>'
+                + '<th class="pb-2 pr-4">Risk</th>'
+                + '<th class="pb-2 pr-4">Last Scan</th>'
+                + '<th class="pb-2">Actions</th>'
+                + '</tr></thead>'
+                + '<tbody>' + hostRows + '</tbody>'
+                + '</table>' + pagBar;
+        }
+
+        // Delegated click handler for insight host table rows
+        // (avoids inline onclick with escaped quotes which break in Firefox)
+        document.addEventListener('click', function(e) {
+            const row = e.target.closest('.insight-host-row');
+            if (row && !e.target.closest('[onclick]') && !e.target.closest('button') && !e.target.closest('a')) {
+                const ip = row.dataset.ip;
+                if (ip) drillIntoHost(ip);
+            }
+        });
 
         async function loadInsights() {
             // Always sync the active window button styling
@@ -5262,76 +5809,68 @@ def dashboard():
                 }
             });
 
-            // ── Host table ────────────────────────────────────────────────
-            if (!insightHost) {
-                var tbody = document.getElementById('insightHostTableBody');
-                if (!data.hosts.length) {
-                    tbody.innerHTML = '<p class="text-xs text-gray-600">No hosts found in this window.</p>';
-                } else {
-                    var hostRows = '';
-                    for (var hi = 0; hi < data.hosts.length; hi++) {
-                        var h = data.hosts[hi];
- 
-                        var nameCell = h.hostname
-                            ? '<span class="text-gray-300">' + h.hostname + '</span>'
-                            : (h.agent_name
-                                ? '<span class="text-blue-400">agent: ' + h.agent_name + '</span>'
-                                : '<span class="text-gray-700 italic">unknown</span>');
-                        var macCell = h.mac ? '<div class="text-gray-600 font-mono text-xs">' + h.mac + '</div>' : '';
-                        var osCell  = h.os  ? '<div class="text-gray-600 text-xs">' + h.os + '</div>' : '';
-                        var ipWarn  = h.ip_changed ? ' <span class="text-yellow-500" title="IP changed from ' + (h.previous_ip || '') + '">\u26a0</span>' : '';
-                        var lastScan = h.last_scan ? h.last_scan.split('T')[0] : '\u2014';
- 
-                        var actionCell = '';
-                        if (h.result_id) {
-                            actionCell =
-                                '<div class="flex gap-1.5 flex-wrap">'
-                                + '<a href="/report/' + h.result_id + '" target="_blank" '
-                                + 'class="text-xs px-2 py-1 rounded bg-cyan-900 hover:bg-cyan-800 text-cyan-300 border border-cyan-800 transition whitespace-nowrap">'
-                                + 'Report \u2197</a>'
-                                + '<button onclick="goToResult(' + h.result_id + ')" '
-                                + 'class="text-xs px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-green-400 border border-gray-700 transition whitespace-nowrap">'
-                                + '\u2192 Result</button>'
-                                + '</div>';
-                        } else {
-                            actionCell = '<span class="text-xs text-gray-700 italic">no result</span>';
-                        }
- 
-                        hostRows +=
-                            '<tr class="border-b border-gray-800 hover:bg-gray-800 transition">'
-                            + '<td class="py-2 pr-4 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">'
-                            +     '<div class="font-mono text-green-400 text-xs">' + h.ip + ipWarn + '</div>' + osCell
-                            + '</td>'
-                            + '<td class="py-2 pr-4 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">'
-                            +     '<div class="text-xs">' + nameCell + '</div>' + macCell
-                            + '</td>'
-                            + '<td class="py-2 pr-4 text-xs text-gray-300 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">' + h.scan_count + '</td>'
-                            + '<td class="py-2 pr-4 text-xs text-gray-300 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">' + h.open_ports + '</td>'
-                            + '<td class="py-2 pr-4 text-xs text-gray-300 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">' + h.findings   + '</td>'
-                            + '<td class="py-2 pr-4 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">' + riskBadgeHtml(h.risk) + '</td>'
-                            + '<td class="py-2 pr-4 text-xs text-gray-500 cursor-pointer" onclick="drillIntoHost(\\'' + h.ip + '\\')">' + lastScan + '</td>'
-                            + '<td class="py-2">' + actionCell + '</td>'
-                            + '</tr>';
-                    }
-                    tbody.innerHTML =
-                        '<table class="w-full text-sm">'
-                        + '<thead><tr class="text-left text-gray-500 border-b border-gray-800 text-xs">'
-                        + '<th class="pb-2 pr-4">Host</th>'
-                        + '<th class="pb-2 pr-4">Identity</th>'
-                        + '<th class="pb-2 pr-4">Scans</th>'
-                        + '<th class="pb-2 pr-4">Open Ports</th>'
-                        + '<th class="pb-2 pr-4">Findings</th>'
-                        + '<th class="pb-2 pr-4">Risk</th>'
-                        + '<th class="pb-2 pr-4">Last Scan</th>'
-                        + '<th class="pb-2">Actions</th>'
-                        + '</tr></thead>'
-                        + '<tbody>' + hostRows + '</tbody>'
-                        + '</table>';
+            // ── Scan type breakdown chart ──────────────────────────────────
+            chartScanTypes = destroyChart(chartScanTypes);
+            const stCtx = document.getElementById('chartScanTypes').getContext('2d');
+            const stLabels = Object.keys(data.scan_type_counts || {});
+            const stVals   = stLabels.map(k => data.scan_type_counts[k]);
+            const stColors = ['rgba(74,222,128,0.7)', 'rgba(96,165,250,0.7)', 'rgba(251,146,60,0.7)'];
+            chartScanTypes = new Chart(stCtx, {
+                type: 'doughnut',
+                data: {
+                    labels: stLabels,
+                    datasets: [{ data: stVals.length ? stVals : [1], backgroundColor: stVals.length ? stColors : ['#1f2937'], borderWidth: 0 }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'right', labels: { color: '#9ca3af', font: { size: 10 }, boxWidth: 12, padding: 8 } },
+                        tooltip: { enabled: !!stVals.length }
+                    },
+                    cutout: '60%'
                 }
-            }
-            
+            });
 
-            // ── Per-host scan history ─────────────────────────────────────
+            // ── Port frequency chart ───────────────────────────────────────
+            chartTopPorts = destroyChart(chartTopPorts);
+            const portCtx  = document.getElementById('chartTopPorts').getContext('2d');
+            const portData = (data.top_ports || []).slice(0, 12);
+            chartTopPorts = new Chart(portCtx, {
+                type: 'bar',
+                data: {
+                    labels: portData.map(p => p.port),
+                    datasets: [{ label: 'Hosts', data: portData.map(p => p.host_count), backgroundColor: 'rgba(96,165,250,0.5)', borderColor: '#60a5fa', borderWidth: 1, borderRadius: 3 }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        x: { ticks: { color: '#6b7280', font: { size: 9 } }, grid: { color: '#1f2937' } },
+                        y: { ticks: { color: '#6b7280', font: { size: 10 }, stepSize: 1 }, grid: { color: '#1f2937' }, beginAtZero: true }
+                    }
+                }
+            });
+
+            // ── Coverage gaps ──────────────────────────────────────────────
+            const gapPanel = document.getElementById('insightCoverageGaps');
+            const gapBody  = document.getElementById('insightCoverageGapsBody');
+            const gaps = data.coverage_gaps || [];
+            if (gaps.length && !insightHost) {
+                gapPanel.classList.remove('hidden');
+                gapBody.innerHTML = gaps.map(ip =>
+                    `<button onclick="drillIntoHost('${ip}')" class="text-xs font-mono px-2 py-1 rounded bg-yellow-950 border border-yellow-800 text-yellow-300 hover:bg-yellow-900 transition">${ip}</button>`
+                ).join('');
+            } else {
+                gapPanel.classList.add('hidden');
+            }
+
+            // ── Host table (paginated) ─────────────────────────────────────
+            if (!insightHost) {
+                insightHostsData = data.hosts;
+                insightHostPage  = 1;
+                renderInsightHostTable();
+            }
+
             if (insightHost && data.scan_history.length) {
                 // Line chart: open ports over time
                 chartScanHistory = destroyChart(chartScanHistory);
