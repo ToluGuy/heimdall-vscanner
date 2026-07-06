@@ -507,3 +507,9 @@ Check that `AI_PROVIDER` and `AI_API_KEY` are set in `.env` and that the server 
 
 **Update broke something**
 Each update only adds columns — it never drops or modifies existing ones. If something looks wrong after an update, check `journalctl -u vapt-server -n 50` for startup errors and compare your `.env` against the Environment Variables table above for any new required values.
+
+## Usage
+
+```bash
+python3 main.py
+```
