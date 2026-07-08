@@ -176,10 +176,59 @@ def startup_cleanup():
 DASHBOARD_USERNAME = os.environ.get("DASHBOARD_USERNAME", "admin")
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "vapt-admin")
 
+if DASHBOARD_PASSWORD == "vapt-admin":
+    logger.warning(
+        "DASHBOARD_PASSWORD is not set (or is still the default 'vapt-admin'). "
+        "Set a strong DASHBOARD_PASSWORD in .env — this dashboard controls a "
+        "network scanner and should not be left on the default credential."
+    )
+
+# Optional shared secret for /agents/register. Registration is otherwise
+# unauthenticated by design (a new scanner/agent has no API key yet), which
+# means anyone who can reach this server can register as an agent and start
+# receiving job targets. Set VAPT_REGISTRATION_TOKEN in .env (and the matching
+# value on each agent/scanner) to close that off. Left unset by default so
+# existing installs aren't broken by an update.
+AGENT_REGISTRATION_TOKEN = os.environ.get("VAPT_REGISTRATION_TOKEN")
+if not AGENT_REGISTRATION_TOKEN:
+    logger.warning(
+        "VAPT_REGISTRATION_TOKEN is not set — /agents/register is open to anyone who can "
+        "reach this server. Set VAPT_REGISTRATION_TOKEN in .env to require a shared secret "
+        "for new agent/scanner registration."
+    )
+
 # Web ports are Nikto's domain — NSE and standalone jobs validate against this
 WEB_PORTS = {80, 443, 8080, 8443, 8000, 8888}
 
 VALID_JOB_TYPES = {"nmap_scan", "nikto_scan", "nse_scan"}
+
+
+def validate_target(value: str, field_name: str = "target") -> str:
+    """
+    Defensive validation for any user-supplied value that ends up as a bare
+    argv token passed to nmap/nikto (target, subnet, etc). These tools parse
+    tokens starting with '-' as flags rather than targets, so an unvalidated
+    value could inject options such as -oG (write a file) or -iL (read a file
+    as a target list). Commands are invoked as argv lists, never through a
+    shell, so this is scoped to the one thing that actually matters at that
+    boundary — it deliberately does not restrict character sets, since the
+    target field legitimately accepts hostnames, IPv6 addresses, CIDR ranges,
+    and full URLs (for Web Scan).
+    """
+    value = (value or "").strip()
+    if not value:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required")
+    if len(value) > 512:
+        raise HTTPException(status_code=400, detail=f"{field_name} is too long")
+    if any(ord(c) < 32 for c in value):
+        raise HTTPException(status_code=400, detail=f"{field_name} contains invalid control characters")
+    if value[0] == "-":
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} cannot start with '-' — this would be interpreted as a "
+                   "command-line flag by nmap/nikto rather than a target"
+        )
+    return value
 
 
 def require_auth(credentials: HTTPBasicCredentials = Depends(security)):
@@ -206,7 +255,17 @@ def root():
 
 
 @app.post("/agents/register", response_model=AgentResponse)
-def register_agent(agent: AgentCreate, db: Session = Depends(get_db)):
+def register_agent(
+    agent: AgentCreate,
+    db: Session = Depends(get_db),
+    x_registration_token: str | None = Header(default=None),
+):
+    if AGENT_REGISTRATION_TOKEN:
+        if not x_registration_token or not secrets.compare_digest(
+            x_registration_token, AGENT_REGISTRATION_TOKEN
+        ):
+            raise HTTPException(status_code=401, detail="Invalid or missing registration token")
+
     new_agent = Agent(
         name=agent.name,
         capabilities=agent.capabilities or "nmap_scan"
@@ -577,6 +636,8 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
             detail=f"Unknown job type '{job.type}'. Valid types: {sorted(VALID_JOB_TYPES)}"
         )
 
+    target = validate_target(job.target)
+
     # validate port for nikto jobs
     if job.type == "nikto_scan" and job.port is not None:
         if job.port not in WEB_PORTS:
@@ -627,7 +688,7 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
 
     new_job = Job(
         type=job.type,
-        target=job.target,
+        target=target,
         agent_id=job.agent_id,
         status="pending",
         priority=job.priority if job.priority else "medium",
@@ -1184,15 +1245,13 @@ def create_schedule(
 ):
     name = data.get("name", "").strip()
     scan_type = data.get("type", "").strip()
-    target = data.get("target", "").strip()
+    target = validate_target(data.get("target", ""))
     interval_hours = data.get("interval_hours")
 
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
     if scan_type not in VALID_JOB_TYPES:
         raise HTTPException(status_code=400, detail=f"Invalid type. Valid: {sorted(VALID_JOB_TYPES)}")
-    if not target:
-        raise HTTPException(status_code=400, detail="target is required")
     if not interval_hours or int(interval_hours) < 1:
         raise HTTPException(status_code=400, detail="interval_hours must be >= 1")
 
@@ -1342,12 +1401,9 @@ def start_discovery(
     db: Session = Depends(get_db),
     username: str = Depends(require_auth)
 ):
-    subnet = data.get("subnet", "").strip()
+    subnet = validate_target(data.get("subnet", ""), field_name="subnet")
     mode = data.get("mode", "remote")
     profile = data.get("profile", "standard")
-
-    if not subnet:
-        raise HTTPException(status_code=400, detail="subnet is required")
 
     sweep = DiscoverySweep(
         subnet=subnet,
@@ -1511,9 +1567,7 @@ def ping_sweep(
     Fast ping sweep — discovers live hosts in a subnet but does NOT create jobs.
     Returns the list of responding hosts for the user to review before committing.
     """
-    subnet = data.get("subnet", "").strip()
-    if not subnet:
-        raise HTTPException(status_code=400, detail="subnet is required")
+    subnet = validate_target(data.get("subnet", ""), field_name="subnet")
  
     try:
         result = subprocess.run(
