@@ -455,6 +455,7 @@ heimdall-vscanner/
 | `DB_USER` | Database user | `vapt_user` |
 | `DB_PASSWORD` | Database password | — |
 | `STALE_AGENT_HOURS` | Hours before an agent is flagged stale | `24` |
+| `VAPT_REGISTRATION_TOKEN` | Optional shared secret required from agents/scanners at `/agents/register`. Leave unset to keep registration open (the original behaviour). If set here, the same value must be set on every agent and scanner. | — |
 | `AI_PROVIDER` | AI provider for scan analysis (`anthropic`, `openai`, `groq`, `ollama`) | — |
 | `AI_API_KEY` | API key for the chosen AI provider | — |
 | `AI_MODEL` | Model override — leave blank for provider default | — |
@@ -469,6 +470,7 @@ heimdall-vscanner/
 | `VAPT_AGENT_NAME` | Name for this agent instance | `agent-default` |
 | `VAPT_CAPABILITIES` | Comma-separated scan types this agent handles | `nmap_scan,nikto_scan,nse_scan` |
 | `VAPT_KEY_FILE` | Path to store the agent API key | `{agent-name}_key.txt` |
+| `VAPT_REGISTRATION_TOKEN` | Shared secret sent when registering — only required if the server has `VAPT_REGISTRATION_TOKEN` set | — |
 
 ---
 
@@ -504,6 +506,9 @@ ALTER DATABASE vapt OWNER TO vapt_user;
 
 **AI analysis not appearing**
 Check that `AI_PROVIDER` and `AI_API_KEY` are set in `.env` and that the server has been restarted. You can also trigger analysis manually from the dashboard by clicking "Analyse" on any result. Verify the setting is enabled in the Settings panel.
+
+**Job, schedule, or sweep creation returns 400 "cannot start with -"**
+Target/subnet values are validated before being handed to Nmap/Nikto, since a value starting with `-` would otherwise be parsed as a command-line flag rather than a target. Remove the leading hyphen — it isn't a valid target/subnet in any case.
 
 **Update broke something**
 Each update only adds columns — it never drops or modifies existing ones. If something looks wrong after an update, check `journalctl -u vapt-server -n 50` for startup errors and compare your `.env` against the Environment Variables table above for any new required values.
