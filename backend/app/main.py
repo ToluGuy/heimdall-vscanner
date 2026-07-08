@@ -104,6 +104,7 @@ def run_scheduler():
                     profile=schedule.profile,
                     priority=schedule.priority,
                     ports=schedule.ports,
+                    port=schedule.port,
                 )
                 db.add(new_job)
                 schedule.last_run_at = now
@@ -1165,6 +1166,7 @@ def get_schedules(
             "profile": s.profile,
             "priority": s.priority,
             "ports": s.ports,
+            "port": s.port,
             "interval_hours": s.interval_hours,
             "paused": s.paused,
             "last_run_at": s.last_run_at.isoformat() if s.last_run_at else None,
@@ -1203,6 +1205,7 @@ def create_schedule(
         profile=data.get("profile", "standard"),
         priority=data.get("priority", "medium"),
         ports=data.get("ports") or None,
+        port=int(data["port"]) if data.get("port") else None,
         interval_hours=int(interval_hours),
         next_run_at=now,   # fire immediately on first tick
     )
@@ -2152,6 +2155,12 @@ def get_insights(
         "coverage_gaps":    coverage_gaps,
         "hosts":            hosts_list,
         "scan_history":     scan_history,
+        "scan_health": {
+            "done":      sum(1 for j in jobs if j.status == "done"),
+            "failed":    sum(1 for j in jobs if j.status == "failed"),
+            "cancelled": sum(1 for j in jobs if j.status == "cancelled"),
+            "pending":   sum(1 for j in jobs if j.status == "pending"),
+        },
     }
 
 
@@ -3201,8 +3210,8 @@ def dashboard():
                 </div>
             </div>
 
-            <!-- Scan type breakdown + Port frequency side by side -->
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-6" id="insightExtraCharts">
+            <!-- Scan type breakdown + Port frequency + Scan health -->
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6" id="insightExtraCharts">
                 <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
                     <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Scan Type Breakdown</h3>
                     <div class="relative h-48 flex items-center justify-center">
@@ -3213,6 +3222,12 @@ def dashboard():
                     <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Top Open Ports (by host count)</h3>
                     <div class="relative h-48">
                         <canvas id="chartTopPorts"></canvas>
+                    </div>
+                </div>
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                    <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Scan Health</h3>
+                    <div class="relative h-48 flex items-center justify-center">
+                        <canvas id="chartScanHealth"></canvas>
                     </div>
                 </div>
             </div>
@@ -3557,7 +3572,7 @@ def dashboard():
             const ms = parseInt(getClientSetting('refreshInterval', '5000'));
             if (ms > 0) {
                 autoRefreshTimer = setInterval(() => {
-                    loadAgents();
+                    refreshAgents();
                     refreshJobs();
                 }, ms);
             }
@@ -4448,7 +4463,19 @@ def dashboard():
             const data = await res.json();
             data.sort((a, b) => a.id - b.id);
             pageData.agents = data;
-            pages.agents = 1;
+            pages.agents = 1;   // explicit load — reset to page 1
+            renderAgents();
+        }
+
+        // Background refresh: updates data but preserves the current page.
+        async function refreshAgents() {
+            const url = showStaleAgents ? '/agents?show_stale=true' : '/agents';
+            const res = await apiFetch(url);
+            if (!res) return;
+            const data = await res.json();
+            data.sort((a, b) => a.id - b.id);
+            pageData.agents = data;
+            // Do NOT reset pages.agents — preserve current page
             renderAgents();
         }
 
@@ -5454,7 +5481,7 @@ def dashboard():
                 html += `<tr class="border-b border-gray-800 hover:bg-gray-800 transition">
                 <td class="py-2 pr-3 font-medium text-sm">${s.name}</td>
                 <td class="py-2 pr-3 text-xs text-blue-300">${scanTypeLabel(s.type)}</td>
-                <td class="py-2 pr-3 font-mono text-xs">${s.target}</td>
+                <td class="py-2 pr-3 font-mono text-xs">${s.target}${s.port ? '<span class="text-gray-600">:' + s.port + '</span>' : ''}</td>
                 <td class="py-2 pr-3 text-xs text-gray-300">${s.profile}</td>
                 <td class="py-2 pr-3 text-xs text-gray-300">${s.interval_hours}h</td>
                 <td class="py-2 pr-3">${badge}</td>
@@ -5514,7 +5541,7 @@ def dashboard():
         let insightWindow = '7d';
         let insightHost = null;
         let chartActivity = null, chartRisk = null, chartTopHosts = null, chartScanHistory = null;
-        let chartScanTypes = null, chartTopPorts = null;
+        let chartScanTypes = null, chartTopPorts = null, chartScanHealth = null;
         // Insight host table pagination (separate from main pageData since it's a sub-view)
         let insightHostsData = [];
         let insightHostPage  = 1;
@@ -5785,7 +5812,8 @@ def dashboard():
             });
 
             // ── Scan type breakdown chart ──────────────────────────────────
-            chartScanTypes = destroyChart(chartScanTypes);
+            chartScanTypes  = destroyChart(chartScanTypes);
+            chartScanHealth = destroyChart(chartScanHealth);
             const stCtx = document.getElementById('chartScanTypes').getContext('2d');
             const stLabels = Object.keys(data.scan_type_counts || {});
             const stVals   = stLabels.map(k => data.scan_type_counts[k]);
@@ -5823,6 +5851,38 @@ def dashboard():
                         x: { ticks: { color: '#6b7280', font: { size: 9 } }, grid: { color: '#1f2937' } },
                         y: { ticks: { color: '#6b7280', font: { size: 10 }, stepSize: 1 }, grid: { color: '#1f2937' }, beginAtZero: true }
                     }
+                }
+            });
+
+            // ── Scan health chart ──────────────────────────────────────────
+            chartScanHealth = destroyChart(chartScanHealth);
+            const shCtx = document.getElementById('chartScanHealth').getContext('2d');
+            const sh    = data.scan_health || {};
+            const shLabels = ['Done', 'Failed', 'Cancelled', 'Pending'];
+            const shVals   = [sh.done || 0, sh.failed || 0, sh.cancelled || 0, sh.pending || 0];
+            const shColors = ['rgba(74,222,128,0.7)', 'rgba(239,68,68,0.7)', 'rgba(234,179,8,0.7)', 'rgba(96,165,250,0.4)'];
+            const shTotal  = shVals.reduce((a, b) => a + b, 0);
+            chartScanHealth = new Chart(shCtx, {
+                type: 'doughnut',
+                data: {
+                    labels: shLabels,
+                    datasets: [{ data: shTotal ? shVals : [1], backgroundColor: shTotal ? shColors : ['#1f2937'], borderWidth: 0 }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'right', labels: { color: '#9ca3af', font: { size: 10 }, boxWidth: 12, padding: 8 } },
+                        tooltip: {
+                            enabled: !!shTotal,
+                            callbacks: {
+                                label: ctx => {
+                                    const pct = shTotal ? Math.round(ctx.parsed / shTotal * 100) : 0;
+                                    return ` ${ctx.label}: ${ctx.parsed} (${pct}%)`;
+                                }
+                            }
+                        }
+                    },
+                    cutout: '60%'
                 }
             });
 
