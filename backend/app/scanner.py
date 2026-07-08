@@ -35,6 +35,9 @@ AGENT_NAME = os.environ.get("VAPT_AGENT_NAME", "scanner-1")
 CAPABILITIES = os.environ.get("VAPT_CAPABILITIES", "nmap_scan,nikto_scan,nse_scan")
 API_KEY_FILE = os.environ.get("VAPT_KEY_FILE", f"{AGENT_NAME}_key.txt")
 
+# Optional shared secret — only needed if the server has VAPT_REGISTRATION_TOKEN set.
+REGISTRATION_TOKEN = os.environ.get("VAPT_REGISTRATION_TOKEN")
+
 # Web ports are Nikto's domain — NSE skips these automatically
 WEB_PORTS = {80, 443, 8080, 8443, 8000, 8888}
 
@@ -42,6 +45,29 @@ WEB_PORTS = {80, 443, 8080, 8443, 8000, 8888}
 # Port 8000 is excluded because it is typically the Heimdall backend itself —
 # scanning it with Nikto is meaningless and reliably times out.
 NIKTO_SKIP_PORTS = {8000}
+
+# --- SCAN TIMEOUTS ---
+#
+# Nikto already had a hard timeout (100s). Nmap did not, which meant a scan
+# against an unresponsive or heavily-filtered host could hang the scanner/agent
+# indefinitely — the job-cancel and crash-recovery features could mark the job
+# failed/stuck in the DB, but the underlying nmap process itself kept running.
+# These bound the worst case while staying generous enough for a legitimate
+# full-port scan of a slow host. Same pattern already used for the ping-sweep
+# discovery scan (300s) in main.py.
+NMAP_TIMEOUT_SECONDS = {
+    "light": 180,      # -F, top 100 ports
+    "standard": 300,   # -sV, top 1000 ports
+    "full": 900,       # -sV -O -p-, all 65535 ports
+}
+DEFAULT_NMAP_TIMEOUT = 300
+
+NSE_TIMEOUT_SECONDS = {
+    "light": 300,      # --script safe
+    "standard": 600,   # --script vuln
+    "full": 1200,      # --script vuln,exploit — slowest, most intrusive
+}
+DEFAULT_NSE_TIMEOUT = 600
 
 # --- CUSTOM PROFILE: SCRIPT → PORT MAPPING ---
 #
@@ -183,10 +209,12 @@ def register():
         "name": AGENT_NAME,
         "capabilities": CAPABILITIES,
     }
+    headers = {"x-registration-token": REGISTRATION_TOKEN} if REGISTRATION_TOKEN else {}
 
     response = requests.post(
         f"{SERVER_URL}/agents/register",
         json=payload,
+        headers=headers,
         timeout=10,
     )
 
@@ -373,12 +401,20 @@ def run_nmap(target: str, profile: str = "standard") -> list:
     logger.info(f"Running Nmap ({profile}) on {target}")
 
     flags = get_nmap_flags(profile)
+    timeout_s = NMAP_TIMEOUT_SECONDS.get(profile, DEFAULT_NMAP_TIMEOUT)
 
-    result = subprocess.run(
-        ["nmap", *flags, "-oX", "-", target],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["nmap", *flags, "-oX", "-", target],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        raise Exception(
+            f"Nmap scan timed out after {timeout_s}s (profile={profile}) — "
+            "target may be unresponsive or heavily filtered"
+        )
 
     if result.returncode != 0:
         raise Exception(f"Nmap failed: {result.stderr}")
@@ -512,6 +548,7 @@ def run_nse(target: str, profile: str = "standard", ports_str: str | None = None
 
     nse_flags = get_nse_flags(profile)
     port_list, advisory = resolve_nse_ports(ports_str)
+    timeout_s = NSE_TIMEOUT_SECONDS.get(profile, DEFAULT_NSE_TIMEOUT)
 
     cmd = ["nmap", "-sV", *nse_flags]
 
@@ -523,11 +560,18 @@ def run_nse(target: str, profile: str = "standard", ports_str: str | None = None
 
     cmd += ["-oX", "-", target]
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        raise Exception(
+            f"NSE scan timed out after {timeout_s}s (profile={profile}) — "
+            "target may be unresponsive or heavily filtered"
+        )
 
     if result.returncode != 0:
         raise Exception(f"NSE scan failed: {result.stderr}")
@@ -567,11 +611,18 @@ def run_custom_nse(target: str, scripts: list[str]) -> dict:
     if not tcp_ports and not udp_ports:
         logger.info("  No ports derived — using Nmap default range")
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=DEFAULT_NSE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise Exception(
+            f"Custom NSE scan timed out after {DEFAULT_NSE_TIMEOUT}s — "
+            "target may be unresponsive or heavily filtered"
+        )
 
     if result.returncode != 0:
         raise Exception(f"Custom NSE scan failed: {result.stderr}")
@@ -732,6 +783,10 @@ def execute_job(job: dict, api_key: str):
 
     except Exception as e:
         logger.error(f"Job {job_id} execution failed: {e}")
+        try:
+            send_result(api_key, job_id, json.dumps({"error": str(e)}))
+        except Exception as send_err:
+            logger.error(f"Job {job_id} — also failed to record error result: {send_err}")
         send_job_status(api_key, job_id, "failed")
 
 
