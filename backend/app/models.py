@@ -99,7 +99,8 @@ class Schedule(Base):
     mode = Column(String, default="remote")
     profile = Column(String, default="standard")
     priority = Column(String, default="medium")
-    ports = Column(String, nullable=True)               # for nse_scan
+    ports = Column(String, nullable=True)               # for nse_scan (comma-separated)
+    port = Column(Integer, nullable=True)               # for nikto_scan (single port)
     interval_hours = Column(Integer, nullable=False)    # how often to fire
     paused = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)

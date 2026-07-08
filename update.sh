@@ -197,6 +197,14 @@ BEGIN
 
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
+        WHERE table_name='schedules' AND column_name='port'
+    ) THEN
+        ALTER TABLE schedules ADD COLUMN port INTEGER;
+        RAISE NOTICE 'Added schedules.port';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
         WHERE table_name='agents' AND column_name='is_stale'
     ) THEN
         ALTER TABLE agents ADD COLUMN is_stale BOOLEAN DEFAULT FALSE;
