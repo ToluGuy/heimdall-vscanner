@@ -63,11 +63,17 @@ NMAP_TIMEOUT_SECONDS = {
 DEFAULT_NMAP_TIMEOUT = 300
 
 NSE_TIMEOUT_SECONDS = {
-    "light": 300,      # --script safe
-    "standard": 600,   # --script vuln
-    "full": 1200,      # --script vuln,exploit — slowest, most intrusive
+    # NOTE: corrected after real-world testing. "light" maps to --script safe,
+    # which is Nmap's BROADEST script category (covers nearly every protocol/
+    # service with banner/info scripts) — it is not "the fast one." Against a
+    # host with several open services it can legitimately run longer than
+    # --script vuln, which is comparatively narrow and targeted. Don't assume
+    # profile label == relative speed for NSE; give all tiers generous room.
+    "light": 900,      # --script safe
+    "standard": 900,   # --script vuln
+    "full": 1200,      # --script vuln,exploit — vuln + exploit combined
 }
-DEFAULT_NSE_TIMEOUT = 600
+DEFAULT_NSE_TIMEOUT = 900
 
 # --- CUSTOM PROFILE: SCRIPT → PORT MAPPING ---
 #
