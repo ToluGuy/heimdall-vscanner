@@ -4874,15 +4874,15 @@ def dashboard():
         function renderNiktoResult(nikto) {
             if (!nikto) return '';
             return Object.entries(nikto).map(([port, result]) => {
-                if (result.error) return `<div class="mt-2"><p class="text-xs text-gray-400">Nikto port ${port}:</p><p class="text-xs text-red-400">${result.error}</p></div>`;
+                if (result.error) return `<div class="mt-2"><p class="text-xs text-gray-400">Nikto port ${port}:</p><p class="text-xs text-red-400 break-all">${result.error}</p></div>`;
                 if (result.raw) {
                     const findings = result.raw.split('\\n').filter(l => l.match(/^\\+ \\[/));
                     if (!findings.length) return `<div class="mt-2"><p class="text-xs text-gray-500">Nikto port ${port}: no findings.</p></div>`;
-                    return `<div class="mt-2"><p class="text-xs text-gray-400 mb-2">Nikto port ${port} — ${findings.length} finding(s):</p><div class="space-y-1">${findings.map(line => { const m = line.match(/^\\+ \\[(\\w+)\\] (.+?):\\s*(.+)$/); return m ? `<div class="bg-gray-950 rounded p-2 text-xs"><span class="text-yellow-400 font-mono">[${m[1]}]</span><span class="text-gray-400 font-mono ml-2">${m[2]}:</span><span class="text-gray-200 ml-1">${m[3]}</span></div>` : `<div class="bg-gray-950 rounded p-2 text-xs text-gray-300">${line.replace(/^\\+ /, '')}</div>`; }).join('')}</div></div>`;
+                    return `<div class="mt-2"><p class="text-xs text-gray-400 mb-2">Nikto port ${port} — ${findings.length} finding(s):</p><div class="space-y-1">${findings.map(line => { const m = line.match(/^\\+ \\[(\\w+)\\] (.+?):\\s*(.+)$/); return m ? `<div class="bg-gray-950 rounded p-2 text-xs break-all"><span class="text-yellow-400 font-mono">[${m[1]}]</span><span class="text-gray-400 font-mono ml-2">${m[2]}:</span><span class="text-gray-200 ml-1">${m[3]}</span></div>` : `<div class="bg-gray-950 rounded p-2 text-xs text-gray-300 break-all">${line.replace(/^\\+ /, '')}</div>`; }).join('')}</div></div>`;
                 }
                 const vulns = result[0]?.vulnerabilities || [];
                 if (!vulns.length) return `<p class="text-xs text-gray-500 mt-2">Nikto port ${port}: no vulnerabilities found.</p>`;
-                return `<div class="mt-2"><p class="text-xs text-gray-400 mb-1">Nikto port ${port} — ${vulns.length} finding(s):</p><div class="space-y-1">${vulns.map(v => `<div class="bg-gray-950 rounded p-2 text-xs"><span class="text-yellow-400 font-mono">[${v.id}]</span><span class="text-gray-200 ml-2">${v.msg}</span>${v.url ? `<span class="text-gray-500 ml-2"><a href="${v.url}" target="_blank" class="hover:text-blue-400">${v.url}</a></span>` : ''}</div>`).join('')}</div></div>`;
+                return `<div class="mt-2"><p class="text-xs text-gray-400 mb-1">Nikto port ${port} — ${vulns.length} finding(s):</p><div class="space-y-1">${vulns.map(v => `<div class="bg-gray-950 rounded p-2 text-xs break-all"><span class="text-yellow-400 font-mono">[${v.id}]</span><span class="text-gray-200 ml-2">${v.msg}</span>${v.url ? `<span class="text-gray-500 ml-2"><a href="${v.url}" target="_blank" class="hover:text-blue-400">${v.url}</a></span>` : ''}</div>`).join('')}</div></div>`;
             }).join('');
         }
         function renderNseResult(nse) {
@@ -4895,7 +4895,7 @@ def dashboard():
                 const outputId = `nse-output-${Math.random().toString(36).slice(2)}`;
                 const shortOutput = f.output.length > 200 ? f.output.slice(0, 200) + '...' : f.output;
                 const hasMore = f.output.length > 200;
-                return `<div class="bg-gray-950 rounded-lg p-3 text-xs space-y-1"><div class="flex items-center gap-3 flex-wrap"><span class="text-purple-400 font-mono font-semibold">${f.script_id}</span><span class="text-gray-500">on</span>${portLabel}<span class="text-gray-600 font-mono">${f.host}</span></div><div class="text-gray-300 whitespace-pre-wrap leading-relaxed" id="${outputId}-short">${shortOutput}</div>${hasMore ? `<div class="text-gray-300 whitespace-pre-wrap leading-relaxed hidden" id="${outputId}-full">${f.output}</div><button onclick="document.getElementById('${outputId}-short').classList.toggle('hidden');document.getElementById('${outputId}-full').classList.toggle('hidden');this.textContent=this.textContent==='Show more'?'Show less':'Show more';" class="text-xs text-gray-500 hover:text-gray-300 underline transition">Show more</button>` : ''}</div>`;
+                return `<div class="bg-gray-950 rounded-lg p-3 text-xs space-y-1 break-all"><div class="flex items-center gap-3 flex-wrap"><span class="text-purple-400 font-mono font-semibold">${f.script_id}</span><span class="text-gray-500">on</span>${portLabel}<span class="text-gray-600 font-mono">${f.host}</span></div><div class="text-gray-300 whitespace-pre-wrap leading-relaxed" id="${outputId}-short">${shortOutput}</div>${hasMore ? `<div class="text-gray-300 whitespace-pre-wrap leading-relaxed hidden" id="${outputId}-full">${f.output}</div><button onclick="document.getElementById('${outputId}-short').classList.toggle('hidden');document.getElementById('${outputId}-full').classList.toggle('hidden');this.textContent=this.textContent==='Show more'?'Show less':'Show more';" class="text-xs text-gray-500 hover:text-gray-300 underline transition">Show more</button>` : ''}</div>`;
             }).join('');
             return `${warningHtml}<p class="text-xs text-gray-400 mb-2">${findings.length} NSE finding(s):</p><div class="space-y-2">${rows}</div>`;
         }
