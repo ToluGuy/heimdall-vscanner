@@ -1,0 +1,67 @@
+
+            .nav-tab { transition: all 0.15s ease; }
+            .nav-tab.active {
+                background: rgba(74, 222, 128, 0.1);
+                color: #4ade80;
+                border-color: #4ade80;
+            }
+            .tab-panel { display: none; }
+            .tab-panel.active { display: block; }
+            
+            /* ── Light theme ── */
+            body.theme-light {
+                --tw-bg-opacity: 1;
+                background-color: #f1f5f9 !important;
+                color: #0f172a !important;
+            }
+            body.theme-light .bg-gray-950  { background-color: #f1f5f9 !important; }
+            body.theme-light .bg-gray-900  { background-color: #ffffff !important; }
+            body.theme-light .bg-gray-800  { background-color: #f8fafc !important; }
+            body.theme-light .bg-gray-750  { background-color: #f1f5f9 !important; }
+            body.theme-light .bg-gray-700  { background-color: #e2e8f0 !important; }
+            body.theme-light .border-gray-800 { border-color: #e2e8f0 !important; }
+            body.theme-light .border-gray-700 { border-color: #cbd5e1 !important; }
+            body.theme-light .text-gray-100 { color: #0f172a !important; }
+            body.theme-light .text-gray-200 { color: #1e293b !important; }
+            body.theme-light .text-gray-300 { color: #334155 !important; }
+            body.theme-light .text-gray-400 { color: #475569 !important; }
+            body.theme-light .text-gray-500 { color: #64748b !important; }
+            body.theme-light .text-gray-600 { color: #94a3b8 !important; }
+            body.theme-light .text-gray-700 { color: #cbd5e1 !important; }
+            body.theme-light .text-white    { color: #0f172a !important; }
+            body.theme-light .bg-gray-950.bg-opacity-95 { background-color: rgba(241,245,249,0.97) !important; }
+            /* Keep accent colours as-is in light mode — green, blue, red etc stay vivid */
+             
+            /* ── Result card hover tooltip ── */
+            .result-tooltip {
+                position: absolute;
+                bottom: calc(100% + 8px);
+                left: 50%;
+                transform: translateX(-50%);
+                min-width: 240px;
+                max-width: 320px;
+                background: #060a10;
+                border: 1px solid #2a3347;
+                border-radius: 8px;
+                padding: 10px 14px;
+                pointer-events: none;
+                opacity: 0;
+                transition: opacity 0.12s ease;
+                z-index: 30;
+                white-space: nowrap;
+                box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+            }
+            .result-tooltip.visible {
+                opacity: 1;
+            }
+            /* Arrow pointing down */
+            .result-tooltip::after {
+                content: '';
+                position: absolute;
+                top: 100%;
+                left: 50%;
+                transform: translateX(-50%);
+                border: 5px solid transparent;
+                border-top-color: #2a3347;
+            }
+        

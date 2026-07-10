@@ -1,0 +1,897 @@
+
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <title>Heimdall V-Scanner</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <script src="https://cdn.tailwindcss.com"></script>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+        <link rel="stylesheet" href="/static/app.css">
+    </head>
+    <body class="bg-gray-950 text-gray-100 min-h-screen">
+
+        <!-- ── DIALOGS ──────────────────────────────────────────────────── -->
+
+        <!-- Confirm Dialog -->
+        <div id="confirmDialog" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 hidden">
+            <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-sm">
+                <h3 class="text-sm font-semibold text-white mb-2">Confirm Action</h3>
+                <p id="confirmMsg" class="text-xs text-gray-400 mb-5">This action cannot be undone.</p>
+                <div class="flex gap-3 justify-end">
+                    <button onclick="cancelConfirm()" class="text-xs px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 transition">Cancel</button>
+                    <button id="confirmOkBtn" class="text-xs px-4 py-2 rounded-lg bg-red-700 hover:bg-red-600 text-white font-semibold transition">Confirm</button>
+                </div>
+            </div>
+        </div>
+ 
+        <!-- Sweep Confirm Dialog (ping results → assign jobs?) -->
+        <div id="sweepConfirmDialog" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 hidden">
+            <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-lg max-h-screen overflow-y-auto">
+                <div class="flex items-center gap-3 mb-3">
+                    <span class="text-cyan-400 text-lg">⌖</span>
+                    <h3 class="text-sm font-semibold text-white">Assign Scan Jobs?</h3>
+                </div>
+                <p id="sweepConfirmMsg" class="text-xs text-gray-400 mb-2"></p>
+                <!-- Large sweep warning — shown when host count exceeds threshold -->
+                <div id="sweepLargeWarning" class="hidden mb-3 p-3 bg-yellow-950 border border-yellow-700 rounded-lg text-xs text-yellow-300 space-y-1">
+                    <p class="font-semibold">⚠ Large sweep detected</p>
+                    <p id="sweepLargeWarningMsg"></p>
+                    <p>For faster results, consider registering additional scanner instances from the Agents tab.</p>
+                </div>
+                <div id="sweepHostList" class="max-h-32 overflow-y-auto mb-4 space-y-1"></div>
+
+                <!-- Job type + profile selectors -->
+                <div class="bg-gray-800 border border-gray-700 rounded-lg p-4 mb-4 space-y-3">
+                    <p class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Scan Settings</p>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500">Scan Type</label>
+                            <select id="sweepJobType" onchange="onSweepJobTypeChange()"
+                                class="bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-cyan-500">
+                                <option value="nmap_scan">Open Port Scan</option>
+                                <option value="nse_scan">Vulnerability Scan</option>
+                                <option value="nikto_scan">Web Scan</option>
+                            </select>
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500">Profile</label>
+                            <select id="sweepProfile" onchange="onSweepProfileChange()"
+                                class="bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-cyan-500">
+                                <option value="standard">Standard</option>
+                                <option value="light">Light</option>
+                                <option value="full">Full</option>
+                                <option value="custom">Custom</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Sweep mode + priority -->
+                    <div class="grid grid-cols-2 gap-3">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500">Mode</label>
+                            <select id="sweepJobMode"
+                                class="bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-cyan-500">
+                                <option value="remote">Remote</option>
+                                <option value="agent">Agent</option>
+                            </select>
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500">Priority</label>
+                            <select id="sweepJobPriority"
+                                class="bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-cyan-500">
+                                <option value="medium">Medium</option>
+                                <option value="high">High</option>
+                                <option value="low">Low</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Intrusive warning — shown for full profile -->
+                    <div id="sweepFullWarning" class="hidden flex items-start gap-2 bg-red-950 border border-red-800 rounded-lg px-3 py-2">
+                        <span class="text-red-400 text-xs mt-0.5 flex-shrink-0">⚠</span>
+                        <p class="text-xs text-red-300">Full profile with Vulnerability Scan uses <span class="font-mono">--script vuln,exploit</span> — intrusive scripts that may disrupt services.</p>
+                    </div>
+                </div>
+
+                <!-- Custom profile capability cards (compact) — shown when type=nse_scan + profile=custom -->
+                <div id="sweepCustomPanel" class="hidden mb-4">
+                    <div class="flex items-center justify-between mb-2">
+                        <p class="text-xs font-semibold text-green-400 uppercase tracking-wider">Select Capabilities</p>
+                        <div class="flex items-center gap-3">
+                            <button onclick="sweepSelectAll()" class="text-xs text-gray-500 hover:text-gray-300 transition">Select all</button>
+                            <button onclick="sweepClearAll()" class="text-xs text-gray-500 hover:text-gray-300 transition">Clear all</button>
+                            <span id="sweepScriptCount" class="text-xs text-gray-600">0 scripts selected</span>
+                        </div>
+                    </div>
+                    <div id="sweepCapabilityCards" class="space-y-1.5"></div>
+                    <p id="sweepCustomWarning" class="hidden mt-2 text-xs text-red-400">Select at least one capability before assigning jobs.</p>
+                </div>
+
+                <p id="sweepConfirmNote" class="text-xs text-gray-500 mb-5">Confirming will create a Open Port Scan job for each host above.</p>
+                <div class="flex gap-3 justify-end">
+                    <button onclick="cancelSweepConfirm()" class="text-xs px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 transition">Cancel</button>
+                    <button onclick="confirmSweep()" class="text-xs px-4 py-2 rounded-lg bg-cyan-700 hover:bg-cyan-600 text-white font-semibold transition">Assign Jobs</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Exploit Warning Dialog -->
+        <div id="exploitWarningDialog" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 hidden">
+            <div class="bg-gray-900 border border-red-800 rounded-xl p-6 w-full max-w-md">
+                <div class="flex items-center gap-3 mb-3">
+                    <span class="text-red-400 text-xl">⚠</span>
+                    <h3 class="text-sm font-semibold text-red-400">Intrusive Scan Warning</h3>
+                </div>
+                <p class="text-xs text-gray-300 mb-2">You are about to run an NSE scan with the <span class="text-red-300 font-mono font-semibold">full</span> profile.</p>
+                <p class="text-xs text-gray-400 mb-4">This uses <span class="font-mono text-orange-300">--script vuln,exploit</span> — intrusive scripts that can disrupt or crash services. Only proceed with explicit authorisation.</p>
+                <div class="flex gap-3 justify-end">
+                    <button onclick="cancelExploitWarning()" class="text-xs px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 transition">Cancel</button>
+                    <button onclick="confirmExploitWarning()" class="text-xs px-4 py-2 rounded-lg bg-red-700 hover:bg-red-600 text-white font-semibold transition">I understand — proceed</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Login Overlay -->
+        <div id="loginOverlay" class="fixed inset-0 bg-gray-950 bg-opacity-95 flex items-center justify-center z-50">
+            <div class="bg-gray-900 border border-gray-700 rounded-xl p-8 w-full max-w-sm">
+                <div class="flex items-center gap-3 mb-6">
+                    <div class="w-3 h-3 rounded-full bg-green-400"></div>
+                    <h2 class="text-lg font-bold text-green-400">Heimdall V-Scanner</h2>
+                </div>
+                <p class="text-sm text-gray-400 mb-6">Sign in to continue</p>
+                <div class="space-y-4">
+                    <div>
+                        <label class="text-xs text-gray-400 mb-1 block">Username</label>
+                        <input id="loginUsername" type="text" placeholder="Username"
+                            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                    </div>
+                    <div>
+                        <label class="text-xs text-gray-400 mb-1 block">Password</label>
+                        <input id="loginPassword" type="password" placeholder="••••••••"
+                            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                    </div>
+                    <p id="loginError" class="text-xs text-red-400 hidden">Invalid credentials. Please try again.</p>
+                    <button onclick="submitLogin()" class="w-full bg-green-600 hover:bg-green-500 text-white font-semibold py-2 rounded-lg transition text-sm">Sign In</button>
+                </div>
+            </div>
+        </div>
+        
+        
+        <!-- ── SETTINGS PANEL ─────────────────────────────────────────── -->
+        
+        <!-- Backdrop -->
+        <div id="settingsBackdrop"
+             class="fixed inset-0 bg-black bg-opacity-50 z-40 hidden transition-opacity"
+             onclick="closeSettings()"></div>
+ 
+        <!-- Slide-in panel -->
+        <div id="settingsPanel"
+             class="fixed top-0 right-0 h-full w-80 bg-gray-900 border-l border-gray-800 z-50 transform translate-x-full transition-transform duration-300 overflow-y-auto flex flex-col">
+ 
+            <!-- Panel header -->
+            <div class="flex items-center justify-between px-6 py-4 border-b border-gray-800 flex-shrink-0">
+                <div class="flex items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                    </svg>
+                    <h2 class="text-sm font-semibold text-green-400 tracking-wide">Settings</h2>
+                </div>
+                <button onclick="closeSettings()" class="text-gray-500 hover:text-gray-300 transition text-lg leading-none">✕</button>
+            </div>
+ 
+            <!-- Panel body -->
+            <div class="flex-1 px-6 py-5 space-y-7 overflow-y-auto">
+ 
+                <!-- ── Appearance ── -->
+                <section>
+                    <p class="text-xs font-bold uppercase tracking-wider text-gray-500 mb-3">Appearance</p>
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm text-gray-200">Theme</p>
+                            <p class="text-xs text-gray-500 mt-0.5">Light or dark dashboard</p>
+                        </div>
+                        <div class="flex items-center gap-1 bg-gray-800 rounded-lg p-1 border border-gray-700">
+                            <button onclick="setTheme('dark')" id="theme-dark"
+                                class="theme-btn text-xs px-3 py-1.5 rounded-md transition font-medium bg-gray-700 text-white">
+                                Dark
+                            </button>
+                            <button onclick="setTheme('light')" id="theme-light"
+                                class="theme-btn text-xs px-3 py-1.5 rounded-md transition font-medium text-gray-400 hover:text-white">
+                                Light
+                            </button>
+                        </div>
+                    </div>
+                </section>
+ 
+                <hr class="border-gray-800">
+ 
+                <!-- ── Scan defaults ── -->
+                <section>
+                    <p class="text-xs font-bold uppercase tracking-wider text-gray-500 mb-3">Scan Defaults</p>
+                    <p class="text-xs text-gray-600 mb-3">Pre-fills the Create Job form. You can still change them per job.</p>
+ 
+                    <div class="space-y-3">
+                        <div class="flex items-center justify-between gap-3">
+                            <label class="text-sm text-gray-300 flex-shrink-0">Profile</label>
+                            <select id="setting-default-profile" onchange="saveClientSetting('defaultProfile', this.value)"
+                                class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-green-500 w-36">
+                                <option value="standard">Standard</option>
+                                <option value="light">Light</option>
+                                <option value="full">Full</option>
+                            </select>
+                        </div>
+                        <div class="flex items-center justify-between gap-3">
+                            <label class="text-sm text-gray-300 flex-shrink-0">Mode</label>
+                            <select id="setting-default-mode" onchange="saveClientSetting('defaultMode', this.value)"
+                                class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-green-500 w-36">
+                                <option value="remote">Remote</option>
+                                <option value="agent">Agent</option>
+                            </select>
+                        </div>
+                        <div class="flex items-center justify-between gap-3">
+                            <label class="text-sm text-gray-300 flex-shrink-0">Priority</label>
+                            <select id="setting-default-priority" onchange="saveClientSetting('defaultPriority', this.value)"
+                                class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-green-500 w-36">
+                                <option value="medium">Medium</option>
+                                <option value="high">High</option>
+                                <option value="low">Low</option>
+                            </select>
+                        </div>
+                    </div>
+                </section>
+ 
+                <hr class="border-gray-800">
+ 
+                <!-- ── Dashboard behaviour ── -->
+                <section>
+                    <p class="text-xs font-bold uppercase tracking-wider text-gray-500 mb-3">Dashboard</p>
+ 
+                    <div class="space-y-3">
+                        <div class="flex items-center justify-between gap-3">
+                            <div>
+                                <p class="text-sm text-gray-300">Auto-refresh interval</p>
+                                <p class="text-xs text-gray-600 mt-0.5">Jobs &amp; agents poll rate</p>
+                            </div>
+                            <select id="setting-refresh-interval" onchange="saveClientSetting('refreshInterval', this.value); applyRefreshInterval()"
+                                class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-green-500 w-24">
+                                <option value="3000">3s</option>
+                                <option value="5000">5s</option>
+                                <option value="10000">10s</option>
+                                <option value="30000">30s</option>
+                                <option value="0">Off</option>
+                            </select>
+                        </div>
+                    </div>
+                </section>
+ 
+                <hr class="border-gray-800">
+ 
+                <!-- ── Server settings ── -->
+                <section>
+                    <p class="text-xs font-bold uppercase tracking-wider text-gray-500 mb-3">Server</p>
+                    <p class="text-xs text-gray-600 mb-3">These are saved to the database and take effect immediately.</p>
+ 
+                    <div class="space-y-4">
+                        <div class="flex items-center justify-between gap-4">
+                            <div class="min-w-0">
+                                <p class="text-sm text-gray-300">AI auto-analysis</p>
+                                <p class="text-xs text-gray-600 mt-0.5">Analyse results automatically after each scan</p>
+                            </div>
+                            <button id="setting-ai-toggle" onclick="toggleServerSetting('ai_auto_analyse')"
+                                class="relative w-11 h-6 rounded-full transition-colors duration-200 focus:outline-none flex-shrink-0">
+                                <span id="setting-ai-knob"
+                                    class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform duration-200"></span>
+                            </button>
+                        </div>
+
+                        <div class="flex items-center justify-between gap-4">
+                            <div class="min-w-0">
+                                <p class="text-sm text-gray-300">Auto web scan after port scan</p>
+                                <p class="text-xs text-gray-600 mt-0.5">Automatically run Nikto when web ports are found in an Open Port Scan. Disable to make port scans faster.</p>
+                            </div>
+                            <button id="setting-nikto-toggle" onclick="toggleServerSetting('auto_nikto')"
+                                class="relative w-11 h-6 rounded-full transition-colors duration-200 focus:outline-none flex-shrink-0">
+                                <span id="setting-nikto-knob"
+                                    class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform duration-200"></span>
+                            </button>
+                        </div>
+ 
+                        <div class="flex items-center justify-between gap-3">
+                            <div>
+                                <p class="text-sm text-gray-300">Stale agent threshold</p>
+                                <p class="text-xs text-gray-600 mt-0.5">Hours before an agent is marked stale</p>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <input id="setting-stale-hours" type="number" min="1" max="720"
+                                    class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-green-500 w-20 text-right"
+                                    onchange="saveServerSetting('stale_agent_hours', this.value)">
+                                <span class="text-xs text-gray-500">hrs</span>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+ 
+            </div>
+ 
+            <!-- Panel footer -->
+            <div class="px-6 py-4 border-t border-gray-800 flex-shrink-0">
+                <p class="text-xs text-gray-700 text-center">Heimdall V-Scanner</p>
+            </div>
+        </div>
+        
+
+        <!-- ── HEADER ───────────────────────────────────────────────────── -->
+        <div class="bg-gray-900 border-b border-gray-800 px-6 py-3 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="w-3 h-3 rounded-full bg-green-400 animate-ping opacity-75"></div>
+                <h1 class="text-lg font-bold text-green-400 tracking-wider">Heimdall V-Scanner</h1>
+            </div>
+
+            <!-- Tab navigation -->
+            <nav class="flex items-center gap-1">
+                <button onclick="switchTab('dashboard')" id="nav-dashboard"
+                    class="nav-tab active text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
+                    Dashboard
+                </button>
+                <button onclick="switchTab('discovery')" id="nav-discovery"
+                    class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
+                    Discovery
+                </button>
+                <button onclick="switchTab('schedules')" id="nav-schedules"
+                    class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
+                    Schedules
+                </button>
+                <button onclick="switchTab('insights')" id="nav-insights"
+                    class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
+                    Insights
+                </button>
+                <button onclick="switchTab('topology')" id="nav-topology"
+                    class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
+                    Network Map
+                </button>
+            </nav>
+            <div class="flex items-center gap-2">
+                <button onclick="loadAll()" class="text-sm bg-gray-800 hover:bg-gray-700 px-4 py-2 rounded-lg transition">↻ Refresh</button>
+                <button onclick="openSettings()" class="text-sm bg-gray-800 hover:bg-gray-700 w-9 h-9 rounded-lg transition flex items-center justify-center" title="Settings">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                    </svg>
+                </button>
+            </div>
+        </div>
+
+        <!-- ── TAB: DASHBOARD ───────────────────────────────────────────── -->
+        <div id="tab-dashboard" class="tab-panel active">
+        <div class="max-w-screen-xl mx-auto px-6 py-8 space-y-10">
+
+            <!-- Create Job -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <h2 class="text-lg font-semibold text-green-400 mb-4">Create Job</h2>
+                <div class="flex flex-wrap gap-3 items-end">
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Target</label>
+                        <input id="target" placeholder="IP or hostname"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-44">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Agent ID (optional)</label>
+                        <input id="agent_id" placeholder="Leave blank for any"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-44">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Scan Type</label>
+                        <select id="job_type" onchange="onJobTypeChange()"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="nmap_scan">Open Port Scan</option>
+                            <option value="nikto_scan">Web Scan</option>
+                            <option value="nse_scan">Vulnerability Scan</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1" id="portField" style="display:none">
+                        <label class="text-xs text-gray-400">Port</label>
+                        <input id="port" placeholder="80"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-24">
+                    </div>
+                    <div class="flex flex-col gap-1" id="portsField" style="display:none">
+                        <label class="text-xs text-gray-400">Ports (optional, comma-separated)</label>
+                        <input id="ports" placeholder="22,445,3389"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-52">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Mode</label>
+                        <select id="mode" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="remote">Remote</option>
+                            <option value="agent">Agent</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Profile</label>
+                        <select id="profile" onchange="onProfileChange()" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="standard">Standard</option>
+                            <option value="light">Light</option>
+                            <option value="full">Full</option>
+                            <option value="custom">Custom</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Priority</label>
+                        <select id="priority" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="medium">Medium</option>
+                            <option value="high">High</option>
+                            <option value="low">Low</option>
+                        </select>
+                    </div>
+                    <button onclick="createJob()" class="bg-green-600 hover:bg-green-500 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">+ Create</button>
+                </div>
+                <div id="nseExploitBanner" class="hidden mt-4 flex items-start justify-between gap-3 bg-red-950 border border-red-800 rounded-lg px-4 py-3">
+                    <div class="flex items-start gap-3">
+                        <span class="text-red-400 text-sm mt-0.5">⚠</span>
+                        <p class="text-xs text-red-300"><strong class="text-red-200">Full profile with Vulnerability Scan</strong> uses <span class="font-mono">--script vuln,exploit</span> — intrusive scripts that may disrupt services.</p>
+                    </div>
+                    <button onclick="dismissExploitBanner()" class="text-red-500 hover:text-red-300 transition text-sm leading-none flex-shrink-0">✕</button>
+                </div>
+                <!-- Custom Profile — Capability Cards -->
+                <div id="customProfilePanel" class="hidden mt-5">
+                    <div class="flex items-center justify-between mb-3">
+                        <p class="text-xs font-semibold text-green-400 uppercase tracking-wider">Select Capabilities</p>
+                        <div class="flex items-center gap-3">
+                            <button onclick="selectAllCapabilities()" class="text-xs text-gray-500 hover:text-gray-300 transition">Select all</button>
+                            <button onclick="clearAllCapabilities()" class="text-xs text-gray-500 hover:text-gray-300 transition">Clear all</button>
+                            <span id="customScriptCount" class="text-xs text-gray-600">0 scripts selected</span>
+                        </div>
+                    </div>
+                    <div id="capabilityCards" class="space-y-2"></div>
+                    <p id="customProfileWarning" class="hidden mt-3 text-xs text-red-400">Select at least one capability before creating the job.</p>
+                </div>
+
+                <!-- Custom Nikto Profile — Tuning Category Cards -->
+                <div id="niktoCustomPanel" class="hidden mt-5">
+                    <div class="flex items-center justify-between mb-3">
+                        <p class="text-xs font-semibold text-purple-400 uppercase tracking-wider">Select Test Categories</p>
+                        <div class="flex items-center gap-3">
+                            <button onclick="selectAllNiktoCategories()" class="text-xs text-gray-500 hover:text-gray-300 transition">Select all</button>
+                            <button onclick="clearAllNiktoCategories()" class="text-xs text-gray-500 hover:text-gray-300 transition">Clear all</button>
+                            <span id="niktoCategoryCount" class="text-xs text-gray-600">0 categories selected</span>
+                        </div>
+                    </div>
+                    <div id="niktoCategoryCards" class="grid grid-cols-2 gap-2"></div>
+                    <p id="niktoCustomWarning" class="hidden mt-3 text-xs text-red-400">Select at least one category before creating the job.</p>
+                </div>
+            </div>
+
+            <!-- Agents -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-semibold text-green-400">Agents</h2>
+                    <div class="flex items-center gap-2">
+                        <button onclick="openRegisterScanner()"
+                            class="text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-green-500 hover:text-green-400 transition">+ Register Scanner</button>
+                        <button onclick="toggleStaleAgents()" id="staleAgentsBtn"
+                            class="text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-yellow-500 transition">Show Stale</button>
+                    </div>
+                </div>
+                <div id="agents" class="overflow-x-auto"></div>
+            </div>
+
+            <!-- Register Scanner Modal -->
+            <div id="registerScannerBackdrop" class="hidden fixed inset-0 bg-black bg-opacity-60 z-40" onclick="closeRegisterScanner()"></div>
+            <div id="registerScannerModal" class="hidden fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-lg">
+                <div class="flex items-center justify-between px-6 py-4 border-b border-gray-800">
+                    <h3 class="text-sm font-semibold text-green-400">Register New Scanner</h3>
+                    <button onclick="closeRegisterScanner()" class="text-gray-500 hover:text-gray-300 transition text-lg leading-none">✕</button>
+                </div>
+                <div id="registerScannerForm" class="px-6 py-5 space-y-4">
+                    <div>
+                        <label class="text-xs text-gray-400 block mb-1">Scanner name</label>
+                        <input id="scannerName" placeholder="scanner-2" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                        <p class="text-xs text-gray-600 mt-1">Leave blank to use the suggested name.</p>
+                    </div>
+                    <div>
+                        <label class="text-xs text-gray-400 block mb-1">Capabilities</label>
+                        <input id="scannerCaps" value="nmap_scan,nikto_scan,nse_scan" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                        <p class="text-xs text-gray-600 mt-1">Comma-separated. Options: <span class="font-mono">nmap_scan</span>, <span class="font-mono">nikto_scan</span>, <span class="font-mono">nse_scan</span></p>
+                    </div>
+                    <button onclick="submitRegisterScanner()" class="w-full bg-green-700 hover:bg-green-600 text-white text-sm font-medium py-2 rounded-lg transition">Register</button>
+                    <p class="text-xs text-gray-600 text-center">Registration creates the agent record and API key. To enable auto-start on this server, add <span class="font-mono text-gray-500">SCANNER_AUTOSTART=true</span> to your <span class="font-mono text-gray-500">.env</span> file and restart the server.</p>
+                </div>
+                <div id="registerScannerResult" class="hidden px-6 pb-6 space-y-4">
+                    <div id="registerScannerStatusBanner" class="mb-3 p-3 bg-green-950 border border-green-800 rounded-lg text-xs text-green-300">
+                        Scanner registered.
+                    </div>
+                    <div>
+                        <div class="flex items-center justify-between mb-1">
+                            <p class="text-xs text-gray-400">API key</p>
+                            <button onclick="copyText('resultApiKey')" class="text-xs text-gray-500 hover:text-gray-300 transition">Copy</button>
+                        </div>
+                        <pre id="resultApiKey" class="text-xs font-mono bg-gray-800 rounded-lg p-3 text-cyan-300 overflow-x-auto select-all whitespace-pre-wrap break-all"></pre>
+                    </div>
+                    <div>
+                        <div class="flex items-center justify-between mb-1">
+                            <p class="text-xs text-gray-400">Setup commands</p>
+                            <button onclick="copyText('resultSetupCmds')" class="text-xs text-gray-500 hover:text-gray-300 transition">Copy</button>
+                        </div>
+                        <pre id="resultSetupCmds" class="text-xs font-mono bg-gray-800 rounded-lg p-3 text-gray-300 overflow-x-auto whitespace-pre-wrap break-all"></pre>
+                    </div>
+                    <div>
+                        <div class="flex items-center justify-between mb-1">
+                            <p class="text-xs text-gray-400">Systemd service (save as <span class="font-mono">/etc/systemd/system/vapt-scanner-<span id="resultServiceName"></span>.service</span>)</p>
+                            <button onclick="copyText('resultServiceFile')" class="text-xs text-gray-500 hover:text-gray-300 transition">Copy</button>
+                        </div>
+                        <pre id="resultServiceFile" class="text-xs font-mono bg-gray-800 rounded-lg p-3 text-gray-300 overflow-x-auto whitespace-pre-wrap break-all"></pre>
+                    </div>
+                    <button onclick="closeRegisterScanner()" class="w-full border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-gray-200 text-sm py-2 rounded-lg transition">Done</button>
+                </div>
+            </div>
+
+            <!-- Jobs -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <div class="flex items-center justify-between mb-3">
+                    <h2 class="text-lg font-semibold text-green-400">Jobs</h2>
+                    <div class="flex gap-2 flex-wrap justify-end">
+                        <button onclick="setJobFilter('all')" id="filter-all" class="filter-btn active-filter text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-green-500 transition">All</button>
+                        <button onclick="setJobFilter('pending')" id="filter-pending" class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-yellow-500 transition">Pending</button>
+                        <button onclick="setJobFilter('running')" id="filter-running" class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-blue-500 transition">Running</button>
+                        <button onclick="setJobFilter('done')" id="filter-done" class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-green-500 transition">Done</button>
+                        <button onclick="setJobFilter('failed')" id="filter-failed" class="filter-btn text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-red-500 transition">Failed</button>
+                        <button onclick="toggleJobHistory()" id="jobHistoryBtn" class="text-xs px-3 py-1 rounded-full border border-gray-600 hover:border-purple-500 transition">Show History</button>
+                    </div>
+                </div>
+                <div class="flex gap-2 mb-3">
+                    <button onclick="clearAllByStatus('pending')" class="text-xs px-3 py-1 rounded-lg bg-yellow-950 hover:bg-yellow-900 text-yellow-300 border border-yellow-800 transition">Delete all pending</button>
+                    <button onclick="clearAllByStatus('failed')" class="text-xs px-3 py-1 rounded-lg bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 transition">Delete all failed</button>
+                </div>
+                <div id="jobs" class="overflow-x-auto"></div>
+            </div>
+
+            <!-- Results -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-semibold text-green-400">Scan Results</h2>
+                    <div class="flex gap-1 bg-gray-800 rounded-lg p-1">
+                        <button onclick="setResultTab('active')" id="tab-active" class="result-tab text-xs px-4 py-1.5 rounded-md transition font-medium bg-gray-700 text-white">Active</button>
+                        <button onclick="setResultTab('history')" id="tab-history" class="result-tab text-xs px-4 py-1.5 rounded-md transition font-medium text-gray-400 hover:text-gray-200">History</button>
+                    </div>
+                </div>
+                <div id="activeToolbar" class="mb-4 flex items-center gap-3">
+                    <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
+                        <input type="checkbox" id="selectAllActiveCheckbox" onchange="toggleSelectAllActive()" class="accent-yellow-500"> Select all
+                    </label>
+                    <button onclick="clearSelected()" class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-600 transition font-medium">Clear Selected</button>
+                    <button onclick="exportResults()" class="text-xs px-3 py-1.5 rounded-lg bg-cyan-900 hover:bg-cyan-800 text-cyan-200 border border-cyan-700 transition font-medium">↓ Export JSON</button>
+                </div>
+                <div id="historyToolbar" class="hidden mb-4 flex items-center gap-3">
+                    <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
+                        <input type="checkbox" id="selectAllCheckbox" onchange="toggleSelectAll()" class="accent-red-500"> Select all
+                    </label>
+                    <button onclick="deleteSelected()" class="text-xs px-3 py-1.5 rounded-lg bg-red-900 hover:bg-red-800 text-red-200 border border-red-700 transition font-medium">Delete Selected</button>
+                    <button onclick="clearAllHistory()" class="text-xs px-3 py-1.5 rounded-lg bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 transition font-medium">⚠ Clear All History</button>
+                    <button onclick="exportResults()" class="text-xs px-3 py-1.5 rounded-lg bg-cyan-900 hover:bg-cyan-800 text-cyan-200 border border-cyan-700 transition font-medium">↓ Export JSON</button>
+                </div>
+                <div id="results" class="space-y-4"></div>
+            </div>
+
+        </div>
+        </div>
+
+        <!-- ── TAB: DISCOVERY ───────────────────────────────────────────── -->
+        <div id="tab-discovery" class="tab-panel">
+        <div class="max-w-screen-xl mx-auto px-6 py-8 space-y-8">
+
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <h2 class="text-lg font-semibold text-green-400 mb-1">Network Discovery</h2>
+                <p class="text-xs text-gray-500 mb-5">Ping scans find live hosts. Sweep scans find hosts and automatically assign Nmap jobs.</p>
+
+                <div class="flex flex-wrap gap-3 items-end mb-5">
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Subnet (CIDR)</label>
+                        <input id="discoverSubnet" placeholder="192.168.1.0/24"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-52">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Mode</label>
+                        <select id="discoverMode" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="remote">Remote</option>
+                            <option value="agent">Agent</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Profile</label>
+                        <select id="discoverProfile" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="standard">Standard</option>
+                            <option value="light">Light</option>
+                            <option value="full">Full</option>
+                        </select>
+                    </div>
+                    <div class="flex gap-2">
+                        <button onclick="startPing()" id="pingBtn"
+                            class="bg-gray-700 hover:bg-gray-600 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">
+                            ⬡ Ping
+                        </button>
+                        <button onclick="startSweep()" id="sweepBtn"
+                            class="bg-cyan-700 hover:bg-cyan-600 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">
+                            ⌖ Sweep
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Status bar — dismissible -->
+                <div id="sweepStatus" class="hidden mb-4 p-3 bg-gray-800 rounded-lg border border-gray-700 text-xs text-gray-300 flex items-center gap-3">
+                    <div id="sweepSpinner" class="w-3 h-3 rounded-full bg-cyan-400 animate-pulse flex-shrink-0"></div>
+                    <span id="sweepStatusText" class="flex-1">Working...</span>
+                    <button id="cancelSweepBtn" onclick="cancelActiveSweep()" class="hidden text-xs px-2 py-1 rounded bg-red-900 hover:bg-red-800 text-red-300 hover:text-red-200 transition">Cancel Sweep</button>
+                    <button onclick="dismissSweepStatus()" class="text-gray-500 hover:text-gray-300 transition text-base leading-none">✕</button>
+                </div>
+
+                <!-- Ping results panel -->
+                <div id="pingResults" class="hidden mb-4 p-4 bg-gray-800 rounded-lg border border-gray-700">
+                    <div class="flex items-center justify-between mb-3">
+                        <p class="text-xs font-semibold text-gray-300" id="pingResultsTitle">Ping Results</p>
+                        <button onclick="dismissPingResults()" class="text-gray-500 hover:text-gray-300 transition text-sm">✕</button>
+                    </div>
+                    <div id="pingResultsList" class="space-y-1 max-h-48 overflow-y-auto"></div>
+                </div>
+
+                <!-- Sweep result detail panel -->
+                <div id="sweepResultPanel" class="hidden mb-4 bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+                    <div class="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+                        <p class="text-xs font-semibold text-cyan-400" id="sweepResultTitle">Sweep Results</p>
+                        <div class="flex items-center gap-3">
+                            <button id="sweepCancelJobsBtn" onclick="cancelSweepJobs()" class="hidden text-xs px-2 py-1 rounded bg-red-900 hover:bg-red-800 text-red-300 hover:text-red-200 transition">Cancel All Jobs</button>
+                            <button onclick="closeSweepResultPanel()" class="text-gray-500 hover:text-gray-300 transition text-sm">✕</button>
+                        </div>
+                    </div>
+                    <div id="sweepResultBody" class="p-4 overflow-x-auto max-h-80 overflow-y-auto text-xs"></div>
+                </div>
+
+            </div>
+
+            <!-- Sweep History -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-semibold text-green-400">Sweep History</h2>
+                    <button onclick="clearAllSweeps()" class="text-xs px-3 py-1.5 rounded-lg bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 transition">Clear All</button>
+                </div>
+                <div id="sweepHistory"></div>
+            </div>
+
+        </div>
+        </div>
+
+        <!-- ── TAB: SCHEDULES ───────────────────────────────────────────── -->
+        <div id="tab-schedules" class="tab-panel">
+        <div class="max-w-screen-xl mx-auto px-6 py-8 space-y-8">
+
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <h2 class="text-lg font-semibold text-green-400 mb-4">Create Schedule</h2>
+                <div class="flex flex-wrap gap-3 items-end mb-5">
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Name</label>
+                        <input id="sched_name" placeholder="Daily firewall scan"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-48">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Target</label>
+                        <input id="sched_target" placeholder="IP or hostname"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-36">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Scan Type</label>
+                        <select id="sched_type" onchange="onSchedTypeChange()" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="nmap_scan">Open Port Scan</option>
+                            <option value="nikto_scan">Web Scan</option>
+                            <option value="nse_scan">Vulnerability Scan</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1" id="schedPortField" style="display:none">
+                        <label class="text-xs text-gray-400">Port</label>
+                        <input id="sched_port" type="number" placeholder="80"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-20">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Profile</label>
+                        <select id="sched_profile" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="standard">Standard</option>
+                            <option value="light">Light</option>
+                            <option value="full">Full</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Mode</label>
+                        <select id="sched_mode" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="remote">Remote</option>
+                            <option value="agent">Agent</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Priority</label>
+                        <select id="sched_priority" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
+                            <option value="medium">Medium</option>
+                            <option value="high">High</option>
+                            <option value="low">Low</option>
+                        </select>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Every (hours)</label>
+                        <input id="sched_interval" type="number" min="1" placeholder="24"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-24">
+                    </div>
+                    <button onclick="createSchedule()" class="bg-green-600 hover:bg-green-500 text-white font-semibold px-5 py-2 rounded-lg transition text-sm">+ Schedule</button>
+                </div>
+            </div>
+
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                <h2 class="text-lg font-semibold text-green-400 mb-4">Active Schedules</h2>
+                <div id="schedules" class="overflow-x-auto"></div>
+            </div>
+
+        </div>
+        </div>
+
+        <!-- ── TAB: INSIGHTS ───────────────────────────────────────────── -->
+        <div id="tab-insights" class="tab-panel">
+        <div class="max-w-screen-xl mx-auto px-6 py-8 space-y-6">
+
+            <!-- Controls row -->
+            <div class="flex items-center justify-between flex-wrap gap-4">
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-gray-500 mr-1">Window:</span>
+                    <button onclick="setInsightWindow('24h')" id="iw-24h"
+                        class="insight-win text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">24h</button>
+                    <button onclick="setInsightWindow('7d')" id="iw-7d"
+                        class="insight-win text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">7d</button>
+                    <button onclick="setInsightWindow('30d')" id="iw-30d"
+                        class="insight-win text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">30d</button>
+                    <button onclick="setInsightWindow('3m')" id="iw-3m"
+                        class="insight-win text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400 hover:text-gray-200 transition">3m</button>
+                </div>
+                <div id="insightHostBreadcrumb" class="hidden flex items-center gap-2">
+                    <button onclick="clearInsightHost()" class="text-xs text-gray-500 hover:text-gray-300 transition">← All Hosts</button>
+                    <span class="text-xs text-gray-600">|</span>
+                    <span id="insightHostLabel" class="text-xs font-mono text-green-400"></span>
+                </div>
+                <button onclick="loadInsights()" class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-400 transition">↻ Refresh</button>
+            </div>
+
+            <!-- Stat cards -->
+            <div id="insightStats" class="grid grid-cols-2 md:grid-cols-4 gap-4"></div>
+
+            <!-- Scan activity chart -->
+            <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Scan Activity</h3>
+                <div class="relative h-48">
+                    <canvas id="chartActivity"></canvas>
+                </div>
+            </div>
+
+            <!-- Risk + Top Hosts side by side -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                    <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Risk Distribution</h3>
+                    <div class="relative h-48 flex items-center justify-center">
+                        <canvas id="chartRisk"></canvas>
+                    </div>
+                </div>
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                    <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4" id="topHostsTitle">Top Hosts by Findings</h3>
+                    <div class="relative h-48">
+                        <canvas id="chartTopHosts"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Scan type breakdown + Port frequency + Scan health -->
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6" id="insightExtraCharts">
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                    <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Scan Type Breakdown</h3>
+                    <div class="relative h-48 flex items-center justify-center">
+                        <canvas id="chartScanTypes"></canvas>
+                    </div>
+                </div>
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                    <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Top Open Ports (by host count)</h3>
+                    <div class="relative h-48">
+                        <canvas id="chartTopPorts"></canvas>
+                    </div>
+                </div>
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                    <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Scan Health</h3>
+                    <div class="relative h-48 flex items-center justify-center">
+                        <canvas id="chartScanHealth"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Coverage gaps -->
+            <div id="insightCoverageGaps" class="hidden bg-gray-900 rounded-xl border border-yellow-900 p-5">
+                <div class="flex items-center gap-2 mb-3">
+                    <h3 class="text-xs font-semibold text-yellow-400 uppercase tracking-wider">Coverage Gaps</h3>
+                    <span class="text-xs text-gray-600">— hosts port-scanned but not vuln-scanned in the last 30 days (all-time)</span>
+                </div>
+                <div id="insightCoverageGapsBody" class="flex flex-wrap gap-2 items-center"></div>
+            </div>
+
+            <!-- Host table (aggregate) or scan timeline (per-host) -->
+            <div id="insightHostTable" class="bg-gray-900 rounded-xl border border-gray-800 p-5">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Scanned Hosts</h3>
+                </div>
+                <div id="insightHostTableBody"></div>
+            </div>
+
+            <!-- Per-host scan history (only visible in drilldown) -->
+            <div id="insightScanHistory" class="hidden bg-gray-900 rounded-xl border border-gray-800 p-5">
+                <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Scan History</h3>
+                <div class="relative h-48 mb-6">
+                    <canvas id="chartScanHistory"></canvas>
+                </div>
+                <div id="insightScanHistoryTable"></div>
+            </div>
+
+            <!-- Empty state -->
+            <div id="insightEmpty" class="hidden text-center py-16">
+                <p class="text-gray-600 text-sm">No scan data in the selected window.</p>
+                <p class="text-gray-700 text-xs mt-1">Run some scans and come back here to see analytics.</p>
+            </div>
+
+        </div>
+        </div>
+        
+        <!-- ── TAB: TOPOLOGY ──────────────────────────────────────────── -->
+        <div id="tab-topology" class="tab-panel">
+        <div class="max-w-screen-xl mx-auto px-6 py-8">
+
+            <!-- Top bar -->
+            <div class="flex items-center justify-between mb-6 flex-wrap gap-4">
+                <div>
+                    <h2 class="text-lg font-semibold text-green-400">Network Map</h2>
+                    <p class="text-xs text-gray-600 mt-0.5">All discovered hosts grouped by subnet, coloured by risk level</p>
+                </div>
+                <div class="flex items-center gap-3">
+                    <!-- Risk filter -->
+                    <div class="flex items-center gap-1 bg-gray-900 border border-gray-800 rounded-lg p-1">
+                        <button onclick="setMapFilter('all')"        id="mf-all"        class="map-filter-btn text-xs px-3 py-1 rounded-md transition font-medium bg-gray-700 text-white">All</button>
+                        <button onclick="setMapFilter('CRITICAL')"   id="mf-CRITICAL"   class="map-filter-btn text-xs px-3 py-1 rounded-md transition font-medium text-gray-400 hover:text-white">Critical</button>
+                        <button onclick="setMapFilter('HIGH')"       id="mf-HIGH"       class="map-filter-btn text-xs px-3 py-1 rounded-md transition font-medium text-gray-400 hover:text-white">High</button>
+                        <button onclick="setMapFilter('MEDIUM')"     id="mf-MEDIUM"     class="map-filter-btn text-xs px-3 py-1 rounded-md transition font-medium text-gray-400 hover:text-white">Medium</button>
+                        <button onclick="setMapFilter('UNANALYSED')" id="mf-UNANALYSED" class="map-filter-btn text-xs px-3 py-1 rounded-md transition font-medium text-gray-400 hover:text-white">Unanalysed</button>
+                    </div>
+                    <button onclick="loadTopology()" class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-400 transition">↻ Refresh</button>
+                </div>
+            </div>
+
+            <!-- Summary stats row -->
+            <div id="mapStats" class="flex gap-4 flex-wrap mb-6"></div>
+
+            <!-- Network map body -->
+            <div id="mapBody" class="space-y-6"></div>
+
+            <!-- Empty state -->
+            <div id="mapEmpty" class="hidden text-center py-20">
+                <div class="text-4xl mb-4 opacity-20">⌖</div>
+                <p class="text-gray-500 text-sm font-medium mb-1">No hosts mapped yet</p>
+                <p class="text-gray-700 text-xs mb-4">Run a discovery sweep or an Open Port Scan to populate the map.</p>
+                <button onclick="switchTab('discovery')" class="text-xs px-4 py-2 rounded-lg bg-green-900 hover:bg-green-800 text-green-300 border border-green-800 transition font-medium">→ Go to Discovery</button>
+            </div>
+
+            <!-- Colour legend -->
+            <div class="mt-6 flex flex-wrap gap-4 text-xs text-gray-500">
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-full bg-red-500 inline-block"></span>Critical</span>
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-full bg-orange-500 inline-block"></span>High</span>
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-full bg-yellow-400 inline-block"></span>Medium</span>
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-full bg-blue-400 inline-block"></span>Low / Info</span>
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-full bg-gray-500 inline-block"></span>Unanalysed</span>
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-full bg-green-500 inline-block"></span>Unscanned</span>
+                <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-full border-2 border-cyan-400 bg-transparent inline-block"></span>Agent host</span>
+            </div>
+
+        </div>
+        </div>
+
+        <!-- ── SCRIPTS ──────────────────────────────────────────────────── -->
+        <script src="/static/app.js"></script>
+    </body>
+    </html>
+    
