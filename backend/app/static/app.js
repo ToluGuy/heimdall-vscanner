@@ -1595,9 +1595,10 @@ ${data.warning}`);
                     `<option value="${o}" ${o === value ? 'selected' : ''}>${o}</option>`).join('');
                 control = `<select id="${id}" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">${opts}</select>`;
             } else if (field.type === 'multiselect') {
+                const selected = Array.isArray(value) ? value : (field.default || []);
                 const opts = (field.options || []).map(o => `
                     <label class="flex items-center gap-2 text-xs text-gray-300 py-0.5">
-                        <input type="checkbox" class="plugin-multiselect" data-field="${id}" value="${o}">
+                        <input type="checkbox" class="plugin-multiselect" data-field="${id}" value="${o}" ${selected.includes(o) ? 'checked' : ''}>
                         ${o}
                     </label>`).join('');
                 control = `<div id="${id}" class="flex flex-col bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 max-h-32 overflow-y-auto">${opts}</div>`;
@@ -1815,6 +1816,7 @@ ${data.warning}`);
             if (!pluginsRes) return;
             const plugins = await pluginsRes.json();
             const agents = agentsRes ? await agentsRes.json() : [];
+            window.__lastLoadedPlugins = plugins;
             renderPluginsList(plugins, agents);
         }
 
@@ -1840,8 +1842,43 @@ ${data.warning}`);
                             <button onclick="uninstallPlugin('${p.name}')" class="text-xs text-red-500 hover:text-red-400">Remove</button>
                         </div>
                     </div>
+                    ${(p.config_schema || []).length ? renderPluginConfigForm(p) : ''}
                     ${(p.job_types || []).map(jt => renderDeploymentStatus(jt, agents)).join('')}
                 </div>`).join('');
+        }
+
+        function renderPluginConfigForm(plugin) {
+            const idPrefix = `pluginconfig_${plugin.name}`;
+            const fields = plugin.config_schema.map(f => renderFormFieldHtml(f, idPrefix, plugin.config?.[f.name])).join('');
+            return `<div class="mt-2 pt-2 border-t border-gray-700">
+                <div class="flex flex-wrap gap-3 items-end">${fields}</div>
+                <button onclick="savePluginConfig('${plugin.name}')"
+                    class="mt-2 text-xs px-3 py-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-200 transition">
+                    Save config
+                </button>
+            </div>`;
+        }
+
+        async function savePluginConfig(pluginName) {
+            const plugin = (window.__lastLoadedPlugins || []).find(p => p.name === pluginName);
+            if (!plugin) return;
+            const idPrefix = `pluginconfig_${pluginName}`;
+            const config = {};
+            plugin.config_schema.forEach(f => {
+                const val = readFormFieldValue(f, idPrefix);
+                if (val !== undefined && val !== '' && !(Array.isArray(val) && !val.length)) config[f.name] = val;
+            });
+            const res = await apiFetch(`/plugins/${pluginName}/config`, {
+                method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config),
+            });
+            if (!res) return;
+            if (res.status !== 200) {
+                const err = await res.json();
+                alert(`Save failed: ${err.detail}`);
+                return;
+            }
+            await loadPlugins();
         }
 
         function renderDeploymentStatus(jobType, agents) {

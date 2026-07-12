@@ -124,6 +124,7 @@ class Plugin(Base):
     display_name = Column(String, nullable=False)
     version      = Column(String, nullable=False)
     manifest     = Column(Text, nullable=False)          # full plugin.json, stored verbatim
+    config       = Column(Text, nullable=False, default="{}")  # JSON dict, values per manifest's config_schema
     enabled      = Column(Boolean, default=True)
     installed_at = Column(DateTime, default=datetime.utcnow)
 

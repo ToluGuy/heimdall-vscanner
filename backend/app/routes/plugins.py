@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..models import Plugin, Job
 from ..core import logger, require_auth, BUILTIN_JOB_TYPES
+from ..services.hooks import KNOWN_HOOK_EVENTS
 
 router = APIRouter()
 
@@ -96,6 +97,16 @@ def _validate_manifest(manifest: dict):
     hooks = manifest.get("hooks", [])
     if not isinstance(hooks, list):
         raise HTTPException(status_code=400, detail="'hooks' must be a list")
+    unknown_hooks = set(hooks) - KNOWN_HOOK_EVENTS
+    if unknown_hooks:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unrecognised hook event(s) {sorted(unknown_hooks)}. Valid: {sorted(KNOWN_HOOK_EVENTS)}"
+        )
+
+    config_schema = manifest.get("config_schema", [])
+    if not isinstance(config_schema, list):
+        raise HTTPException(status_code=400, detail="'config_schema' must be a list")
 
 
 @router.get("/plugins")
@@ -104,6 +115,10 @@ def list_plugins(db: Session = Depends(get_db), username: str = Depends(require_
     out = []
     for p in plugins:
         manifest = json.loads(p.manifest)
+        try:
+            config = json.loads(p.config) if p.config else {}
+        except (ValueError, TypeError):
+            config = {}
         out.append({
             "id": p.id,
             "name": p.name,
@@ -113,6 +128,8 @@ def list_plugins(db: Session = Depends(get_db), username: str = Depends(require_
             "installed_at": p.installed_at.isoformat() if p.installed_at else None,
             "job_types": manifest.get("job_types", []),
             "hooks": manifest.get("hooks", []),
+            "config_schema": manifest.get("config_schema", []),
+            "config": config,
         })
     return out
 
@@ -202,6 +219,43 @@ def uninstall_plugin(
     db.commit()
     logger.info(f"Plugin '{name}' uninstalled — {cancelled} pending job(s) cancelled")
     return {"ok": True, "cancelled_pending_jobs": cancelled}
+
+
+@router.get("/plugins/{name}/config")
+def get_plugin_config(
+    name: str,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    plugin = db.query(Plugin).filter(Plugin.name == name).first()
+    if not plugin:
+        raise HTTPException(status_code=404, detail="Plugin not found")
+    try:
+        config = json.loads(plugin.config) if plugin.config else {}
+    except (ValueError, TypeError):
+        config = {}
+    return config
+
+
+@router.patch("/plugins/{name}/config")
+def update_plugin_config(
+    name: str,
+    data: dict,
+    db: Session = Depends(get_db),
+    username: str = Depends(require_auth),
+):
+    """
+    Replaces a plugin's stored config wholesale with the given dict — the
+    dashboard always sends every config_schema field together, so there's
+    no partial-merge ambiguity to worry about.
+    """
+    plugin = db.query(Plugin).filter(Plugin.name == name).first()
+    if not plugin:
+        raise HTTPException(status_code=404, detail="Plugin not found")
+    plugin.config = json.dumps(data)
+    db.commit()
+    logger.info(f"Plugin '{name}' config updated")
+    return {"ok": True}
 
 
 @router.get("/plugins/job-types")

@@ -1,6 +1,7 @@
 # backend/app/routes/jobs.py
 
 import json
+import threading
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -13,6 +14,7 @@ from ..core import (
     logger, require_auth, validate_target, get_setting,
     get_valid_job_types, get_job_type_risk_tier, WEB_PORTS, JOB_TIMEOUT_SECONDS,
 )
+from ..services.hooks import fire_hook
 
 router = APIRouter()
 
@@ -249,6 +251,7 @@ def recover_stuck_jobs(db: Session = Depends(get_db)):
     now = datetime.utcnow()
     stuck_jobs = db.query(Job).filter(Job.status == "running").all()
     recovered = 0
+    newly_failed = []
 
     for job in stuck_jobs:
         if job.started_at is None:
@@ -272,8 +275,14 @@ def recover_stuck_jobs(db: Session = Depends(get_db)):
                 job.started_at = None
                 job.completed_at = datetime.utcnow()
                 logger.error(f"Job {job.id} exceeded max retries, marking failed")
+                newly_failed.append({"job_id": job.id, "type": job.type, "target": job.target})
 
     db.commit()
+
+    # Fire after commit — see the same note in routes/agents.py submit_result().
+    for payload in newly_failed:
+        threading.Thread(target=fire_hook, args=("job.failed", payload), daemon=True).start()
+
     return {"checked": len(stuck_jobs), "recovered": recovered}
 
 
