@@ -1,16 +1,17 @@
 # backend/app/routes/jobs.py
 
+import json
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import Agent, Job
+from ..models import Agent, Job, TargetAuthorization
 from ..schemas import JobCreate
 from ..core import (
     logger, require_auth, validate_target, get_setting,
-    VALID_JOB_TYPES, WEB_PORTS, JOB_TIMEOUT_SECONDS,
+    get_valid_job_types, get_job_type_risk_tier, WEB_PORTS, JOB_TIMEOUT_SECONDS,
 )
 
 router = APIRouter()
@@ -19,14 +20,32 @@ router = APIRouter()
 @router.post("/jobs/create")
 def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = Depends(require_auth)):
 
-    # validate job type
-    if job.type not in VALID_JOB_TYPES:
+    # validate job type — built-in or plugin-provided, whatever's currently enabled
+    valid_types = get_valid_job_types(db)
+    if job.type not in valid_types:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown job type '{job.type}'. Valid types: {sorted(VALID_JOB_TYPES)}"
+            detail=f"Unknown job type '{job.type}'. Valid types: {sorted(valid_types)}"
         )
 
     target = validate_target(job.target)
+
+    # high-risk job types (credential attacks, exploitation-class tooling) require
+    # an active, time-boxed authorization for this exact target + job type —
+    # see routes/authorizations.py. Built-ins and read_only/intrusive plugin
+    # types never hit this gate.
+    if get_job_type_risk_tier(db, job.type) == "high":
+        live_auth = db.query(TargetAuthorization).filter(
+            TargetAuthorization.target == target,
+            TargetAuthorization.job_type == job.type,
+            TargetAuthorization.expires_at > datetime.utcnow(),
+        ).first()
+        if not live_auth:
+            raise HTTPException(
+                status_code=403,
+                detail=f"'{job.type}' against '{target}' requires an active authorization. "
+                       "Authorize this target for this job type first."
+            )
 
     # validate port for nikto jobs
     if job.type == "nikto_scan" and job.port is not None:
@@ -76,6 +95,8 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
     if job.nikto_tuning:
         nikto_tuning_str = ",".join(s.strip() for s in job.nikto_tuning if s.strip())
 
+    extra_params_str = json.dumps(job.extra_params) if job.extra_params else None
+
     new_job = Job(
         type=job.type,
         target=target,
@@ -88,6 +109,7 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
         ports=job.ports if job.ports else None,
         custom_scripts=custom_scripts_str,
         nikto_tuning=nikto_tuning_str,
+        extra_params=extra_params_str,
     )
     db.add(new_job)
     db.commit()
@@ -201,6 +223,9 @@ def get_next_job(
     if job.nikto_tuning:
         nikto_tuning_list = [s.strip() for s in job.nikto_tuning.split(",") if s.strip()]
 
+    # Deserialise extra_params (plugin form_fields values) back to a dict
+    extra_params = json.loads(job.extra_params) if job.extra_params else {}
+
     # Read auto_nikto setting so agents/scanner can respect it
     auto_nikto = get_setting(db, "auto_nikto") == "true"
 
@@ -214,6 +239,7 @@ def get_next_job(
         "ports": job.ports,
         "custom_scripts": custom_scripts_list,
         "nikto_tuning": nikto_tuning_list,
+        "extra_params": extra_params,
         "auto_nikto": auto_nikto,
     }
 

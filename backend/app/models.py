@@ -45,6 +45,7 @@ class Job(Base):
     ports = Column(String, nullable=True)        # comma-separated — used by nse_scan and multi-port nikto
     custom_scripts = Column(String, nullable=True)  # comma-separated NSE script names — used when profile='custom'
     nikto_tuning = Column(String, nullable=True)    # comma-separated Nikto tuning categories — used when profile='custom' on nikto_scan
+    extra_params = Column(Text, nullable=True)      # JSON-encoded dict — plugin form_fields values, ignored by built-in types
     sweep_id = Column(Integer, ForeignKey("discovery_sweeps.id"), nullable=True)  # set when job was created by a sweep
     cleared = Column(Boolean, default=False)
 
@@ -113,3 +114,26 @@ class Setting(Base):
 
     key   = Column(String, primary_key=True, index=True)
     value = Column(String, nullable=False)
+
+
+class Plugin(Base):
+    __tablename__ = "plugins"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    name         = Column(String, unique=True, nullable=False, index=True)  # matches plugin.json's "name"
+    display_name = Column(String, nullable=False)
+    version      = Column(String, nullable=False)
+    manifest     = Column(Text, nullable=False)          # full plugin.json, stored verbatim
+    enabled      = Column(Boolean, default=True)
+    installed_at = Column(DateTime, default=datetime.utcnow)
+
+
+class TargetAuthorization(Base):
+    __tablename__ = "target_authorizations"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    target        = Column(String, nullable=False, index=True)
+    job_type      = Column(String, nullable=False)        # scoped to one exact job type, not blanket
+    authorized_by = Column(String, nullable=False)        # dashboard username from require_auth
+    created_at    = Column(DateTime, default=datetime.utcnow)
+    expires_at    = Column(DateTime, nullable=False)       # short-lived by design

@@ -166,10 +166,21 @@
             document.getElementById('settingsPanel').classList.add('translate-x-full');
             document.getElementById('settingsBackdrop').classList.add('hidden');
         }
+
+        function openPluginsPanel() {
+            loadPlugins();
+            document.getElementById('pluginsPanel').classList.remove('translate-x-full');
+            document.getElementById('pluginsBackdrop').classList.remove('hidden');
+        }
+
+        function closePluginsPanel() {
+            document.getElementById('pluginsPanel').classList.add('translate-x-full');
+            document.getElementById('pluginsBackdrop').classList.add('hidden');
+        }
  
         // Close on Escape key
         document.addEventListener('keydown', e => {
-            if (e.key === 'Escape') closeSettings();
+            if (e.key === 'Escape') { closeSettings(); closePluginsPanel(); }
         });
  
         // ── Theme ─────────────────────────────────────────────────────────────
@@ -293,6 +304,9 @@
 
             const staleInput = document.getElementById('setting-stale-hours');
             if (staleInput) staleInput.value = serverSettings['stale_agent_hours'] || '24';
+
+            const authHoursInput = document.getElementById('setting-auth-max-hours');
+            if (authHoursInput) authHoursInput.value = serverSettings['high_risk_auth_max_hours'] || '4';
         }
  
         async function toggleServerSetting(key) {
@@ -331,6 +345,7 @@
             if (tab === 'schedules') { loadSchedules(); }
             if (tab === 'insights') { loadInsights(); }
             if (tab === 'topology') { setTimeout(loadTopology, 50); }
+            if (tab === 'pentest') { loadPentestTab(); }
         }
 
         // ── AUTH ───────────────────────────────────────────────────────────
@@ -347,6 +362,7 @@
                     document.getElementById("loginOverlay").classList.add('hidden');
                     loadAll();
                     loadServerSettings();
+                    loadJobTypes();
                 }
             });
         }
@@ -406,6 +422,7 @@
             if (targetInput) {
                 targetInput.placeholder = type === 'nikto_scan' ? 'IP, hostname, or URL' : 'IP or hostname';
             }
+            renderPluginFieldsForCreateJob(type);
             updateNseExploitBanner();
             onProfileChange();
         }
@@ -1493,6 +1510,8 @@ WantedBy=multi-user.target`;
                 document.getElementById('niktoCustomWarning').classList.add('hidden');
                 payload.nikto_tuning = categories;
             }
+            const pluginExtra = collectPluginExtraParams(type);
+            if (pluginExtra && Object.keys(pluginExtra).length) payload.extra_params = pluginExtra;
             const res = await apiFetch('/jobs/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
             if (!res) return;
             if (res.status === 400) { const err = await res.json(); alert(`Job creation failed: ${err.detail}`); return; }
@@ -1504,7 +1523,6 @@ ${data.warning}`);
             document.getElementById("port").value = "";
             document.getElementById("ports").value = "";
             setTimeout(loadAll, 300);
-
             // Reset custom NSE profile state
             if (type === 'nse_scan' && profile === 'custom') {
                 initCapabilityState();
@@ -1519,6 +1537,403 @@ ${data.warning}`);
                 document.getElementById('niktoCustomPanel').classList.add('hidden');
                 document.getElementById('profile').value = 'standard';
             }
+        }
+
+        // ── PLUGINS & JOB TYPES ────────────────────────────────────────────
+        let availableJobTypes = [];
+
+        async function loadJobTypes() {
+            const res = await apiFetch('/plugins/job-types');
+            if (!res) return;
+            availableJobTypes = await res.json();
+
+            // Extend the Create Job dropdown with plugin types meant for the regular
+            // scan flow (tab === 'scan'). Pen Test-tab types render separately.
+            const select = document.getElementById('job_type');
+            if (select) {
+                Array.from(select.querySelectorAll('option[data-plugin-option]')).forEach(o => o.remove());
+                availableJobTypes
+                    .filter(jt => !jt.builtin && (jt.tab || 'scan') === 'scan')
+                    .forEach(jt => {
+                        const opt = document.createElement('option');
+                        opt.value = jt.type;
+                        opt.textContent = jt.label;
+                        opt.dataset.pluginOption = 'true';
+                        select.appendChild(opt);
+                    });
+            }
+
+            updatePentestTabVisibility();
+        }
+
+        function updatePentestTabVisibility() {
+            // The Pen Test tab only exists to hold pentest-tagged plugin job types —
+            // no point showing an empty tab before one's actually installed, and it
+            // should disappear again the moment the last one is uninstalled/disabled.
+            const hasPentestTypes = availableJobTypes.some(jt => jt.tab === 'pentest');
+            const navBtn = document.getElementById('nav-pentest');
+            if (!navBtn) return;
+            navBtn.classList.toggle('hidden', !hasPentestTypes);
+
+            // If we're sitting on the tab when it disappears, don't strand the user on a hidden panel.
+            const pentestPanel = document.getElementById('tab-pentest');
+            if (!hasPentestTypes && pentestPanel && pentestPanel.classList.contains('active')) {
+                switchTab('dashboard');
+            }
+        }
+
+        function getJobTypeInfo(type) {
+            return availableJobTypes.find(jt => jt.type === type) || null;
+        }
+
+        function renderFormFieldHtml(field, idPrefix, currentValue) {
+            const id = `${idPrefix}_${field.name}`;
+            const value = currentValue !== undefined ? currentValue : (field.default ?? '');
+            let control;
+            if (field.type === 'select') {
+                const opts = (field.options || []).map(o =>
+                    `<option value="${o}" ${o === value ? 'selected' : ''}>${o}</option>`).join('');
+                control = `<select id="${id}" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">${opts}</select>`;
+            } else if (field.type === 'multiselect') {
+                const opts = (field.options || []).map(o => `
+                    <label class="flex items-center gap-2 text-xs text-gray-300 py-0.5">
+                        <input type="checkbox" class="plugin-multiselect" data-field="${id}" value="${o}">
+                        ${o}
+                    </label>`).join('');
+                control = `<div id="${id}" class="flex flex-col bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 max-h-32 overflow-y-auto">${opts}</div>`;
+            } else if (field.type === 'number') {
+                control = `<input id="${id}" type="number" value="${value}" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-24">`;
+            } else {
+                control = `<input id="${id}" type="text" value="${value}" placeholder="${field.label || field.name}" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-44">`;
+            }
+            return `<div class="flex flex-col gap-1">
+                <label class="text-xs text-gray-400">${field.label || field.name}${field.required ? ' *' : ''}</label>
+                ${control}
+            </div>`;
+        }
+
+        function readFormFieldValue(field, idPrefix) {
+            const id = `${idPrefix}_${field.name}`;
+            if (field.type === 'multiselect') {
+                return Array.from(document.querySelectorAll(`input.plugin-multiselect[data-field="${id}"]:checked`)).map(el => el.value);
+            }
+            const el = document.getElementById(id);
+            if (!el) return undefined;
+            if (field.type === 'number') return el.value ? Number(el.value) : undefined;
+            return el.value || undefined;
+        }
+
+        // ── Create Job — dynamic fields for plugin-provided types ──────────
+        function renderPluginFieldsForCreateJob(type) {
+            const container = document.getElementById('pluginFields');
+            if (!container) return;
+            const info = getJobTypeInfo(type);
+            if (!info || info.builtin || !(info.form_fields || []).length) {
+                container.innerHTML = '';
+                container.style.display = 'none';
+                return;
+            }
+            container.innerHTML = info.form_fields
+                .filter(f => f.name !== 'target')
+                .map(f => renderFormFieldHtml(f, 'cj_plugin')).join('');
+            container.style.display = 'flex';
+        }
+
+        function collectPluginExtraParams(type) {
+            const info = getJobTypeInfo(type);
+            if (!info || info.builtin) return null;
+            const extra = {};
+            (info.form_fields || []).filter(f => f.name !== 'target').forEach(f => {
+                const val = readFormFieldValue(f, 'cj_plugin');
+                if (val !== undefined && val !== '' && !(Array.isArray(val) && !val.length)) extra[f.name] = val;
+            });
+            return extra;
+        }
+
+        // ── PEN TEST TAB ─────────────────────────────────────────────────
+        async function loadPentestTab() {
+            if (!availableJobTypes.length) await loadJobTypes();
+            await loadAuthorizations();
+
+            const pentestTypes = availableJobTypes.filter(jt => jt.tab === 'pentest');
+            const networkTypes = pentestTypes.filter(jt => (jt.section || '').toLowerCase() === 'network');
+            const webTypes     = pentestTypes.filter(jt => (jt.section || '').toLowerCase() === 'web');
+            const otherTypes   = pentestTypes.filter(jt => !networkTypes.includes(jt) && !webTypes.includes(jt));
+
+            const netEl   = document.getElementById('pentestNetworkSection');
+            const webEl   = document.getElementById('pentestWebSection');
+            const otherEl = document.getElementById('pentestOtherSection');
+            if (netEl)   netEl.innerHTML   = renderPentestSection(networkTypes, 'No Network Pen Test plugins installed yet.');
+            if (webEl)   webEl.innerHTML   = renderPentestSection(webTypes, 'No Web Pen Test plugins installed yet.');
+            if (otherEl) otherEl.innerHTML = otherTypes.length ? renderPentestSection(otherTypes, '') : '';
+        }
+
+        function renderPentestSection(types, emptyMessage) {
+            if (!types.length) return `<p class="text-xs text-gray-600 italic">${emptyMessage}</p>`;
+            return types.map(jt => renderPentestCard(jt)).join('');
+        }
+
+        function riskBadgeClasses(tier) {
+            if (tier === 'high') return 'border-red-700 text-red-400 bg-red-950';
+            if (tier === 'intrusive') return 'border-yellow-700 text-yellow-400 bg-yellow-950';
+            if (tier === 'read_only') return 'border-green-700 text-green-400 bg-green-950';
+            return 'border-gray-700 text-gray-400 bg-gray-900';
+        }
+
+        function renderPentestCard(jt) {
+            const idPrefix = `pentest_${jt.type}`;
+            const fields = (jt.form_fields || []).filter(f => f.name !== 'target');
+            const needsAuth = jt.risk_tier === 'high';
+            const activeAuth = (window.__activeAuthorizations || []).find(a => a.job_type === jt.type && a.active);
+
+            return `
+                <div class="bg-gray-950 border border-gray-800 rounded-lg p-4 mb-3">
+                    <div class="flex items-center justify-between mb-2">
+                        <div>
+                            <p class="text-sm font-semibold text-gray-200">${jt.label}</p>
+                            <p class="text-xs text-gray-600">${jt.plugin_name ? 'Plugin: ' + jt.plugin_name : ''}</p>
+                        </div>
+                        <span class="text-xs px-2 py-0.5 rounded-full border ${riskBadgeClasses(jt.risk_tier)}">${jt.risk_tier}</span>
+                    </div>
+                    <div class="flex flex-wrap gap-3 items-end mt-2">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-400">Target</label>
+                            <input id="${idPrefix}_target" placeholder="IP or hostname"
+                                class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-44">
+                        </div>
+                        ${fields.map(f => renderFormFieldHtml(f, idPrefix)).join('')}
+                    </div>
+                    ${needsAuth ? renderAuthorizationStatus(jt.type, activeAuth, idPrefix) : ''}
+                    <div class="mt-3">
+                        <button onclick="submitPentestJob('${jt.type}')"
+                            class="text-xs px-4 py-2 rounded-lg bg-red-900 hover:bg-red-800 text-red-200 border border-red-800 transition font-medium">
+                            ${needsAuth ? 'Run (requires active authorization)' : 'Run'}
+                        </button>
+                    </div>
+                </div>`;
+        }
+
+        function renderAuthorizationStatus(jobType, activeAuth, idPrefix) {
+            if (activeAuth) {
+                return `<div class="mt-3 flex items-center justify-between gap-3 bg-green-950 border border-green-800 rounded-lg px-3 py-2">
+                    <p class="text-xs text-green-300">Authorized for ${activeAuth.target} until ${new Date(activeAuth.expires_at).toLocaleString()}</p>
+                    <button onclick="revokeAuthorization(${activeAuth.id})" class="text-xs text-red-400 hover:text-red-300 underline">Revoke</button>
+                </div>`;
+            }
+            return `<div class="mt-3 flex items-center gap-2 bg-gray-900 border border-gray-800 rounded-lg px-3 py-2">
+                <p class="text-xs text-gray-500 flex-1">No active authorization for this job type.</p>
+                <button onclick="openAuthorizeModal('${jobType}', document.getElementById('${idPrefix}_target').value)"
+                    class="text-xs px-3 py-1.5 rounded-lg bg-yellow-900 hover:bg-yellow-800 text-yellow-200 border border-yellow-800 transition font-medium">
+                    Authorize Target
+                </button>
+            </div>`;
+        }
+
+        async function submitPentestJob(jobType) {
+            const idPrefix = `pentest_${jobType}`;
+            const targetEl = document.getElementById(`${idPrefix}_target`);
+            const target = targetEl ? targetEl.value.trim() : '';
+            if (!target) { alert('Please enter a target.'); return; }
+
+            const info = getJobTypeInfo(jobType);
+            const extra = {};
+            (info?.form_fields || []).filter(f => f.name !== 'target').forEach(f => {
+                const val = readFormFieldValue(f, idPrefix);
+                if (val !== undefined && val !== '' && !(Array.isArray(val) && !val.length)) extra[f.name] = val;
+            });
+
+            const payload = { type: jobType, target, mode: 'remote', extra_params: extra };
+            const res = await apiFetch('/jobs/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            if (!res) return;
+            if (res.status === 403 || res.status === 400) {
+                const err = await res.json();
+                alert(`Blocked: ${err.detail}`);
+                return;
+            }
+            alert('Job created — check the Dashboard tab for progress.');
+            targetEl.value = '';
+            setTimeout(loadAll, 300);
+        }
+
+        // ── TARGET AUTHORIZATIONS ───────────────────────────────────────────
+        async function loadAuthorizations() {
+            const res = await apiFetch('/authorizations');
+            if (!res) return;
+            window.__activeAuthorizations = await res.json();
+        }
+
+        let pendingAuthJobType = null;
+
+        function openAuthorizeModal(jobType, prefillTarget) {
+            pendingAuthJobType = jobType;
+            document.getElementById('authorizeJobType').textContent = jobType;
+            document.getElementById('authorizeTarget').value = prefillTarget || '';
+            const maxHours = serverSettings['high_risk_auth_max_hours'] || '4';
+            document.getElementById('authorizeHours').value = maxHours;
+            document.getElementById('authorizeHours').max = maxHours;
+            document.getElementById('authorizeMaxNote').textContent = `Max ${maxHours}h (set in Settings → Server)`;
+            document.getElementById('authorizeBackdrop').classList.remove('hidden');
+            document.getElementById('authorizeModal').classList.remove('hidden');
+        }
+
+        function closeAuthorizeModal() {
+            document.getElementById('authorizeBackdrop').classList.add('hidden');
+            document.getElementById('authorizeModal').classList.add('hidden');
+            pendingAuthJobType = null;
+        }
+
+        async function submitAuthorization() {
+            const target = document.getElementById('authorizeTarget').value.trim();
+            const hours  = document.getElementById('authorizeHours').value;
+            if (!target || !pendingAuthJobType) return;
+
+            const res = await apiFetch('/authorizations', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target, job_type: pendingAuthJobType, hours: parseFloat(hours) }),
+            });
+            if (!res) return;
+            if (res.status !== 200) {
+                const err = await res.json();
+                alert(`Authorization failed: ${err.detail}`);
+                return;
+            }
+            closeAuthorizeModal();
+            await loadPentestTab();
+        }
+
+        function revokeAuthorization(authId) {
+            showConfirm('Revoke this authorization now?', async () => {
+                const res = await apiFetch(`/authorizations/${authId}`, { method: 'DELETE' });
+                if (!res) return;
+                await loadPentestTab();
+            });
+        }
+
+        // ── PLUGINS MANAGEMENT (Settings panel) ─────────────────────────────
+        async function loadPlugins() {
+            const [pluginsRes, agentsRes] = await Promise.all([apiFetch('/plugins'), apiFetch('/agents')]);
+            if (!pluginsRes) return;
+            const plugins = await pluginsRes.json();
+            const agents = agentsRes ? await agentsRes.json() : [];
+            renderPluginsList(plugins, agents);
+        }
+
+        function renderPluginsList(plugins, agents) {
+            const container = document.getElementById('pluginsList');
+            if (!container) return;
+            if (!plugins.length) {
+                container.innerHTML = '<p class="text-xs text-gray-600 italic">No plugins installed.</p>';
+                return;
+            }
+            container.innerHTML = plugins.map(p => `
+                <div class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 mb-2">
+                    <div class="flex items-center justify-between gap-3">
+                        <div class="min-w-0">
+                            <p class="text-sm text-gray-200 truncate">${p.display_name} <span class="text-gray-600">v${p.version}</span></p>
+                            <p class="text-xs text-gray-600">${p.job_types.length} job type(s), ${p.hooks.length} hook(s)</p>
+                        </div>
+                        <div class="flex items-center gap-2 flex-shrink-0">
+                            <button onclick="togglePlugin('${p.name}', ${!p.enabled})"
+                                class="text-xs px-2 py-1 rounded-lg border transition ${p.enabled ? 'border-green-700 text-green-400 hover:bg-green-950' : 'border-gray-600 text-gray-500 hover:bg-gray-700'}">
+                                ${p.enabled ? 'Enabled' : 'Disabled'}
+                            </button>
+                            <button onclick="uninstallPlugin('${p.name}')" class="text-xs text-red-500 hover:text-red-400">Remove</button>
+                        </div>
+                    </div>
+                    ${(p.job_types || []).map(jt => renderDeploymentStatus(jt, agents)).join('')}
+                </div>`).join('');
+        }
+
+        function renderDeploymentStatus(jobType, agents) {
+            if (!agents.length) {
+                return `<div class="mt-2 pt-2 border-t border-gray-700">
+                    <p class="text-xs text-gray-600">No registered agents to check deployment against.</p>
+                </div>`;
+            }
+            const rows = agents.map(a => {
+                const caps = (a.capabilities || '').split(',').map(c => c.trim());
+                const deployed = caps.includes(jobType.type);
+                const cmdId = `deploycmd_${jobType.type}_${a.id}`;
+                const cmd = `./install_plugin.sh <path-to-plugin-source> ${jobType.type} scanner:${a.name}`;
+                return `<div class="flex items-center justify-between gap-2 text-xs py-1">
+                    <span class="text-gray-400">${a.name}</span>
+                    ${deployed
+                        ? `<span class="text-green-400">✓ deployed</span>`
+                        : `<button onclick="copyDeployCommand('${cmdId}')" class="text-gray-500 hover:text-gray-300 underline" title="${cmd}">
+                               <span id="${cmdId}-label">copy deploy command</span>
+                               <span id="${cmdId}" class="hidden">${cmd}</span>
+                           </button>`}
+                </div>`;
+            }).join('');
+            return `<div class="mt-2 pt-2 border-t border-gray-700">
+                <p class="text-xs text-gray-500 font-mono mb-1">${jobType.type}</p>
+                ${rows}
+            </div>`;
+        }
+
+        function copyDeployCommand(cmdId) {
+            const text = document.getElementById(cmdId).textContent;
+            navigator.clipboard.writeText(text).then(() => {
+                const label = document.getElementById(`${cmdId}-label`);
+                const original = label.textContent;
+                label.textContent = 'copied!';
+                setTimeout(() => { label.textContent = original; }, 1500);
+            });
+        }
+
+        async function togglePlugin(name, enabled) {
+            const res = await apiFetch(`/plugins/${name}/enable`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled }),
+            });
+            if (!res) return;
+            await loadPlugins();
+            await loadJobTypes();
+        }
+
+        function uninstallPlugin(name) {
+            showConfirm(`Uninstall '${name}'? Any pending jobs of its type will be cancelled. Past results are kept.`, async () => {
+                const res = await apiFetch(`/plugins/${name}`, { method: 'DELETE' });
+                if (!res) return;
+                const data = await res.json();
+                if (data.cancelled_pending_jobs) alert(`${data.cancelled_pending_jobs} pending job(s) were cancelled.`);
+                await loadPlugins();
+                await loadJobTypes();
+            });
+        }
+
+        function readPluginManifestFile(fileInput) {
+            const file = fileInput.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = e => { document.getElementById('pluginManifestText').value = e.target.result; };
+            reader.readAsText(file);
+        }
+
+        async function installPluginFromTextarea() {
+            const raw = document.getElementById('pluginManifestText').value.trim();
+            if (!raw) { alert('Paste a plugin.json, or choose a file first.'); return; }
+            let manifest;
+            try {
+                manifest = JSON.parse(raw);
+            } catch (e) {
+                alert(`Invalid JSON: ${e.message}`);
+                return;
+            }
+            const res = await apiFetch('/plugins/install', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(manifest),
+            });
+            if (!res) return;
+            if (res.status !== 200) {
+                const err = await res.json();
+                alert(`Install failed: ${err.detail}`);
+                return;
+            }
+            document.getElementById('pluginManifestText').value = '';
+            await loadPlugins();
+            await loadJobTypes();
+            alert('Plugin installed.');
         }
 
         // ── RESULTS ────────────────────────────────────────────────────────

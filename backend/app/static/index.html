@@ -310,8 +310,22 @@
                                 <span class="text-xs text-gray-500">hrs</span>
                             </div>
                         </div>
+
+                        <div class="flex items-center justify-between gap-3">
+                            <div>
+                                <p class="text-sm text-gray-300">Max authorization duration</p>
+                                <p class="text-xs text-gray-600 mt-0.5">Cap on how long a Pen Test target authorization can last</p>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <input id="setting-auth-max-hours" type="number" min="0.5" max="168" step="0.5"
+                                    class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-green-500 w-20 text-right"
+                                    onchange="saveServerSetting('high_risk_auth_max_hours', this.value)">
+                                <span class="text-xs text-gray-500">hrs</span>
+                            </div>
+                        </div>
                     </div>
                 </section>
+
  
             </div>
  
@@ -321,6 +335,62 @@
             </div>
         </div>
         
+
+        <!-- ── PLUGINS PANEL ────────────────────────────────────────────── -->
+        <div id="pluginsBackdrop"
+             class="fixed inset-0 bg-black bg-opacity-50 z-40 hidden transition-opacity"
+             onclick="closePluginsPanel()"></div>
+
+        <div id="pluginsPanel"
+             class="fixed top-0 right-0 h-full w-96 bg-gray-900 border-l border-gray-800 z-50 transform translate-x-full transition-transform duration-300 overflow-y-auto flex flex-col">
+
+            <div class="flex items-center justify-between px-6 py-4 border-b border-gray-800 flex-shrink-0">
+                <div class="flex items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1 12.024c0-.617.236-1.234.706-1.704L2.916 9.11c.246-.247.611-.35.95-.24.322.104.55.372.694.68a2.5 2.5 0 1 0 3.237-3.237c-.308-.144-.576-.372-.68-.694-.11-.339-.007-.704.24-.95l1.21-1.21A2.402 2.402 0 0 1 10.271 2c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.968 1.02a1.026 1.026 0 0 0 .29.877l1.568 1.568"></path>
+                    </svg>
+                    <h2 class="text-sm font-semibold text-green-400 tracking-wide">Plugins</h2>
+                </div>
+                <button onclick="closePluginsPanel()" class="text-gray-500 hover:text-gray-300 transition text-lg leading-none">✕</button>
+            </div>
+
+            <div class="flex-1 px-6 py-5 space-y-5 overflow-y-auto">
+                <p class="text-xs text-gray-600">
+                    Installing here only registers a plugin's metadata — it never transmits or
+                    runs code. Each job type below shows which registered agents already have
+                    its execution code deployed, detected from what they report as capable of.
+                </p>
+
+                <div id="pluginsList"></div>
+
+                <hr class="border-gray-800">
+
+                <details class="group">
+                    <summary class="text-xs text-green-400 hover:text-green-300 cursor-pointer select-none">+ Install a plugin</summary>
+                    <div class="mt-3 space-y-2">
+                        <textarea id="pluginManifestText" rows="6" placeholder="Paste plugin.json here…"
+                            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs font-mono text-gray-200 focus:outline-none focus:border-green-500"></textarea>
+                        <div class="flex items-center justify-between gap-2">
+                            <label class="text-xs text-gray-500 hover:text-gray-300 cursor-pointer underline">
+                                or choose a file
+                                <input type="file" accept=".json,application/json" class="hidden" onchange="readPluginManifestFile(this)">
+                            </label>
+                            <button onclick="installPluginFromTextarea()"
+                                class="text-xs px-3 py-1.5 rounded-lg bg-green-900 hover:bg-green-800 text-green-300 border border-green-800 transition font-medium">
+                                Install
+                            </button>
+                        </div>
+                    </div>
+                </details>
+            </div>
+
+            <div class="px-6 py-4 border-t border-gray-800 flex-shrink-0">
+                <p class="text-xs text-gray-700 text-center">
+                    Deploy code with <code class="text-gray-500">install_plugin.sh</code>
+                </p>
+            </div>
+        </div>
+
 
         <!-- ── HEADER ───────────────────────────────────────────────────── -->
         <div class="bg-gray-900 border-b border-gray-800 px-6 py-3 flex items-center justify-between">
@@ -351,9 +421,18 @@
                     class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
                     Network Map
                 </button>
+                <button onclick="switchTab('pentest')" id="nav-pentest"
+                    class="nav-tab hidden text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
+                    Pen Test
+                </button>
             </nav>
             <div class="flex items-center gap-2">
                 <button onclick="loadAll()" class="text-sm bg-gray-800 hover:bg-gray-700 px-4 py-2 rounded-lg transition">↻ Refresh</button>
+                <button onclick="openPluginsPanel()" class="text-sm bg-gray-800 hover:bg-gray-700 w-9 h-9 rounded-lg transition flex items-center justify-center" title="Plugins">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1 12.024c0-.617.236-1.234.706-1.704L2.916 9.11c.246-.247.611-.35.95-.24.322.104.55.372.694.68a2.5 2.5 0 1 0 3.237-3.237c-.308-.144-.576-.372-.68-.694-.11-.339-.007-.704.24-.95l1.21-1.21A2.402 2.402 0 0 1 10.271 2c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.968 1.02a1.026 1.026 0 0 0 .29.877l1.568 1.568"></path>
+                    </svg>
+                </button>
                 <button onclick="openSettings()" class="text-sm bg-gray-800 hover:bg-gray-700 w-9 h-9 rounded-lg transition flex items-center justify-center" title="Settings">
                     <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <circle cx="12" cy="12" r="3"></circle>
@@ -400,6 +479,7 @@
                         <input id="ports" placeholder="22,445,3389"
                             class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500 w-52">
                     </div>
+                    <div id="pluginFields" class="flex flex-wrap gap-3" style="display:none"></div>
                     <div class="flex flex-col gap-1">
                         <label class="text-xs text-gray-400">Mode</label>
                         <select id="mode" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-green-500">
@@ -888,6 +968,72 @@
             </div>
 
         </div>
+        </div>
+
+        <!-- ── PEN TEST TAB ─────────────────────────────────────────────── -->
+        <div id="tab-pentest" class="tab-panel">
+        <div class="max-w-screen-xl mx-auto px-6 py-8">
+
+            <div class="mb-6">
+                <h2 class="text-lg font-semibold text-red-400">Pen Test</h2>
+                <p class="text-xs text-gray-600 mt-0.5">
+                    Credential attacks and exploitation-class tooling, kept separate from routine
+                    scanning. High-risk job types here require an explicit, time-boxed target
+                    authorization before they'll run.
+                </p>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                    <h3 class="text-sm font-semibold text-gray-300 mb-3">Network Pen Test</h3>
+                    <div id="pentestNetworkSection"></div>
+                </div>
+                <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
+                    <h3 class="text-sm font-semibold text-gray-300 mb-3">Web Pen Test</h3>
+                    <div id="pentestWebSection"></div>
+                </div>
+            </div>
+
+            <div id="pentestOtherSection" class="mt-6"></div>
+
+            <p class="text-xs text-gray-700 mt-8">
+                Installing a plugin here only registers its metadata — it never runs code on its
+                own. Manage installed plugins from Settings → Plugins.
+            </p>
+
+        </div>
+        </div>
+
+        <!-- ── AUTHORIZE TARGET MODAL ───────────────────────────────────── -->
+        <div id="authorizeBackdrop" class="fixed inset-0 bg-black bg-opacity-50 z-40 hidden" onclick="closeAuthorizeModal()"></div>
+        <div id="authorizeModal" class="fixed inset-0 z-50 hidden flex items-center justify-center px-4">
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 w-full max-w-sm">
+                <h3 class="text-sm font-semibold text-yellow-400 mb-1">Authorize Target</h3>
+                <p class="text-xs text-gray-500 mb-4">
+                    For <span id="authorizeJobType" class="text-gray-300 font-mono"></span> only —
+                    scoped to one exact target, expires automatically.
+                </p>
+                <div class="space-y-3">
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Target</label>
+                        <input id="authorizeTarget" placeholder="IP or hostname"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-yellow-500">
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-xs text-gray-400">Duration (hours)</label>
+                        <input id="authorizeHours" type="number" min="0.5" step="0.5"
+                            class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-yellow-500">
+                        <span id="authorizeMaxNote" class="text-xs text-gray-600"></span>
+                    </div>
+                </div>
+                <div class="flex items-center justify-end gap-2 mt-5">
+                    <button onclick="closeAuthorizeModal()" class="text-xs px-3 py-2 rounded-lg text-gray-400 hover:text-gray-200 transition">Cancel</button>
+                    <button onclick="submitAuthorization()"
+                        class="text-xs px-4 py-2 rounded-lg bg-yellow-900 hover:bg-yellow-800 text-yellow-200 border border-yellow-800 transition font-medium">
+                        Authorize
+                    </button>
+                </div>
+            </div>
         </div>
 
         <!-- ── SCRIPTS ──────────────────────────────────────────────────── -->

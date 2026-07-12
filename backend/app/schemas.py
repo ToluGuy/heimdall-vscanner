@@ -53,3 +53,4 @@ class JobCreate(BaseModel):
     ports: Optional[str] = None
     custom_scripts: Optional[list[str]] = None  # list of NSE script names — only used when profile='custom' on nse_scan
     nikto_tuning: Optional[list[str]] = None    # list of Nikto tuning category codes — only used when profile='custom' on nikto_scan
+    extra_params: Optional[dict] = None         # plugin-provided form_fields values, keyed by field name — ignored by built-in types

@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..models import Schedule
-from ..core import logger, require_auth, validate_target, VALID_JOB_TYPES
+from ..core import logger, require_auth, validate_target, get_valid_job_types, get_job_type_risk_tier
 
 router = APIRouter()
 
@@ -51,8 +51,16 @@ def create_schedule(
 
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
-    if scan_type not in VALID_JOB_TYPES:
-        raise HTTPException(status_code=400, detail=f"Invalid type. Valid: {sorted(VALID_JOB_TYPES)}")
+    valid_types = get_valid_job_types(db)
+    if scan_type not in valid_types:
+        raise HTTPException(status_code=400, detail=f"Invalid type. Valid: {sorted(valid_types)}")
+    if get_job_type_risk_tier(db, scan_type) == "high":
+        raise HTTPException(
+            status_code=400,
+            detail="High-risk job types (credential attacks, exploitation-class tooling) can't be "
+                   "scheduled — they require a fresh, explicit, time-boxed authorization each time, "
+                   "which a recurring schedule can't provide. Run these as one-off jobs only."
+        )
     if not interval_hours or int(interval_hours) < 1:
         raise HTTPException(status_code=400, detail="interval_hours must be >= 1")
 
