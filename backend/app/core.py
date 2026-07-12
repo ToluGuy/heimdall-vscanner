@@ -152,6 +152,25 @@ def get_job_type_risk_tier(db, job_type: str) -> str:
     return info["risk_tier"] if info else "high"
 
 
+def get_discovery_job_types(db) -> list:
+    """
+    Job types a sweep is allowed to run against the hosts it finds:
+    nmap_scan (the original, always-available default) plus any enabled
+    plugin job type that declares itself for the Discovery tab. Deliberately
+    NOT the full get_valid_job_types() set — picking nikto_scan or a
+    Pen Test type for a whole subnet sweep doesn't make sense, so those
+    stay unavailable here regardless of what's installed.
+    """
+    types = [{
+        "type": "nmap_scan", "label": "Port Scan (default)",
+        "risk_tier": "read_only", "builtin": True,
+    }]
+    for jt, plugin in _plugin_job_types(db):
+        if jt.get("tab") == "discovery":
+            types.append({**jt, "builtin": False, "plugin_name": plugin.name})
+    return types
+
+
 # --- VALIDATION ---
 
 # Web ports are Nikto's domain — NSE and standalone jobs validate against this

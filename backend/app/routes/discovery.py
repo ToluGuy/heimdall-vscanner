@@ -11,12 +11,17 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db, SessionLocal
 from ..models import DiscoverySweep, Job, Result
-from ..core import logger, require_auth, validate_target
+from ..core import logger, require_auth, validate_target, get_discovery_job_types
 
 router = APIRouter()
 
 
-def run_ping_sweep(sweep_id: int, subnet: str, mode: str, profile: str):
+@router.get("/discover/job-types")
+def get_sweep_job_types(db: Session = Depends(get_db), username: str = Depends(require_auth)):
+    return get_discovery_job_types(db)
+
+
+def run_ping_sweep(sweep_id: int, subnet: str, mode: str, profile: str, job_type: str):
     db = SessionLocal()
     try:
         result = subprocess.run(
@@ -48,7 +53,7 @@ def run_ping_sweep(sweep_id: int, subnet: str, mode: str, profile: str):
         jobs_created = 0
         for host_ip in hosts:
             new_job = Job(
-                type="nmap_scan",
+                type=job_type,
                 target=host_ip,
                 status="pending",
                 mode=mode,
@@ -99,6 +104,14 @@ def start_discovery(
     subnet = validate_target(data.get("subnet", ""), field_name="subnet")
     mode = data.get("mode", "remote")
     profile = data.get("profile", "standard")
+    job_type = data.get("job_type", "nmap_scan")
+
+    allowed = get_discovery_job_types(db)
+    if job_type not in {jt["type"] for jt in allowed}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{job_type}' isn't available for sweeps. Valid: {sorted(jt['type'] for jt in allowed)}"
+        )
 
     sweep = DiscoverySweep(
         subnet=subnet,
@@ -110,7 +123,7 @@ def start_discovery(
 
     thread = threading.Thread(
         target=run_ping_sweep,
-        args=(sweep.id, subnet, mode, profile),
+        args=(sweep.id, subnet, mode, profile, job_type),
         daemon=True
     )
     thread.start()
@@ -267,8 +280,11 @@ def ping_sweep(
     username: str = Depends(require_auth)
 ):
     """
-    Fast ping sweep — discovers live hosts in a subnet but does NOT create jobs.
-    Returns the list of responding hosts for the user to review before committing.
+    Fast ping sweep — discovers live hosts in a subnet and creates a sweep
+    record for them, but does NOT create scan jobs itself. Returns the host
+    list plus sweep_id, so a follow-up flow (e.g. the sweep confirmation
+    dialog) can create jobs against sweep_id — keeping them grouped and out
+    of the main Jobs/Results lists, same as jobs from POST /discover.
     """
     subnet = validate_target(data.get("subnet", ""), field_name="subnet")
 
@@ -297,8 +313,20 @@ def ping_sweep(
             except ET.ParseError as e:
                 raise HTTPException(status_code=500, detail=f"XML parse error: {e}")
 
-        logger.info(f"Ping sweep on {subnet}: {len(hosts)} host(s) found")
-        return {"subnet": subnet, "hosts": hosts, "count": len(hosts)}
+        sweep = DiscoverySweep(
+            subnet=subnet,
+            status="done",
+            hosts_found=len(hosts),
+            jobs_created=0,  # updated implicitly — /sweeps/{id}/results queries live Job rows, not this counter
+            result=json.dumps([h["ip"] for h in hosts]),
+            completed_at=datetime.utcnow(),
+        )
+        db.add(sweep)
+        db.commit()
+        db.refresh(sweep)
+
+        logger.info(f"Ping sweep on {subnet}: {len(hosts)} host(s) found (sweep_id={sweep.id})")
+        return {"subnet": subnet, "hosts": hosts, "count": len(hosts), "sweep_id": sweep.id}
 
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="Ping sweep timed out")

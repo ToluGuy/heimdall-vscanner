@@ -112,6 +112,7 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
         custom_scripts=custom_scripts_str,
         nikto_tuning=nikto_tuning_str,
         extra_params=extra_params_str,
+        sweep_id=job.sweep_id,
     )
     db.add(new_job)
     db.commit()
@@ -127,12 +128,19 @@ def create_job(job: JobCreate, db: Session = Depends(get_db), username: str = De
 @router.get("/jobs")
 def get_jobs(
     db: Session = Depends(get_db),
-    show_history: bool = False
+    show_history: bool = False,
+    show_sweep_jobs: bool = False,
 ):
-    if show_history:
-        jobs = db.query(Job).all()
-    else:
-        jobs = db.query(Job).filter(Job.cleared == False).all()
+    query = db.query(Job)
+    if not show_history:
+        query = query.filter(Job.cleared == False)
+    if not show_sweep_jobs:
+        # Sweep-spawned jobs (one per discovered host) can number in the dozens
+        # per sweep — they have their own consolidated view at
+        # GET /sweeps/{sweep_id}/results, so they're hidden here by default
+        # rather than flooding the main Jobs list.
+        query = query.filter(Job.sweep_id == None)
+    jobs = query.all()
 
     result = []
     for j in jobs:

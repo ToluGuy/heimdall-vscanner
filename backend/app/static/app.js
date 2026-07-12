@@ -1564,6 +1564,26 @@ ${data.warning}`);
             }
 
             updatePentestTabVisibility();
+            loadDiscoveryJobTypes();
+        }
+
+        async function loadDiscoveryJobTypes() {
+            const res = await apiFetch('/discover/job-types');
+            if (!res) return;
+            const types = await res.json();
+
+            const select = document.getElementById('sweepJobType');
+            if (!select) return;
+            Array.from(select.querySelectorAll('option[data-plugin-option]')).forEach(o => o.remove());
+
+            types.filter(jt => !jt.builtin).forEach(jt => {
+                SCAN_TYPE_LABELS[jt.type] = jt.label;
+                const opt = document.createElement('option');
+                opt.value = jt.type;
+                opt.textContent = jt.label;
+                opt.dataset.pluginOption = 'true';
+                select.appendChild(opt);
+            });
         }
 
         function updatePentestTabVisibility() {
@@ -2375,7 +2395,7 @@ ${data.warning}`);
                 }
 
                 // Show confirmation dialog — store hosts list for direct job creation path
-                pendingSweepPayload = { subnet, hosts: data.hosts };
+                pendingSweepPayload = { subnet, hosts: data.hosts, sweepId: data.sweep_id };
                 // Reset sweep dialog selectors to sensible defaults
                 const sweepJobType = document.getElementById('sweepJobType');
                 const sweepProfile = document.getElementById('sweepProfile');
@@ -2431,13 +2451,15 @@ ${data.warning}`);
 
             document.getElementById("sweepConfirmDialog").classList.add('hidden');
             if (!pendingSweepPayload) return;
-            const { subnet, hosts } = pendingSweepPayload;
+            const { subnet, hosts, sweepId } = pendingSweepPayload;
             pendingSweepPayload = null;
 
-            showSweepStatus(`Assigning ${SCAN_TYPE_LABELS[jobType] || jobType} jobs to ${hosts.length} host(s)…`, 'bg-cyan-400 animate-pulse');
+            showSweepStatus(`Assigning ${scanTypeLabel(jobType)} jobs to ${hosts.length} host(s)…`, 'bg-cyan-400 animate-pulse');
 
-            // For custom profile or non-nmap types, create individual jobs directly
-            // rather than using the sweep endpoint (which hardcodes nmap_scan).
+            // For custom profile, plugin types, or anything other than plain nmap_scan,
+            // create individual jobs directly (tagged with sweep_id so they're grouped
+            // and stay out of the main Jobs/Results lists) rather than using the
+            // /discover endpoint, which only ever creates nmap_scan jobs.
             if (jobType !== 'nmap_scan' || profile === 'custom') {
                 const customScripts = (jobType === 'nse_scan' && profile === 'custom')
                     ? getSweepSelectedScripts()
@@ -2454,6 +2476,7 @@ ${data.warning}`);
                             profile:        profile,
                             priority:       priority,
                             custom_scripts: customScripts || undefined,
+                            sweep_id:       sweepId || undefined,
                         }),
                     })
                 ));
@@ -2581,6 +2604,21 @@ ${data.warning}`);
                     findings = Array.isArray(f) ? `${f.length} finding${f.length !== 1 ? 's' : ''}` : '—';
                 }
 
+                // Asset Inventory results don't have nmap.ports/nse.findings shaped like
+                // that — repurpose the same two columns to show what's actually useful here.
+                let portSummaryTitle = portSummary;
+                if (h.output && h.output.asset_inventory) {
+                    const ai = h.output.asset_inventory;
+                    const classColours = {
+                        router: 'text-cyan-400', printer: 'text-purple-400', iot: 'text-yellow-400',
+                        nas: 'text-blue-400', workstation: 'text-green-400', server: 'text-orange-400',
+                        unclassified: 'text-gray-500',
+                    };
+                    portSummaryTitle = ai.signals ? ai.signals.join('; ') : ai.classification;
+                    portSummary = `<span class="${classColours[ai.classification] || 'text-gray-400'}">${ai.classification}</span>`;
+                    findings = ai.confidence ? `${ai.confidence} confidence` : '—';
+                }
+
                 const resultLink = h.result_id
                     ? `<button onclick="closeSweepResultPanel(); switchTab('results'); setTimeout(()=>{ const el=document.getElementById('result-${h.result_id}'); if(el){ el.scrollIntoView({behavior:'smooth'}); el.classList.add('ring-1','ring-cyan-500'); setTimeout(()=>el.classList.remove('ring-1','ring-cyan-500'),2000); }},300);" class="text-xs text-cyan-400 hover:text-cyan-300 transition">View</button>`
                     : '<span class="text-gray-600 text-xs">—</span>';
@@ -2588,7 +2626,7 @@ ${data.warning}`);
                 return `<tr class="border-b border-gray-800 hover:bg-gray-800 transition text-xs">
                     <td class="py-2 pr-4 font-mono text-gray-200">${h.target}</td>
                     <td class="py-2 pr-4">${statusBadge(h.status)}</td>
-                    <td class="py-2 pr-4 text-gray-400 font-mono text-xs max-w-xs truncate" title="${portSummary}">${portSummary}</td>
+                    <td class="py-2 pr-4 text-gray-400 font-mono text-xs max-w-xs truncate" title="${portSummaryTitle}">${portSummary}</td>
                     <td class="py-2 pr-4 text-gray-400">${findings}</td>
                     <td class="py-2 pr-4 text-gray-500">${h.completed_at ? formatTimestamp(h.completed_at) : '—'}</td>
                     <td class="py-2">${resultLink}</td>
