@@ -10,6 +10,7 @@ import requests
 import subprocess
 import xml.etree.ElementTree as ET
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 import threading
 import importlib.util
 
@@ -862,6 +863,18 @@ def recover_interrupted_jobs(api_key: str):
         logger.debug(f"Crash recovery check failed: {e}")
 
 
+def _log_job_thread_exception(future):
+    """
+    execute_job() already catches its own errors internally and reports them
+    to the server — this is a safety net for anything that somehow still
+    escapes that, since a submitted-but-never-.result()'d Future would
+    otherwise swallow it silently.
+    """
+    exc = future.exception()
+    if exc:
+        logger.error(f"Unhandled exception in job execution thread: {exc}")
+
+
 def main():
     api_key = load_api_key()
 
@@ -876,6 +889,13 @@ def main():
     hb_thread = threading.Thread(target=heartbeat_loop, args=(api_key,), daemon=True)
     hb_thread.start()
 
+    # 2 workers matches the concurrent-job cap the server already enforces
+    # via get_agent_load() — this just lets this scanner actually use both
+    # slots at once instead of running jobs one at a time. A long job
+    # (Nikto today; hydra/sqlmap-class Pen Test jobs down the line) no
+    # longer blocks polling for the second slot while it runs.
+    executor = ThreadPoolExecutor(max_workers=2)
+
     while True:
         try:
             send_heartbeat(api_key)
@@ -883,7 +903,8 @@ def main():
 
             if job:
                 logger.info(f"Received job: {job}")
-                execute_job(job, api_key)
+                future = executor.submit(execute_job, job, api_key)
+                future.add_done_callback(_log_job_thread_exception)
             else:
                 logger.info("No remote jobs available")
 
