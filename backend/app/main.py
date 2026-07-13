@@ -19,7 +19,7 @@ from .db import Base, engine
 from .core import logger
 from .services.scheduler import run_stale_cleanup, run_scheduler, init_default_settings
 
-from .routes import agents, jobs, results, hosts, schedules, discovery, reports, insights, topology, settings, dashboard
+from .routes import agents, jobs, results, hosts, schedules, discovery, reports, insights, topology, settings, dashboard, plugins, authorizations
 
 Base.metadata.create_all(bind=engine)
 
@@ -36,6 +36,8 @@ app.include_router(reports.router)     # HTML report generation
 app.include_router(insights.router)    # Dashboard insights/analytics
 app.include_router(topology.router)    # Network topology graph
 app.include_router(settings.router)    # Server-side settings
+app.include_router(plugins.router)     # Plugin registration (metadata only — see routes/plugins.py)
+app.include_router(authorizations.router)  # Target authorizations for high-risk job types
 
 
 @app.on_event("startup")

@@ -77,12 +77,104 @@ def require_auth(credentials: HTTPBasicCredentials = Depends(security)):
     return credentials.username
 
 
+# --- JOB TYPES ---
+#
+# The three scan types this tool ships with. Plugins can register more —
+# see get_valid_job_types()/get_job_type_info() below, which merge these
+# with whatever's declared in enabled Plugin rows. routes/plugins.py owns
+# the actual install/uninstall mechanics; this is just the read side that
+# job creation/validation calls into.
+BUILTIN_JOB_TYPES = {"nmap_scan", "nikto_scan", "nse_scan"}
+
+# All three built-ins are non-destructive; nse_scan can run intrusive vuln
+# scripts depending on profile, so it's tiered one step above the others.
+# Same tier vocabulary a plugin's manifest uses (none/read_only/intrusive/high)
+# so the risk gate in create_job() treats built-ins and plugins uniformly.
+BUILTIN_RISK_TIERS = {
+    "nmap_scan": "read_only",
+    "nikto_scan": "read_only",
+    "nse_scan": "intrusive",
+}
+
+
+def _enabled_plugins(db):
+    from .models import Plugin
+    return db.query(Plugin).filter(Plugin.enabled == True).all()
+
+
+def _plugin_job_types(db):
+    """Yields (job_type_dict, plugin_row) for every job type any enabled plugin declares."""
+    import json as _json
+    for plugin in _enabled_plugins(db):
+        try:
+            manifest = _json.loads(plugin.manifest)
+        except (ValueError, TypeError):
+            logger.error(f"Plugin '{plugin.name}' has an unparsable manifest — skipping its job types")
+            continue
+        for jt in manifest.get("job_types", []):
+            if jt.get("type"):
+                yield jt, plugin
+
+
+def get_valid_job_types(db) -> set:
+    """Built-in job types plus every job type declared by an enabled plugin."""
+    types = set(BUILTIN_JOB_TYPES)
+    for jt, _plugin in _plugin_job_types(db):
+        types.add(jt["type"])
+    return types
+
+
+def get_job_type_info(db, job_type: str) -> dict | None:
+    """
+    Full metadata for a job type, built-in or plugin-provided — risk tier,
+    whether it needs a target authorization, tab/section placement, form
+    fields. Returns None if job_type isn't recognised at all. Built-ins get
+    a small synthetic entry since they have no manifest of their own.
+    """
+    if job_type in BUILTIN_JOB_TYPES:
+        return {
+            "type": job_type,
+            "risk_tier": BUILTIN_RISK_TIERS.get(job_type, "intrusive"),
+            "requires_target_auth": False,
+            "tab": "scan",
+            "builtin": True,
+        }
+    for jt, plugin in _plugin_job_types(db):
+        if jt["type"] == job_type:
+            return {**jt, "builtin": False, "plugin_name": plugin.name}
+    return None
+
+
+def get_job_type_risk_tier(db, job_type: str) -> str:
+    """Unrecognised job types default to 'high' — the most restrictive tier —
+    rather than silently treating something unknown as safe."""
+    info = get_job_type_info(db, job_type)
+    return info["risk_tier"] if info else "high"
+
+
+def get_discovery_job_types(db) -> list:
+    """
+    Job types a sweep is allowed to run against the hosts it finds:
+    nmap_scan (the original, always-available default) plus any enabled
+    plugin job type that declares itself for the Discovery tab. Deliberately
+    NOT the full get_valid_job_types() set — picking nikto_scan or a
+    Pen Test type for a whole subnet sweep doesn't make sense, so those
+    stay unavailable here regardless of what's installed.
+    """
+    types = [{
+        "type": "nmap_scan", "label": "Port Scan (default)",
+        "risk_tier": "read_only", "builtin": True,
+    }]
+    for jt, plugin in _plugin_job_types(db):
+        if jt.get("tab") == "discovery":
+            types.append({**jt, "builtin": False, "plugin_name": plugin.name})
+    return types
+
+
 # --- VALIDATION ---
 
 # Web ports are Nikto's domain — NSE and standalone jobs validate against this
 WEB_PORTS = {80, 443, 8080, 8443, 8000, 8888}
-
-VALID_JOB_TYPES = {"nmap_scan", "nikto_scan", "nse_scan"}
 
 
 def validate_target(value: str, field_name: str = "target") -> str:
@@ -119,6 +211,7 @@ SETTING_DEFAULTS = {
     "ai_auto_analyse":    "true",
     "stale_agent_hours":  "24",
     "auto_nikto":         "true",   # automatically run Nikto after nmap_scan when web ports are found
+    "high_risk_auth_max_hours": "4",  # cap on how long a target authorization can last before expiring
 }
 
 

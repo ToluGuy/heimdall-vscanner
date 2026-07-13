@@ -5,3 +5,7 @@ __pycache__/
 .env
 logs/
 Changelogformat.md
+<<<<<<< HEAD
+=======
+migrations/
+>>>>>>> develop-mode

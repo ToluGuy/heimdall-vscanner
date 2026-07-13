@@ -1,5 +1,67 @@
 # Changelog
 
+## [v2.1] - 13-07-2026
+
+### Added
+- **Plugin extension mechanism**: manifest-based installation
+  (`plugin.json`), risk-tiered job types (`none`/`read_only`/`intrusive`/
+  `high`), a target authorization gate for high-risk job types (scoped to
+  one exact target + job type, time-boxed, cap configurable in Settings),
+  and per-plugin config storage rendered through the same generic field
+  system as job creation.
+- **Dedicated Plugins panel**, showing per-agent deployment status
+  (auto-detected from reported capabilities) with a ready-to-copy
+  `install_plugin.sh` command for anything not yet deployed.
+- `install_plugin.sh` — local helper that deploys a plugin's code onto a
+  scanner/agent and updates its capabilities in one step. Plugin code
+  itself is never transmitted by the server — this only ever moves code
+  that's already on the machine you run it from.
+- **Hook plugin system** (`services/hooks.py`) — event-driven plugins,
+  three events wired in: `job.completed`, `job.failed`, `host.new`.
+- **Webhook Notifications plugin**, pre-installed — posts a JSON payload
+  to a configured URL on any of the above events. Works directly with
+  Slack/Discord incoming webhooks.
+- **Asset Inventory plugin** — passive device fingerprinting and
+  classification (router / printer / IoT / NAS / workstation / server),
+  each with a confidence level and the signals behind it. Runs from the
+  Discovery tab against a sweep's discovered hosts.
+- Discovery sweeps can now target any installed job type, not just
+  `nmap_scan`.
+- `tools/migrations/` — a lightweight, numbered convention for schema
+  changes that `Base.metadata.create_all()` can't handle on its own
+  (altering an existing table rather than creating a new one).
+
+### Changed
+- Agent and scanner job execution now uses a 2-worker thread pool instead
+  of running jobs strictly one at a time — matches the concurrency limit
+  the server already enforced, previously unused in practice since a
+  single long job blocked polling entirely.
+- Sweep-spawned jobs and results are now hidden from the main Jobs/Results
+  lists by default (`show_sweep_jobs`/`show_sweep_results` to opt back
+  in) — they have their own consolidated view per sweep. This was
+  pre-existing clutter, not something new in this release.
+- High-risk job types can never be attached to a schedule — one-off jobs
+  only, since a recurring schedule can't provide the fresh, explicit
+  authorization the risk gate depends on.
+
+### Fixed
+- Plugin `form_fields` values had no path from the dashboard form into
+  what an agent actually receives at execution time — added
+  `Job.extra_params`, threaded through job creation, dispatch, and
+  execution.
+- A race condition where a hook event could fire, and its background
+  thread open a fresh DB session, before the triggering transaction had
+  actually committed — the row wasn't guaranteed visible yet.
+- `install_plugin.sh` hard-failed when a scanner is run manually rather
+  than via systemd; now degrades to a manual-restart reminder instead.
+
+### Internal
+- `VALID_JOB_TYPES` (a static set) replaced by `get_valid_job_types()`/
+  `get_job_type_info()` in `core.py`, merging built-ins with whatever
+  plugins are currently enabled.
+
+---
+
 ## [v2.0] - 10-07-2026
 
 ### Changed

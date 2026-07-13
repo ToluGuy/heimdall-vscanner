@@ -1,0 +1,19 @@
+{
+  "name": "webhook",
+  "display_name": "Webhook Notifications",
+  "version": "1.0.0",
+  "description": "Sends a JSON POST to a URL you configure when a job completes, a job fails, or a new host is discovered. Works directly with Slack and Discord incoming webhooks, or anything else that accepts one — a plain script, Zapier, n8n, etc.",
+  "job_types": [],
+  "hooks": ["job.completed", "job.failed", "host.new"],
+  "config_schema": [
+    { "name": "webhook_url", "type": "text", "required": true, "label": "Webhook URL" },
+    {
+      "name": "events",
+      "type": "multiselect",
+      "required": false,
+      "label": "Notify on",
+      "options": ["job.completed", "job.failed", "host.new"],
+      "default": ["job.failed", "host.new"]
+    }
+  ]
+}

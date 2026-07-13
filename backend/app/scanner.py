@@ -10,7 +10,9 @@ import requests
 import subprocess
 import xml.etree.ElementTree as ET
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 import threading
+import importlib.util
 
 # --- LOGGING ---
 os.makedirs("logs", exist_ok=True)
@@ -700,6 +702,34 @@ def run_nikto(target: str, port: int, profile: str = "standard", nikto_tuning: l
 
 # --- EXECUTION ENGINE ---
 
+def run_plugin(job_type: str, target: str, profile: str, **kwargs) -> dict:
+    """
+    Executes a locally-installed plugin's scan logic. Plugins are never
+    fetched or pushed automatically — this only ever imports code that's
+    already sitting in plugins/<job_type>/run.py on THIS machine's disk,
+    placed there deliberately (see install_plugin.sh). If it isn't there,
+    the job fails with a clear, specific message rather than silently
+    doing nothing or trying to reach out anywhere for it.
+    """
+    plugin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins", job_type)
+    entry_point = os.path.join(plugin_dir, "run.py")
+
+    if not os.path.isfile(entry_point):
+        raise Exception(
+            f"No plugin installed for job type '{job_type}' on this scanner "
+            f"(expected {entry_point}). Install it with install_plugin.sh first."
+        )
+
+    spec = importlib.util.spec_from_file_location(f"heimdall_plugin_{job_type}", entry_point)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    if not hasattr(module, "execute"):
+        raise Exception(f"Plugin at {entry_point} has no execute(target, profile, **kwargs) function")
+
+    return module.execute(target, profile, **kwargs)
+
+
 def execute_job(job: dict, api_key: str):
     job_type = job.get("type")
     target = job.get("target")
@@ -710,6 +740,7 @@ def execute_job(job: dict, api_key: str):
     ports = job.get("ports")          # comma-separated (nse_scan / multi-port nikto)
     custom_scripts = job.get("custom_scripts")  # list of script names (custom profile)
     nikto_tuning = job.get("nikto_tuning")      # list of tuning category codes (custom nikto profile)
+    extra_params = job.get("extra_params") or {}  # plugin form_fields values
     auto_nikto = job.get("auto_nikto", True)    # whether to auto-run Nikto after nmap_scan
 
     if mode != "remote":
@@ -778,7 +809,10 @@ def execute_job(job: dict, api_key: str):
                 output = {"nse": nse_result}
 
         else:
-            output = {"error": f"Unsupported job type: {job_type}"}
+            plugin_output = run_plugin(job_type, target, profile, ports=ports,
+                                        custom_scripts=custom_scripts, nikto_tuning=nikto_tuning,
+                                        **extra_params)
+            output = plugin_output if isinstance(plugin_output, dict) else {"result": plugin_output}
 
         logger.info(f"Job {job_id} complete")
 
@@ -829,6 +863,18 @@ def recover_interrupted_jobs(api_key: str):
         logger.debug(f"Crash recovery check failed: {e}")
 
 
+def _log_job_thread_exception(future):
+    """
+    execute_job() already catches its own errors internally and reports them
+    to the server — this is a safety net for anything that somehow still
+    escapes that, since a submitted-but-never-.result()'d Future would
+    otherwise swallow it silently.
+    """
+    exc = future.exception()
+    if exc:
+        logger.error(f"Unhandled exception in job execution thread: {exc}")
+
+
 def main():
     api_key = load_api_key()
 
@@ -843,6 +889,13 @@ def main():
     hb_thread = threading.Thread(target=heartbeat_loop, args=(api_key,), daemon=True)
     hb_thread.start()
 
+    # 2 workers matches the concurrent-job cap the server already enforces
+    # via get_agent_load() — this just lets this scanner actually use both
+    # slots at once instead of running jobs one at a time. A long job
+    # (Nikto today; hydra/sqlmap-class Pen Test jobs down the line) no
+    # longer blocks polling for the second slot while it runs.
+    executor = ThreadPoolExecutor(max_workers=2)
+
     while True:
         try:
             send_heartbeat(api_key)
@@ -850,7 +903,8 @@ def main():
 
             if job:
                 logger.info(f"Received job: {job}")
-                execute_job(job, api_key)
+                future = executor.submit(execute_job, job, api_key)
+                future.add_done_callback(_log_job_thread_exception)
             else:
                 logger.info("No remote jobs available")
 

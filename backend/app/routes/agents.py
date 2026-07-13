@@ -25,6 +25,7 @@ from ..core import (
     AGENT_REGISTRATION_TOKEN, INSTALL_DIR, ENV_FILE, PYTHON_BIN, SCANNER_PY,
     SCANNER_AUTOSTART,
 )
+from ..services.hooks import fire_hook
 from .results import run_ai_analysis
 
 router = APIRouter()
@@ -65,6 +66,10 @@ def find_or_create_host(db: Session, ip: str, mac: str = None, hostname: str = N
     Finds an existing Host record using priority matching, or creates a new one.
     Priority: agent_id > MAC > hostname > IP.
     Updates metadata and logs IP changes.
+    Returns (host, was_newly_created) — the caller fires the host.new hook
+    itself, after its own commit, since a background thread's hook
+    execution opens a fresh DB session that won't see this row until the
+    surrounding transaction actually commits.
     """
     now = datetime.utcnow()
     host = None
@@ -99,8 +104,9 @@ def find_or_create_host(db: Session, ip: str, mac: str = None, hostname: str = N
         db.add(host)
         db.flush()
         logger.info(f"New host: {ip} mac={mac} hostname={hostname}")
+        return host, True
 
-    return host
+    return host, False
 
 
 @router.post("/agents/results")
@@ -137,10 +143,11 @@ def submit_result(
 
     # Resolve host record
     host = None
+    host_is_new = False
     if target_ip:
         try:
-            host = find_or_create_host(db, ip=target_ip, mac=mac, hostname=hostname,
-                                       agent_id=linked_agent_id, os_fingerprint=os_fingerprint)
+            host, host_is_new = find_or_create_host(db, ip=target_ip, mac=mac, hostname=hostname,
+                                                     agent_id=linked_agent_id, os_fingerprint=os_fingerprint)
         except Exception as e:
             logger.error(f"Host resolution failed for {target_ip}: {e}")
             try:
@@ -172,6 +179,26 @@ def submit_result(
             daemon=True
         )
         thread.start()
+
+    # Fire hooks only after the commit above — a background thread's hook
+    # execution opens its own DB session, which won't see these rows until
+    # this transaction has actually committed.
+    if host_is_new:
+        threading.Thread(
+            target=fire_hook,
+            args=("host.new", {"host_id": host.id, "ip": host.ip, "mac": host.mac, "hostname": host.hostname}),
+            daemon=True
+        ).start()
+
+    if job:
+        threading.Thread(
+            target=fire_hook,
+            args=("job.completed", {
+                "job_id": job.id, "type": job.type, "target": job.target,
+                "result_id": new_result.id,
+            }),
+            daemon=True
+        ).start()
 
     return {"message": "Result stored"}
 
@@ -454,4 +481,12 @@ def update_job_status(
 
     job.status = new_status
     db.commit()
+
+    if new_status == "failed":
+        threading.Thread(
+            target=fire_hook,
+            args=("job.failed", {"job_id": job.id, "type": job.type, "target": job.target}),
+            daemon=True
+        ).start()
+
     return {"ok": True}

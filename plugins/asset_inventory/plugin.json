@@ -1,0 +1,19 @@
+{
+  "name": "asset_inventory",
+  "display_name": "Asset Inventory",
+  "version": "1.0.0",
+  "description": "Passive fingerprinting and device classification beyond nmap's defaults — labels each host as a router, workstation, printer, IoT/embedded device, server, or NAS based on open ports, service banners, OS fingerprint, and MAC vendor. Read-only, never attempts access.",
+  "job_types": [
+    {
+      "type": "asset_inventory_scan",
+      "label": "Asset Inventory",
+      "agent_capability": "asset_inventory_scan",
+      "risk_tier": "read_only",
+      "tab": "discovery",
+      "form_fields": [
+        { "name": "target", "type": "text", "required": true, "label": "Target" }
+      ]
+    }
+  ],
+  "hooks": []
+}

@@ -38,12 +38,18 @@ def run_ai_analysis(result_id: int, output: dict):
 def get_results(
     db: Session = Depends(get_db),
     username: str = Depends(require_auth),
-    show_history: bool = False
+    show_history: bool = False,
+    show_sweep_results: bool = False,
 ):
-    if show_history:
-        results = db.query(Result).filter(Result.cleared == True).all()
-    else:
-        results = db.query(Result).filter(Result.cleared == False).all()
+    query = db.query(Result).filter(Result.cleared == (True if show_history else False))
+    if not show_sweep_results:
+        # Same reasoning as get_jobs() — a sweep's results have their own
+        # consolidated view, so they're hidden from the main Results list
+        # by default rather than flooding it one entry per discovered host.
+        sweep_job_ids = [j.id for j in db.query(Job.id).filter(Job.sweep_id != None).all()]
+        if sweep_job_ids:
+            query = query.filter(Result.job_id.notin_(sweep_job_ids))
+    results = query.all()
 
     response = []
 
