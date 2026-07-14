@@ -90,7 +90,7 @@ cd "$INSTALL_DIR"
 import sys
 sys.path.insert(0, '.')
 from backend.app.db import engine, Base
-from backend.app.models import Agent, Job, Result, DiscoverySweep, Schedule, Host, Setting
+from backend.app.models import Agent, Job, Result, DiscoverySweep, Schedule, Host, Setting, Plugin, TargetAuthorization
 Base.metadata.create_all(bind=engine)
 print('  Tables verified')
 "
@@ -193,6 +193,14 @@ BEGIN
     ) THEN
         ALTER TABLE jobs ADD COLUMN nikto_tuning VARCHAR;
         RAISE NOTICE 'Added jobs.nikto_tuning';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='jobs' AND column_name='extra_params'
+    ) THEN
+        ALTER TABLE jobs ADD COLUMN extra_params TEXT;
+        RAISE NOTICE 'Added jobs.extra_params';
     END IF;
 
     IF NOT EXISTS (
