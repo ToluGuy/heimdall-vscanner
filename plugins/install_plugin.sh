@@ -22,8 +22,8 @@
 #                       agent/plugins/<job_type>/. Not assumed to run under
 #                       systemd; restart it yourself afterwards.
 #
-# Example:
-#   ./install_plugin.sh ./my-plugins/asset_inventory asset_inventory_scan scanner:scanner-default
+# Example (run from inside plugins/):
+#   ./install_plugin.sh ./ffuf ffuf_scan scanner:scanner-default
 
 set -e
 
@@ -42,7 +42,7 @@ if [ ! -f "$PLUGIN_SRC/run.py" ]; then
     exit 1
 fi
 
-INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVICE_NAME=""
 
 if [[ "$TARGET" == scanner:* ]]; then
