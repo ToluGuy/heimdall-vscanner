@@ -1,0 +1,27 @@
+{
+  "name": "whatweb_scan",
+  "display_name": "WhatWeb Fingerprinting",
+  "version": "1.0.0",
+  "description": "Fingerprints web technologies (CMS, server software, JS libraries, frameworks) using WhatWeb. Defaults to its stealthiest aggression level (a single HTTP request); higher levels make more requests and can trigger WAFs, which is why this is tagged intrusive rather than read_only.",
+  "job_types": [
+    {
+      "type": "whatweb_scan",
+      "label": "WhatWeb Fingerprint",
+      "agent_capability": "whatweb_scan",
+      "risk_tier": "intrusive",
+      "tab": "loki",
+      "section": "web",
+      "form_fields": [
+        { "name": "target", "type": "text", "required": true, "label": "Target URL" },
+        { "name": "aggression", "type": "select", "required": false, "label": "Aggression level (1=stealthy, 3=aggressive, 4=heavy)", "options": ["1", "3", "4"], "default": "1" }
+      ],
+      "result_display": {
+        "summary_fields": ["target", "aggression"],
+        "sections": [
+          { "key": "findings", "label": "Fingerprint", "type": "table", "columns": ["url", "http_status"], "nested_tags_field": "technologies" }
+        ]
+      }
+    }
+  ],
+  "hooks": []
+}

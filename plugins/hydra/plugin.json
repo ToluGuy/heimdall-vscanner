@@ -1,0 +1,30 @@
+{
+  "name": "hydra_scan",
+  "display_name": "Hydra Credential Brute-Force",
+  "version": "1.0.0",
+  "description": "Attempts to brute-force a single username's password against a live login service using Hydra. Unlike the other Loki tools, this actively attacks real credentials on a live service — it can trigger account lockouts or security alerting — which is why it sits at high risk tier and requires a live target authorization before it will run. v1 is deliberately narrow: one username, one password wordlist, stops at the first hit.",
+  "job_types": [
+    {
+      "type": "hydra_scan",
+      "label": "Hydra Brute-Force",
+      "agent_capability": "hydra_scan",
+      "risk_tier": "high",
+      "tab": "loki",
+      "section": "network",
+      "form_fields": [
+        { "name": "target", "type": "text", "required": true, "label": "Target host" },
+        { "name": "service", "type": "select", "required": true, "label": "Service", "options": ["ssh", "ftp", "telnet", "mysql", "postgres", "rdp"] },
+        { "name": "username", "type": "text", "required": true, "label": "Username to test" },
+        { "name": "password_wordlist_path", "type": "text", "required": true, "label": "Password wordlist path (on the scanner)", "default": "/usr/share/wordlists/rockyou.txt" },
+        { "name": "threads", "type": "number", "required": false, "label": "Threads (keep low — this is a live credential attack)", "default": 4 }
+      ],
+      "result_display": {
+        "summary_fields": ["target", "service", "username", "quantity_found"],
+        "sections": [
+          { "key": "found", "label": "Cracked Credentials", "type": "table", "columns": ["host", "login", "password", "port"] }
+        ]
+      }
+    }
+  ],
+  "hooks": []
+}

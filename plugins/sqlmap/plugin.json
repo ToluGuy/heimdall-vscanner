@@ -1,0 +1,27 @@
+{
+  "name": "sqlmap_scan",
+  "display_name": "SQLMap Injection Detection",
+  "version": "1.0.0",
+  "description": "Detects SQL injection points on a target URL using sqlmap, in detection-only mode — it never enumerates databases, tables, or dumps data (no --dbs/--dump/--os-shell). Confirming an injection point already demonstrates exploitability without touching any data, which is why this stays intrusive rather than high risk tier.",
+  "job_types": [
+    {
+      "type": "sqlmap_scan",
+      "label": "SQLMap Injection Scan",
+      "agent_capability": "sqlmap_scan",
+      "risk_tier": "intrusive",
+      "tab": "loki",
+      "section": "web",
+      "form_fields": [
+        { "name": "target", "type": "text", "required": true, "label": "Target URL (include a parameter, e.g. ?id=1)" },
+        { "name": "post_data", "type": "text", "required": false, "label": "POST data (optional, e.g. username=x&password=y)" }
+      ],
+      "result_display": {
+        "summary_fields": ["target", "injectable", "dbms"],
+        "sections": [
+          { "key": "findings", "label": "Injection Findings", "type": "table", "columns": ["parameter", "place", "type", "title", "payload"] }
+        ]
+      }
+    }
+  ],
+  "hooks": []
+}
