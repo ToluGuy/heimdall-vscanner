@@ -314,7 +314,7 @@
                         <div class="flex items-center justify-between gap-3">
                             <div>
                                 <p class="text-sm text-gray-300">Max authorization duration</p>
-                                <p class="text-xs text-gray-600 mt-0.5">Cap on how long a Pen Test target authorization can last</p>
+                                <p class="text-xs text-gray-600 mt-0.5">Cap on how long a Loki target authorization can last</p>
                             </div>
                             <div class="flex items-center gap-2">
                                 <input id="setting-auth-max-hours" type="number" min="0.5" max="168" step="0.5"
@@ -421,9 +421,9 @@
                     class="nav-tab text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
                     Network Map
                 </button>
-                <button onclick="switchTab('pentest')" id="nav-pentest"
-                    class="nav-tab hidden text-xs px-4 py-1.5 rounded-lg border border-transparent text-gray-400 hover:text-gray-200 font-medium">
-                    Pen Test
+                <button onclick="switchTab('loki')" id="nav-loki"
+                    class="nav-tab hidden text-xs px-4 py-1.5 rounded-lg border border-red-900 text-red-400 hover:text-red-300 hover:border-red-700 font-medium">
+                    Loki
                 </button>
             </nav>
             <div class="flex items-center gap-2">
@@ -970,31 +970,32 @@
         </div>
         </div>
 
-        <!-- ── PEN TEST TAB ─────────────────────────────────────────────── -->
-        <div id="tab-pentest" class="tab-panel">
+        <!-- ── LOKI TAB ─────────────────────────────────────────────────── -->
+        <div id="tab-loki" class="tab-panel">
         <div class="max-w-screen-xl mx-auto px-6 py-8">
 
-            <div class="mb-6">
-                <h2 class="text-lg font-semibold text-red-400">Pen Test</h2>
-                <p class="text-xs text-gray-600 mt-0.5">
-                    Credential attacks and exploitation-class tooling, kept separate from routine
-                    scanning. High-risk job types here require an explicit, time-boxed target
+            <div class="mb-6 pb-6 border-b border-red-950">
+                <h2 class="text-xl font-semibold text-red-400">Loki</h2>
+                <p class="text-xs text-gray-500 mt-1 max-w-2xl">
+                    Credential attacks and exploitation-class tooling, kept deliberately separate
+                    from routine scanning — a different destination for a different category of
+                    risk. High-risk job types here require an explicit, time-boxed target
                     authorization before they'll run.
                 </p>
             </div>
 
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
-                    <h3 class="text-sm font-semibold text-gray-300 mb-3">Network Pen Test</h3>
-                    <div id="pentestNetworkSection"></div>
+                    <h3 class="text-sm font-semibold text-gray-300 mb-3">Network</h3>
+                    <div id="lokiNetworkSection"></div>
                 </div>
                 <div class="bg-gray-900 rounded-xl border border-gray-800 p-6">
-                    <h3 class="text-sm font-semibold text-gray-300 mb-3">Web Pen Test</h3>
-                    <div id="pentestWebSection"></div>
+                    <h3 class="text-sm font-semibold text-gray-300 mb-3">Web</h3>
+                    <div id="lokiWebSection"></div>
                 </div>
             </div>
 
-            <div id="pentestOtherSection" class="mt-6"></div>
+            <div id="lokiOtherSection" class="mt-6"></div>
 
             <p class="text-xs text-gray-700 mt-8">
                 Installing a plugin here only registers its metadata — it never runs code on its

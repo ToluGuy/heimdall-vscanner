@@ -345,7 +345,7 @@
             if (tab === 'schedules') { loadSchedules(); }
             if (tab === 'insights') { loadInsights(); }
             if (tab === 'topology') { setTimeout(loadTopology, 50); }
-            if (tab === 'pentest') { loadPentestTab(); }
+            if (tab === 'loki') { loadLokiTab(); }
         }
 
         // ── AUTH ───────────────────────────────────────────────────────────
@@ -406,6 +406,7 @@
             loadResults();
             if (activeTab === 'discovery') loadSweepHistory();
             if (activeTab === 'schedules') loadSchedules();
+            if (activeTab === 'loki') loadLokiTab();
         }
 
         // ── JOB TYPE CHANGE ────────────────────────────────────────────────
@@ -1563,7 +1564,7 @@ ${data.warning}`);
                     });
             }
 
-            updatePentestTabVisibility();
+            updateLokiTabVisibility();
             loadDiscoveryJobTypes();
         }
 
@@ -1586,18 +1587,18 @@ ${data.warning}`);
             });
         }
 
-        function updatePentestTabVisibility() {
-            // The Pen Test tab only exists to hold pentest-tagged plugin job types —
+        function updateLokiTabVisibility() {
+            // The Loki tab only exists to hold loki-tagged plugin job types —
             // no point showing an empty tab before one's actually installed, and it
             // should disappear again the moment the last one is uninstalled/disabled.
-            const hasPentestTypes = availableJobTypes.some(jt => jt.tab === 'pentest');
-            const navBtn = document.getElementById('nav-pentest');
+            const hasLokiTypes = availableJobTypes.some(jt => jt.tab === 'loki');
+            const navBtn = document.getElementById('nav-loki');
             if (!navBtn) return;
-            navBtn.classList.toggle('hidden', !hasPentestTypes);
+            navBtn.classList.toggle('hidden', !hasLokiTypes);
 
             // If we're sitting on the tab when it disappears, don't strand the user on a hidden panel.
-            const pentestPanel = document.getElementById('tab-pentest');
-            if (!hasPentestTypes && pentestPanel && pentestPanel.classList.contains('active')) {
+            const lokiPanel = document.getElementById('tab-loki');
+            if (!hasLokiTypes && lokiPanel && lokiPanel.classList.contains('active')) {
                 switchTab('dashboard');
             }
         }
@@ -1671,27 +1672,43 @@ ${data.warning}`);
             return extra;
         }
 
-        // ── PEN TEST TAB ─────────────────────────────────────────────────
-        async function loadPentestTab() {
+        // ── LOKI TAB ─────────────────────────────────────────────────────
+        async function loadLokiTab() {
             if (!availableJobTypes.length) await loadJobTypes();
             await loadAuthorizations();
+            if (!pageData.results.length) await loadResults();
 
-            const pentestTypes = availableJobTypes.filter(jt => jt.tab === 'pentest');
-            const networkTypes = pentestTypes.filter(jt => (jt.section || '').toLowerCase() === 'network');
-            const webTypes     = pentestTypes.filter(jt => (jt.section || '').toLowerCase() === 'web');
-            const otherTypes   = pentestTypes.filter(jt => !networkTypes.includes(jt) && !webTypes.includes(jt));
+            const lokiTypes    = availableJobTypes.filter(jt => jt.tab === 'loki');
+            const networkTypes = lokiTypes.filter(jt => (jt.section || '').toLowerCase() === 'network');
+            const webTypes     = lokiTypes.filter(jt => (jt.section || '').toLowerCase() === 'web');
+            const otherTypes   = lokiTypes.filter(jt => !networkTypes.includes(jt) && !webTypes.includes(jt));
 
-            const netEl   = document.getElementById('pentestNetworkSection');
-            const webEl   = document.getElementById('pentestWebSection');
-            const otherEl = document.getElementById('pentestOtherSection');
-            if (netEl)   netEl.innerHTML   = renderPentestSection(networkTypes, 'No Network Pen Test plugins installed yet.');
-            if (webEl)   webEl.innerHTML   = renderPentestSection(webTypes, 'No Web Pen Test plugins installed yet.');
-            if (otherEl) otherEl.innerHTML = otherTypes.length ? renderPentestSection(otherTypes, '') : '';
+            const netEl   = document.getElementById('lokiNetworkSection');
+            const webEl   = document.getElementById('lokiWebSection');
+            const otherEl = document.getElementById('lokiOtherSection');
+            if (netEl)   netEl.innerHTML   = renderLokiSection(networkTypes, 'No network tools installed yet.');
+            if (webEl)   webEl.innerHTML   = renderLokiSection(webTypes, 'No web tools installed yet.');
+            if (otherEl) otherEl.innerHTML = otherTypes.length ? renderLokiSection(otherTypes, '') : '';
         }
 
-        function renderPentestSection(types, emptyMessage) {
+        function renderRecentResultsForType(jobType, limit) {
+            const items = pageData.results.filter(r => r.job_info && r.job_info.type === jobType).slice(0, limit);
+            if (!items.length) {
+                return '<p class="text-xs text-gray-600 italic">No results yet — run it against a target to see output here.</p>';
+            }
+            return items.map(r => `
+                <div class="bg-gray-900 border border-gray-800 rounded-lg p-3 mb-2">
+                    <div class="flex items-center justify-between mb-2">
+                        <p class="text-xs text-gray-400">${r.job_info.target || ''}</p>
+                        <p class="text-xs text-gray-600">${r.job_info.completed_at ? new Date(r.job_info.completed_at).toLocaleString() : ''}</p>
+                    </div>
+                    ${renderPluginResult(r.output, jobType)}
+                </div>`).join('');
+        }
+
+        function renderLokiSection(types, emptyMessage) {
             if (!types.length) return `<p class="text-xs text-gray-600 italic">${emptyMessage}</p>`;
-            return types.map(jt => renderPentestCard(jt)).join('');
+            return types.map(jt => renderLokiCard(jt)).join('');
         }
 
         function riskBadgeClasses(tier) {
@@ -1701,8 +1718,8 @@ ${data.warning}`);
             return 'border-gray-700 text-gray-400 bg-gray-900';
         }
 
-        function renderPentestCard(jt) {
-            const idPrefix = `pentest_${jt.type}`;
+        function renderLokiCard(jt) {
+            const idPrefix = `loki_${jt.type}`;
             const fields = (jt.form_fields || []).filter(f => f.name !== 'target');
             const needsAuth = jt.risk_tier === 'high';
             const activeAuth = (window.__activeAuthorizations || []).find(a => a.job_type === jt.type && a.active);
@@ -1726,10 +1743,14 @@ ${data.warning}`);
                     </div>
                     ${needsAuth ? renderAuthorizationStatus(jt.type, activeAuth, idPrefix) : ''}
                     <div class="mt-3">
-                        <button onclick="submitPentestJob('${jt.type}')"
+                        <button onclick="submitLokiJob('${jt.type}')"
                             class="text-xs px-4 py-2 rounded-lg bg-red-900 hover:bg-red-800 text-red-200 border border-red-800 transition font-medium">
                             ${needsAuth ? 'Run (requires active authorization)' : 'Run'}
                         </button>
+                    </div>
+                    <div class="mt-4 pt-3 border-t border-gray-800">
+                        <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Recent Results</p>
+                        <div id="${idPrefix}_results">${renderRecentResultsForType(jt.type, 3)}</div>
                     </div>
                 </div>`;
         }
@@ -1750,8 +1771,8 @@ ${data.warning}`);
             </div>`;
         }
 
-        async function submitPentestJob(jobType) {
-            const idPrefix = `pentest_${jobType}`;
+        async function submitLokiJob(jobType) {
+            const idPrefix = `loki_${jobType}`;
             const targetEl = document.getElementById(`${idPrefix}_target`);
             const target = targetEl ? targetEl.value.trim() : '';
             if (!target) { alert('Please enter a target.'); return; }
@@ -1771,8 +1792,14 @@ ${data.warning}`);
                 alert(`Blocked: ${err.detail}`);
                 return;
             }
-            alert('Job created — check the Dashboard tab for progress.');
             targetEl.value = '';
+            // Immediate feedback in-place; the real result replaces this on the
+            // next auto-refresh cycle while you're on this tab — no need to go
+            // check the Dashboard tab.
+            const resultsEl = document.getElementById(`${idPrefix}_results`);
+            if (resultsEl) {
+                resultsEl.innerHTML = '<p class="text-xs text-gray-500 italic">Job submitted — waiting for it to complete…</p>' + resultsEl.innerHTML;
+            }
             setTimeout(loadAll, 300);
         }
 
@@ -1819,14 +1846,14 @@ ${data.warning}`);
                 return;
             }
             closeAuthorizeModal();
-            await loadPentestTab();
+            await loadLokiTab();
         }
 
         function revokeAuthorization(authId) {
             showConfirm('Revoke this authorization now?', async () => {
                 const res = await apiFetch(`/authorizations/${authId}`, { method: 'DELETE' });
                 if (!res) return;
-                await loadPentestTab();
+                await loadLokiTab();
             });
         }
 
@@ -2056,6 +2083,94 @@ ${data.warning}`);
             }).join('');
             return `${warningHtml}<p class="text-xs text-gray-400 mb-2">${findings.length} NSE finding(s):</p><div class="space-y-2">${rows}</div>`;
         }
+        // ── Generic plugin result rendering ─────────────────────────────────
+        // Renders a plugin's output using the result_display spec its manifest
+        // declares — no plugin-specific frontend code required. A plugin with
+        // no result_display (or a shape that doesn't match its own spec) just
+        // falls back to the raw JSON dump, same as before this existed.
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str === undefined || str === null ? '' : String(str);
+            return div.innerHTML;
+        }
+
+        function resolveResultDataRoot(out) {
+            const keys = Object.keys(out || {});
+            if (keys.length === 1 && out[keys[0]] && typeof out[keys[0]] === 'object' && !Array.isArray(out[keys[0]])) {
+                return out[keys[0]];
+            }
+            return out;
+        }
+
+        function renderGenericPluginResult(out, spec) {
+            const data = resolveResultDataRoot(out);
+            if (!data || typeof data !== 'object') {
+                return '<pre class="text-xs text-gray-400 overflow-x-auto">' + JSON.stringify(out, null, 2) + '</pre>';
+            }
+
+            let html = '';
+
+            const summaryFields = (spec.summary_fields || []).filter(f =>
+                data[f] !== undefined && data[f] !== null && data[f] !== '');
+            if (summaryFields.length) {
+                html += '<div class="flex flex-wrap gap-2 mb-3">' + summaryFields.map(f =>
+                    `<span class="text-xs px-2 py-0.5 rounded-full bg-gray-800 border border-gray-700 text-gray-300"><span class="text-gray-500">${escapeHtml(f)}:</span> ${escapeHtml(data[f])}</span>`
+                ).join('') + '</div>';
+            }
+
+            (spec.sections || []).forEach(section => {
+                const rows = data[section.key];
+                if (!Array.isArray(rows) || !rows.length) return;
+
+                html += `<div class="mb-4"><p class="text-xs font-semibold text-cyan-400 uppercase tracking-wider mb-2">${escapeHtml(section.label || section.key)}</p>`;
+
+                if (section.type === 'list') {
+                    html += '<ul class="space-y-1">' + rows.map(item =>
+                        `<li class="text-xs text-gray-300 flex gap-2"><span class="text-gray-600">•</span>${escapeHtml(item)}</li>`
+                    ).join('') + '</ul>';
+                } else {
+                    // 'table' (default) — optionally with a nested tag-cluster column
+                    // for fields that aren't a fixed set of columns (e.g. WhatWeb's
+                    // per-URL technology matches).
+                    const columns = section.columns ||
+                        (rows[0] ? Object.keys(rows[0]).filter(k => k !== section.nested_tags_field) : []);
+                    html += '<div class="overflow-x-auto"><table class="w-full text-xs border-collapse">';
+                    html += '<thead><tr class="text-left text-gray-500 border-b border-gray-800">' +
+                        columns.map(c => `<th class="pr-4 pb-1 font-medium">${escapeHtml(c)}</th>`).join('') +
+                        (section.nested_tags_field ? '<th class="pb-1 font-medium">Tags</th>' : '') +
+                        '</tr></thead><tbody>';
+                    html += rows.map(row => {
+                        const cells = columns.map(c =>
+                            `<td class="pr-4 py-1 text-gray-300 font-mono">${row[c] !== undefined && row[c] !== null ? escapeHtml(row[c]) : '—'}</td>`
+                        ).join('');
+                        let tagsCell = '<td class="py-1 text-gray-600">—</td>';
+                        const tagsField = section.nested_tags_field && row[section.nested_tags_field];
+                        if (tagsField && typeof tagsField === 'object') {
+                            const tags = Object.entries(tagsField).map(([k, v]) => {
+                                const vals = Array.isArray(v) ? v.join(', ') : String(v);
+                                return `<span class="inline-block text-xs px-1.5 py-0.5 rounded bg-cyan-950 text-cyan-300 border border-cyan-900 mr-1 mb-1">${escapeHtml(k)}${vals ? ': ' + escapeHtml(vals) : ''}</span>`;
+                            }).join('');
+                            tagsCell = `<td class="py-1">${tags}</td>`;
+                        }
+                        return `<tr class="border-b border-gray-900">${cells}${section.nested_tags_field ? tagsCell : ''}</tr>`;
+                    }).join('');
+                    html += '</tbody></table></div>';
+                }
+
+                html += '</div>';
+            });
+
+            return html || '<pre class="text-xs text-gray-400 overflow-x-auto">' + JSON.stringify(out, null, 2) + '</pre>';
+        }
+
+        function renderPluginResult(out, jobType) {
+            const jt = getJobTypeInfo(jobType);
+            if (jt && jt.result_display) {
+                return renderGenericPluginResult(out, jt.result_display);
+            }
+            return '<pre class="text-xs text-gray-400 overflow-x-auto">' + JSON.stringify(out, null, 2) + '</pre>';
+        }
+
         function renderAnalysis(analysis) {
             if (!analysis) return '';
 
@@ -2298,7 +2413,7 @@ ${data.warning}`);
                     +     (out.nmap  ? '<div class="mb-4"><p class="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-2">Open Port Scan</p>'          + renderNmapResult(out.nmap)   + '</div>' : '')
                     +     (out.nikto ? '<div class="mb-4"><p class="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">Web Scan</p>'         + renderNiktoResult(out.nikto) + '</div>' : '')
                     +     (out.nse   ? '<div class="mb-4"><p class="text-xs font-semibold text-purple-400 uppercase tracking-wider mb-2">Vulnerability Scan</p>' + renderNseResult(out.nse)    + '</div>' : '')
-                    +     (!out.nmap && !out.nikto && !out.nse ? '<pre class="text-xs text-gray-400 overflow-x-auto">' + JSON.stringify(out, null, 2) + '</pre>' : '')
+                    +     (!out.nmap && !out.nikto && !out.nse ? renderPluginResult(out, r.job_info?.type) : '')
                     +     (r.analysis
                             ? '<div class="mb-4">' + renderAnalysis(r.analysis) + '</div>'
                             : '<div class="mb-2"><span class="text-xs text-gray-600 italic">Analysis pending — click Analyse above to generate assessment</span></div>'
