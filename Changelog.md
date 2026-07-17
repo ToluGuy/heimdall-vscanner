@@ -1,7 +1,64 @@
 # Changelog
 
-<<<<<<< HEAD
-=======
+## [v3.1] - 17-07-2026
+
+### Added
+- Inline SVG icons on the six nav tabs (Dashboard, Discovery, Schedules,
+  Insights, Network Map, Loki), matching the existing Plugins/Settings
+  icon convention
+- A Heimdall brand icon in the header, and a matching `favicon.svg`
+
+### Fixed
+- Light theme contrast: page, panel, and nested-element backgrounds were
+  nearly indistinguishable (~1.1:1 contrast between page and panel), and
+  two text-color tiers fell below readable contrast against white panels
+  (2.56:1 and 1.48:1, against a ~4.5:1 baseline for body text). Panels
+  now separate visibly from the page, both text tiers pass a real
+  contrast check, and panels get a subtle shadow for extra depth.
+- `favicon.svg` needed registering in the backend's static file
+  allowlist (`STATIC_MEDIA_TYPES`) — it's not a generic file server, so
+  the icon would have 404'd silently otherwise
+
+---
+
+## [v3.0] - 17-07-2026
+
+### Added
+- Renamed "Pen Test" to "Loki" throughout — nav tab, tab panel, settings copy
+- Loki, Heimdall's Penetration testing suite (see README.md), now has its own dedicated screen:
+  spacious Network/Web layout, a distinct header treatment, and inline
+  recent-results per tool card so a job's outcome shows up without leaving
+  the tab
+- Generic `result_display` rendering: a plugin's manifest can now declare
+  summary fields and table/list sections (with an optional nested-tags
+  column) so results render as structured tables instead of a raw JSON
+  dump — no plugin ever ships frontend code to make this happen
+- Four Loki tool plugins, each with its own `plugin.json` / `run.py` /
+  `setup.sh` / `NOTES.md`:
+  - **ffuf** — directory/file fuzzing (intrusive)
+  - **whatweb** — technology fingerprinting (intrusive)
+  - **sqlmap** — SQL injection detection only, no enumeration or dumping
+    (intrusive)
+  - **hydra** — credential brute-force (high risk tier — the first job
+    type that actually requires a live target authorization, not just a
+    warning)
+- `uninstall_plugin.sh` — the disk-side counterpart to `install_plugin.sh`,
+  removes a plugin's deployed code and drops it from advertised
+  capabilities
+
+### Changed
+- `install_plugin.sh` and `uninstall_plugin.sh` moved into `plugins/`;
+  both now resolve the repo root one level above their own location
+  instead of assuming repo root
+
+### Fixed
+- `install_plugin.sh` had its entire contents accidentally duplicated
+  (an older and newer revision concatenated instead of one replacing the
+  other), causing the installer to run every step — including the
+  interactive prompts — twice. Merged into a single script.
+
+---
+
 ## [v2.1.1] - 14-07-2026
 
 ### Fixed
@@ -27,7 +84,6 @@
 
 ---
 
->>>>>>> develop-mode
 ## [v2.1] - 13-07-2026
 
 ### Added
