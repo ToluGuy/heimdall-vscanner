@@ -11,6 +11,7 @@ Heimdall follows a server-agent model:
 - **Agent** (`agent/agent.py`) — Runs on any endpoint across the network. Polls the server for jobs and executes scans from that machine's network position.
 - **Local scanner** (`agent/local_scanner.py`) — A fully standalone scan tool for any endpoint. Runs its own local web UI, requires no central server, and keeps results in memory for the session.
 - **Dashboard** — A web interface served by the backend for creating jobs, monitoring agents, reviewing scan results, managing schedules, and generating reports.
+- **Plugins** — An extension mechanism for adding scan types beyond the built-in three, without modifying Heimdall's own code. See [Plugins](#plugins) below.
 
 ---
 
@@ -167,7 +168,7 @@ DB_PASSWORD=your-password
 ```bash
 python3 -c "
 from backend.app.db import engine, Base
-from backend.app.models import Agent, Job, Result, DiscoverySweep, Schedule, Host, Setting
+from backend.app.models import Agent, Job, Result, DiscoverySweep, Schedule, Host, Setting, Plugin, TargetAuthorization
 Base.metadata.create_all(bind=engine)
 "
 ```
@@ -186,6 +187,7 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS port INTEGER;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ports VARCHAR;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS custom_scripts VARCHAR;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS nikto_tuning VARCHAR;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS extra_params TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sweep_id INTEGER REFERENCES discovery_sweeps(id) ON DELETE SET NULL;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS is_stale BOOLEAN DEFAULT FALSE;
 
@@ -316,6 +318,7 @@ From the dashboard you can:
 - **Scan Results** — Expand results to view port tables, vulnerability findings, and web scan findings; toggle between active results and history. Results are paginated (10 per page by default).
 - **Insights** — Analytics dashboard showing scan activity over time, risk distribution, and per-host drilldowns
 - **Topology** — Interactive D3 network map showing all discovered hosts, clustered by subnet, coloured by risk level
+- **Loki** — Penetration testing tools (fuzzing, fingerprinting, injection testing, credential attacks), installed as plugins. Only appears once at least one is installed. See [Loki](#loki-penetration-testing-experimental) below.
 - **Reports** — Generate a printable HTML report for any scan result, exportable as PDF via the browser print dialog
 - **Export** — Download scan results as structured JSON, individually or in bulk
 - **Settings** — Toggle AI auto-analysis and the auto-Nikto web scan on/off at runtime; configure the stale agent threshold
@@ -404,6 +407,98 @@ Jobs support three priority levels: `high`, `medium`, and `low`. The dispatcher 
 
 ---
 
+## Plugins
+
+Heimdall's built-in scan types (Open Port Scan, Web Scan, Vulnerability Scan) cover general-purpose scanning. Plugins extend this with additional scan types — without ever modifying Heimdall's own code, and without the server ever transmitting or executing code it didn't already have.
+
+A plugin has two independent parts, and both matter:
+
+1. **Manifest registration** — a `plugin.json` describing the scan type: its name, risk tier, dashboard tab/section, and input fields. Registered through **Settings → Plugins** (paste or upload the file) or `POST /plugins/install`. This is metadata only — it doesn't run anything.
+2. **Code deployment** — the plugin's `run.py`, containing the actual scan logic. This has to be placed by hand onto whichever scanner or agent should run it, using `install_plugin.sh`. Nothing on the server side ever pushes this automatically — that's deliberate.
+
+A job type only becomes usable once both steps are done. Registering the manifest without deploying the code makes it visible in the dashboard but any job of that type will fail when it runs (the machine doesn't have the code); deploying the code without registering the manifest means the server never offers it as an option in the first place.
+
+### Risk tiers
+
+| Tier | Meaning |
+|------|---------|
+| `none` | No real risk — informational only |
+| `read_only` | Passive, doesn't send anything unusual to the target |
+| `intrusive` | Sends probing/active traffic to the target (can trip WAFs, rate limits, or alerting) — shown with a warning, no extra gate |
+| `high` | Actively attacks the target (credential attacks, exploitation) — requires a live, time-boxed **target authorization** before the job can even be created |
+
+A `high`-tier job type is rejected outright at creation unless there's an active authorization for that specific target *and* job type. Authorizations are granted from the dashboard, expire automatically, and are capped at a maximum duration set in Settings.
+
+### Installing and uninstalling
+
+```bash
+cd plugins/
+./install_plugin.sh <plugin_source_dir> <job_type> <scanner:NAME|agent>
+./uninstall_plugin.sh <job_type> <scanner:NAME|agent>
+```
+
+`install_plugin.sh` copies the plugin's code onto this machine (`backend/app/installed_plugins/<job_type>/` for a scanner, `agent/installed_plugins/<job_type>/` for an agent), updates that scanner/agent's advertised capabilities, and restarts the relevant systemd service if one exists. `uninstall_plugin.sh` is the reverse — removes the code and drops the capability.
+
+Both scripts locate the repo root relative to their own file location (one level up, since they live in `plugins/`), not your current directory — they work the same whether you run `./install_plugin.sh ...` from inside `plugins/` or `plugins/install_plugin.sh ...` from the repo root. **If you move either script, that assumption is what needs updating.**
+
+Uninstalling is two separate steps, matching the two-part install:
+
+```bash
+# 1. Remove the code from this machine
+./uninstall_plugin.sh ffuf_scan scanner:scanner-default
+
+# 2. Remove the manifest registration (cancels any pending jobs of that type)
+#    — do this from Settings → Plugins, or:
+curl -X DELETE http://localhost:8000/plugins/ffuf_scan
+```
+
+Doing only the first leaves the job type registered with no code backing it on that particular machine — harmless, but pointless. Doing only the second leaves orphaned code on disk that nothing will ever call.
+
+### Two `plugins/` directories — this is intentional
+
+- **`plugins/`** at the repo root is the *source* — install_plugin.sh, uninstall_plugin.sh, and a ready-to-deploy copy of each first-party plugin (`plugins/ffuf/`, `plugins/whatweb/`, etc). This is what's committed to the repo.
+- **`backend/app/installed_plugins/`** and **`agent/installed_plugins/`** are *deployment targets* — where `install_plugin.sh` copies a plugin's code once you actually enable it on a specific machine. These are per-machine artifacts, not source, and shouldn't be committed — see `.gitignore` below.
+
+The one exception is `backend/app/installed_plugins/hooks/`, which ships pre-installed (it's how webhook notifications work out of the box) rather than requiring a manual install step.
+
+```gitignore
+# Locally-deployed plugin code — per-machine artifacts, not source.
+# Only hooks/ and asset_inventory_scan/ ship pre-installed with the repo.
+backend/app/installed_plugins/*
+!backend/app/installed_plugins/hooks/
+!backend/app/installed_plugins/asset_inventory_scan/
+agent/installed_plugins/*
+```
+
+If a plugin folder under `backend/app/installed_plugins/` or `agent/installed_plugins/` was already committed before adding this, the `.gitignore` entry alone won't untrack it — you'll also need `git rm -r --cached <path>` once, after which it'll be ignored normally.
+
+### Hooks
+
+Plugins can also register for lifecycle events (`job.completed`, `job.failed`, `host.new`) rather than adding a scan type — the webhook notifications plugin (`backend/app/installed_plugins/hooks/webhook/`) is the built-in example, and ships pre-installed.
+
+---
+
+## Loki (Penetration Testing, Experimental)
+
+Loki is Heimdall's penetration testing suite — a materially more invasive category of tooling than the default scan types, kept in its own dedicated dashboard destination rather than mixed in with routine scanning. It only appears once at least one Loki-tagged plugin is installed.
+
+**This is new and not yet validated against real targets in production use — treat findings as a starting point to verify, not as ground truth, until it's been run against something real for a while.**
+
+| Tool | Job type | Risk tier | What it does |
+|------|----------|-----------|---------------|
+| ffuf | `ffuf_scan` | `intrusive` | Directory/file fuzzing against a web target |
+| WhatWeb | `whatweb_scan` | `intrusive` | Web technology fingerprinting |
+| sqlmap | `sqlmap_scan` | `intrusive` | SQL injection **detection only** — never enumerates databases or dumps data |
+| Hydra | `hydra_scan` | `high` | Credential brute-force against a live service — requires target authorization |
+
+Each ships as a separate plugin under `plugins/` (`ffuf/`, `whatweb/`, `sqlmap/`, `hydra/`), so you can install only the ones you want. Every plugin folder includes:
+
+- `plugin.json` / `run.py` — the manifest and scan logic
+- `setup.sh` — an explicit, admin-run helper to install the underlying tool (e.g. `apt-get install ffuf`) and any dependency like a wordlist. **Never called automatically by `run.py` or anything else** — installing system packages or fetching wordlists is something you run by hand, once, deliberately.
+- `NOTES.md` — scope decisions and any caveats on how confident the output parsing is
+
+---
+
 ## Project Structure
 
 ```
@@ -412,15 +507,42 @@ heimdall-vscanner/
 │   ├── agent.py              # Endpoint agent — polls server, runs scans locally
 │   ├── local_scanner.py      # Standalone scan tool with browser UI (no server needed)
 │   ├── setup_agent.ps1       # Windows endpoint setup script
-│   └── SETUP_GUIDE.md        # Agent and local scanner setup guide
+│   ├── SETUP_GUIDE.md        # Agent and local scanner setup guide
+│   └── installed_plugins/    # Deployed agent-side plugin code — gitignored, per-machine
 ├── backend/
 │   └── app/
-│       ├── main.py           # FastAPI server, all endpoints, dashboard HTML
+│       ├── main.py           # FastAPI app assembly only — routes live in routes/
+│       ├── core.py           # Job type registry, risk tiers, settings defaults
 │       ├── models.py         # SQLAlchemy database models
 │       ├── schemas.py        # Pydantic request/response schemas
 │       ├── db.py             # Database connection and session
 │       ├── logger.py         # Logging configuration
-│       └── ai_analysis.py    # AI-powered scan analysis (optional)
+│       ├── ai_analysis.py    # AI-powered scan analysis (optional)
+│       ├── scanner.py        # Agentless remote scanner (runs alongside the backend)
+│       ├── routes/           # One module per resource — agents, jobs, results, hosts,
+│       │                     # schedules, discovery, reports, insights, topology,
+│       │                     # settings, dashboard, plugins, authorizations
+│       ├── services/
+│       │   ├── scheduler.py  # Recurring schedule dispatch
+│       │   └── hooks.py      # Fires job.completed/job.failed/host.new to plugins
+│       ├── installed_plugins/ # Deployed scanner-side plugin code
+│       │   ├── hooks/webhook/          # Ships pre-installed (not gitignored)
+│       │   ├── asset_inventory_scan/   # Ships pre-installed (not gitignored)
+│       │   └── ...                     # Everything else here is gitignored —
+│       │                                # per-machine, deployed via install_plugin.sh
+│       └── static/
+│           ├── index.html    # Dashboard markup
+│           ├── app.js        # Dashboard logic
+│           ├── app.css       # Theme (dark + light)
+│           └── favicon.svg
+├── plugins/                   # Plugin SOURCE
+│   ├── install_plugin.sh     # Deploys a plugin's code onto a scanner/agent
+│   ├── uninstall_plugin.sh   # Removes it again
+│   ├── asset_inventory/
+│   ├── ffuf/                 # Loki: directory/file fuzzing
+│   ├── whatweb/               # Loki: technology fingerprinting
+│   ├── sqlmap/                 # Loki: SQL injection detection
+│   └── hydra/                   # Loki: credential brute-force (high risk tier)
 ├── tools/
 │   ├── check_db.py           # Database health check
 │   ├── reset_stuck_jobs.py   # Unstick jobs that got stuck in 'running'
@@ -429,14 +551,13 @@ heimdall-vscanner/
 │   ├── seed_test_jobs.py     # Create test jobs against localhost
 │   ├── test_connection.py    # Verify agent-to-server connectivity
 │   └── test_ports.py         # Open netcat listeners for scan testing
-├── scanner.py                # Agentless remote scanner (runs on central server)
 ├── install.sh                # Automated Linux installer
 ├── update.sh                 # Lightweight updater for new releases
 ├── vapt-server.service       # Systemd service file — backend server
 ├── vapt-scanner.service      # Systemd service file — remote scanner
 ├── requirements.txt
-├── .env                      # Not committed — created by installer or manually
-└── logs/                     # Not committed — created at runtime
+├── .env                      # created by installer or manually
+└── logs/                     # created at runtime
 ```
 
 ---
@@ -512,3 +633,18 @@ Target/subnet values are validated before being handed to Nmap/Nikto, since a va
 
 **Update broke something**
 Each update only adds columns — it never drops or modifies existing ones. If something looks wrong after an update, check `journalctl -u vapt-server -n 50` for startup errors and compare your `.env` against the Environment Variables table above for any new required values.
+
+**`install_plugin.sh` / `uninstall_plugin.sh` — usage reference**
+Both live in `plugins/` and take positional arguments in this order:
+```bash
+./install_plugin.sh <plugin_source_dir> <job_type> <scanner:NAME|agent>
+./uninstall_plugin.sh <job_type> <scanner:NAME|agent>
+```
+Common mistakes:
+- `<job_type>` must exactly match the `"type"` field inside that plugin's `plugin.json` — not the folder name. They're often similar but not always identical (e.g. the source folder `plugins/asset_inventory/` deploys as job type `asset_inventory_scan`).
+- The last argument is either `scanner:NAME` (where `NAME` is a scanner already registered in the dashboard, e.g. `scanner:scanner-default`) or the literal word `agent` — not a hostname or IP.
+- Both scripts figure out the repo root from their own file location, not your current directory — they work fine run from either `plugins/` or the repo root, but **do not move them individually**; if one moves without the other, or either moves outside `plugins/`, path resolution breaks.
+- For a `scanner:NAME` target, the script looks for a systemd service named `vapt-scanner-NAME` to restart. If you're running that scanner manually (not via systemd), you'll see a message saying so — that's not an error, just restart it yourself.
+
+**There are two `plugins/` folders — which one do I use?**
+`plugins/` at the repo root is where you run `install_plugin.sh` from, and where first-party plugin source lives. `backend/app/installed_plugins/` (and `agent/installed_plugins/`) are deployment targets that `install_plugin.sh` writes to — you shouldn't need to touch those directly, and they shouldn't be committed (see [Plugins](#plugins) above for the `.gitignore` entry). If `backend/app/installed_plugins/` has a folder you don't recognize, it's either something `install_plugin.sh` deployed, or `hooks/`/`asset_inventory_scan/`, which ship pre-installed.
