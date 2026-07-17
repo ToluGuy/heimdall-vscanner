@@ -494,7 +494,7 @@ Loki is Heimdall's penetration testing suite — a materially more invasive cate
 Each ships as a separate plugin under `plugins/` (`ffuf/`, `whatweb/`, `sqlmap/`, `hydra/`), so you can install only the ones you want. Every plugin folder includes:
 
 - `plugin.json` / `run.py` — the manifest and scan logic
-- `setup.sh` — an explicit, admin-run helper to install the underlying tool (e.g. `apt-get install ffuf`) and any dependency like a wordlist. **Never called automatically by `run.py` or anything else** — installing system packages or fetching wordlists is something you run by hand, once, deliberately.
+- `setup.sh` — an explicit, admin-run helper to install the underlying tool (e.g. `apt-get install ffuf`) and any dependency like a wordlist. **Never called automatically by `run.py` or anything else** — installing system packages or fetching wordlists is something you run by hand.
 - `NOTES.md` — scope decisions and any caveats on how confident the output parsing is
 
 ---
@@ -508,7 +508,7 @@ heimdall-vscanner/
 │   ├── local_scanner.py      # Standalone scan tool with browser UI (no server needed)
 │   ├── setup_agent.ps1       # Windows endpoint setup script
 │   ├── SETUP_GUIDE.md        # Agent and local scanner setup guide
-│   └── installed_plugins/    # Deployed agent-side plugin code — gitignored, per-machine
+│   └── installed_plugins/    # Deployed agent-side plugin code, per-machine
 ├── backend/
 │   └── app/
 │       ├── main.py           # FastAPI app assembly only — routes live in routes/
