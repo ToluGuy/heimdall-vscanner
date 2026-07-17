@@ -3,7 +3,7 @@
 # Dispatches server-side events (job completed, host discovered, ...) to any
 # enabled plugin subscribed to them. Same safety boundary as scan plugins'
 # run_plugin() in scanner.py/agent.py: this only ever imports code already
-# sitting on THIS server's disk at plugins/hooks/<plugin_name>/run.py,
+# sitting on THIS server's disk at installed_plugins/hooks/<plugin_name>/run.py,
 # placed there manually. Nothing here fetches or receives code from
 # anywhere — a plugin's manifest (installed via the dashboard) only ever
 # declares which events it WANTS, never the code that runs when they fire.
@@ -21,7 +21,7 @@ from ..db import SessionLocal
 from ..core import logger
 from ..models import Plugin
 
-HOOK_PLUGIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugins", "hooks")
+HOOK_PLUGIN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "installed_plugins", "hooks")
 
 # Events core code is allowed to fire. A plugin manifest can only subscribe
 # to names in this set — validated at install time in routes/plugins.py.

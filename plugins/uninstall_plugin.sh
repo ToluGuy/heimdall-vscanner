@@ -1,6 +1,9 @@
 #!/bin/bash
 # uninstall_plugin.sh — removes a plugin's execution code from a scanner or
-# agent running on THIS machine, and drops it from the advertised capabilities.
+# agent running on THIS machine, and drops it from the advertised
+# capabilities. The counterpart to install_plugin.sh — lives alongside it
+# in plugins/, and locates the repo root the same way (one level up from
+# its own file location, not your current directory).
 #
 # This is the disk-side half only. It does NOT touch the plugin's manifest
 # registration on the server (the Plugin/TargetAuthorization DB rows) —
@@ -32,11 +35,11 @@ SERVICE_NAME=""
 
 if [[ "$TARGET" == scanner:* ]]; then
     SCANNER_NAME="${TARGET#scanner:}"
-    DEST="$INSTALL_DIR/backend/app/plugins/$JOB_TYPE"
+    DEST="$INSTALL_DIR/backend/app/installed_plugins/$JOB_TYPE"
     ENV_FILE="$INSTALL_DIR/.env"
     SERVICE_NAME="vapt-scanner-$SCANNER_NAME"
 elif [ "$TARGET" == "agent" ]; then
-    DEST="$INSTALL_DIR/agent/plugins/$JOB_TYPE"
+    DEST="$INSTALL_DIR/agent/installed_plugins/$JOB_TYPE"
     ENV_FILE="$INSTALL_DIR/agent/.env"
 else
     echo "Error: target must be 'scanner:NAME' or 'agent'"

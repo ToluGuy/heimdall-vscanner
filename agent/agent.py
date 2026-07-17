@@ -687,12 +687,12 @@ def run_plugin(job_type: str, target: str, profile: str, **kwargs) -> dict:
     """
     Executes a locally-installed plugin's scan logic. Plugins are never
     fetched or pushed automatically — this only ever imports code that's
-    already sitting in plugins/<job_type>/run.py on THIS machine's disk,
+    already sitting in installed_plugins/<job_type>/run.py on THIS machine's disk,
     placed there deliberately (see install_plugin.sh). If it isn't there,
     the job fails with a clear, specific message rather than silently
     doing nothing or trying to reach out anywhere for it.
     """
-    plugin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins", job_type)
+    plugin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "installed_plugins", job_type)
     entry_point = os.path.join(plugin_dir, "run.py")
 
     if not os.path.isfile(entry_point):

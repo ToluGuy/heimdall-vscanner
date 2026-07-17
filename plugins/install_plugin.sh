@@ -2,6 +2,12 @@
 # install_plugin.sh — deploys a plugin's execution code onto a scanner or
 # agent running on THIS machine, and updates its advertised capabilities.
 #
+# Lives in plugins/, one level below the repo root — it locates the repo
+# root relative to its own file location, not your current directory, so
+# it works whether you run it as ./install_plugin.sh (from inside plugins/)
+# or plugins/install_plugin.sh (from the repo root). If you move this file
+# again, that one-level-up assumption is the thing to update.
+#
 # This never fetches anything over the network and never talks to the
 # Heimdall server. The plugin's manifest (plugin.json) gets registered on
 # the server separately, via the dashboard's Plugins panel — that's pure
@@ -16,10 +22,10 @@
 # <job_type>            Must match the "type" in that plugin's plugin.json.
 # scanner:NAME          A scanner registered through the dashboard, e.g.
 #                       scanner:scanner-default — installs to
-#                       backend/app/plugins/<job_type>/ and restarts
+#                       backend/app/installed_plugins/<job_type>/ and restarts
 #                       vapt-scanner-NAME via systemd.
 # agent                 The endpoint agent on this machine — installs to
-#                       agent/plugins/<job_type>/. Not assumed to run under
+#                       agent/installed_plugins/<job_type>/. Not assumed to run under
 #                       systemd; restart it yourself afterwards.
 #
 # Example (run from inside plugins/):
@@ -47,11 +53,11 @@ SERVICE_NAME=""
 
 if [[ "$TARGET" == scanner:* ]]; then
     SCANNER_NAME="${TARGET#scanner:}"
-    DEST="$INSTALL_DIR/backend/app/plugins/$JOB_TYPE"
+    DEST="$INSTALL_DIR/backend/app/installed_plugins/$JOB_TYPE"
     ENV_FILE="$INSTALL_DIR/.env"
     SERVICE_NAME="vapt-scanner-$SCANNER_NAME"
 elif [ "$TARGET" == "agent" ]; then
-    DEST="$INSTALL_DIR/agent/plugins/$JOB_TYPE"
+    DEST="$INSTALL_DIR/agent/installed_plugins/$JOB_TYPE"
     ENV_FILE="$INSTALL_DIR/agent/.env"
 else
     echo "Error: target must be 'scanner:NAME' or 'agent'"
