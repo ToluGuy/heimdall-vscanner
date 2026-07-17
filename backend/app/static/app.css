@@ -11,11 +11,11 @@
             /* ── Light theme ── */
             body.theme-light {
                 --tw-bg-opacity: 1;
-                background-color: #f1f5f9 !important;
+                background-color: #e2e8f0 !important;
                 color: #0f172a !important;
             }
-            body.theme-light .bg-gray-950  { background-color: #f1f5f9 !important; }
-            body.theme-light .bg-gray-900  { background-color: #ffffff !important; }
+            body.theme-light .bg-gray-950  { background-color: #e2e8f0 !important; }
+            body.theme-light .bg-gray-900  { background-color: #ffffff !important; box-shadow: 0 1px 3px rgba(15,23,42,0.08); }
             body.theme-light .bg-gray-800  { background-color: #f8fafc !important; }
             body.theme-light .bg-gray-750  { background-color: #f1f5f9 !important; }
             body.theme-light .bg-gray-700  { background-color: #e2e8f0 !important; }
@@ -26,10 +26,10 @@
             body.theme-light .text-gray-300 { color: #334155 !important; }
             body.theme-light .text-gray-400 { color: #475569 !important; }
             body.theme-light .text-gray-500 { color: #64748b !important; }
-            body.theme-light .text-gray-600 { color: #94a3b8 !important; }
-            body.theme-light .text-gray-700 { color: #cbd5e1 !important; }
+            body.theme-light .text-gray-600 { color: #57667a !important; }
+            body.theme-light .text-gray-700 { color: #94a3b8 !important; }
             body.theme-light .text-white    { color: #0f172a !important; }
-            body.theme-light .bg-gray-950.bg-opacity-95 { background-color: rgba(241,245,249,0.97) !important; }
+            body.theme-light .bg-gray-950.bg-opacity-95 { background-color: rgba(226,232,240,0.97) !important; }
             /* Keep accent colours as-is in light mode — green, blue, red etc stay vivid */
              
             /* ── Result card hover tooltip ── */

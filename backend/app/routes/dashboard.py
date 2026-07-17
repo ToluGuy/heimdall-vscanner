@@ -17,7 +17,7 @@ router = APIRouter()
 
 # static/ lives at backend/app/static — one level up from this routes/ package
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
-STATIC_MEDIA_TYPES = {"app.js": "application/javascript", "app.css": "text/css"}
+STATIC_MEDIA_TYPES = {"app.js": "application/javascript", "app.css": "text/css", "favicon.svg": "image/svg+xml"}
 
 
 @router.get("/")
