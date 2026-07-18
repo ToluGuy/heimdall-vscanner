@@ -1,5 +1,35 @@
 # Changelog
 
+## [v3.1.1] - 17-07-2026
+
+### Added
+- Updated README and Changelog at project root, which were missing
+  from v3.0 and v3.1
+
+### Changed
+- Renamed the plugin deployment directories to avoid confusion with the
+  repo-root `plugins/` source folder:
+  - `backend/app/plugins/` → `backend/app/installed_plugins/`
+  - `agent/plugins/` → `agent/installed_plugins/`
+- Updated everywhere that path was hardcoded: `scanner.py` and `agent.py`
+  (`run_plugin()`), `services/hooks.py` (`HOOK_PLUGIN_DIR`),
+  `install_plugin.sh`/`uninstall_plugin.sh` destination paths, the
+  `.gitignore` pattern, and the README
+
+### Action required
+- Any scanner or agent that already has plugins deployed needs the
+  folder moved by hand — nothing does this automatically across
+  machines:
+  ```bash
+  mv backend/app/plugins backend/app/installed_plugins
+  mv agent/plugins agent/installed_plugins   # if applicable
+  ```
+  Until this is done on a given machine, `run_plugin()` will report the
+  job type as not installed there, even though the code is still on
+  disk under the old path.
+
+---
+
 ## [v3.1] - 17-07-2026
 
 ### Added
