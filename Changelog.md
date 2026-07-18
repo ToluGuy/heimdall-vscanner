@@ -1,6 +1,18 @@
 # Changelog
 
-## [v3.1.1] - 17-07-2026
+## [v3.2] - 18-07-2026
+ 
+### Added
+- Nuclei added as a fifth Loki tool (`nuclei_scan`, intrusive) —
+  template-based vulnerability scanning using Nuclei's community
+  template library (CVEs, exposed panels, default credentials,
+  misconfigurations). Same shape as the other four: `plugin.json` /
+  `run.py` / `setup.sh` / `NOTES.md`. Severity, template tags, and rate
+  limit are all admin-configurable per job rather than fixed.
+
+---
+
+## [v3.1.1] - 18-07-2026
 
 ### Added
 - Updated README and Changelog at project root, which were missing
