@@ -1,0 +1,29 @@
+{
+  "name": "nuclei_scan",
+  "display_name": "Nuclei Vulnerability Scan",
+  "version": "1.0.0",
+  "description": "Template-based vulnerability scanning using Nuclei's community template library — CVEs, exposed panels, default credentials, misconfigurations. Sends requests across however many templates are installed locally, filtered by severity/tags if set, so treat it as active recon like ffuf/whatweb/sqlmap.",
+  "job_types": [
+    {
+      "type": "nuclei_scan",
+      "label": "Nuclei Scan",
+      "agent_capability": "nuclei_scan",
+      "risk_tier": "intrusive",
+      "tab": "loki",
+      "section": "web",
+      "form_fields": [
+        { "name": "target", "type": "text", "required": true, "label": "Target URL" },
+        { "name": "severity", "type": "multiselect", "required": false, "label": "Minimum severity (leave empty for all)", "options": ["critical", "high", "medium", "low", "info"] },
+        { "name": "tags", "type": "text", "required": false, "label": "Template tags, comma-separated (optional, e.g. cve,exposure)" },
+        { "name": "rate_limit", "type": "number", "required": false, "label": "Rate limit (requests/sec)", "default": 150 }
+      ],
+      "result_display": {
+        "summary_fields": ["target", "total_findings"],
+        "sections": [
+          { "key": "findings", "label": "Findings", "type": "table", "columns": ["template_id", "name", "severity", "matched_at"] }
+        ]
+      }
+    }
+  ],
+  "hooks": []
+}
