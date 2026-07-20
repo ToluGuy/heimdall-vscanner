@@ -89,8 +89,8 @@ cd "$INSTALL_DIR"
 "$INSTALL_DIR/venv/bin/python" -c "
 import sys
 sys.path.insert(0, '.')
-from backend.app.db import engine, Base
-from backend.app.models import Agent, Job, Result, DiscoverySweep, Schedule, Host, Setting, Plugin, TargetAuthorization
+from backend.db import engine, Base
+from backend.models import Agent, Job, Result, DiscoverySweep, Schedule, Host, Setting, Plugin, TargetAuthorization
 Base.metadata.create_all(bind=engine)
 print('  Tables verified')
 "

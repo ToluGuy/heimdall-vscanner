@@ -251,8 +251,8 @@ cd "$INSTALL_DIR"
 "$INSTALL_DIR/venv/bin/python" -c "
 import sys
 sys.path.insert(0, '.')
-from backend.app.db import engine, Base
-from backend.app.models import Agent, Job, Result, DiscoverySweep, Schedule, Host, Setting, Plugin, TargetAuthorization
+from backend.db import engine, Base
+from backend.models import Agent, Job, Result, DiscoverySweep, Schedule, Host, Setting, Plugin, TargetAuthorization
 Base.metadata.create_all(bind=engine)
 print('  Tables created/verified')
 "
@@ -439,7 +439,7 @@ Type=simple
 User=${CURRENT_USER}
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
-ExecStart=${UVICORN_BIN} backend.app.main:app --host 0.0.0.0 --port 8000
+ExecStart=${UVICORN_BIN} backend.main:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -463,7 +463,7 @@ EnvironmentFile=${ENV_FILE}
 Environment=VAPT_AGENT_NAME=scanner-default
 Environment=VAPT_SERVER_URL=http://127.0.0.1:8000
 Environment=VAPT_CAPABILITIES=nmap_scan,nikto_scan,nse_scan
-ExecStart=${PYTHON_BIN} ${INSTALL_DIR}/backend/app/scanner.py
+ExecStart=${PYTHON_BIN} ${INSTALL_DIR}/backend/scanner.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

@@ -17,8 +17,8 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
-    from backend.app.db import SessionLocal
-    from backend.app.models import Agent, Job, Result, DiscoverySweep, Schedule
+    from backend.db import SessionLocal
+    from backend.models import Agent, Job, Result, DiscoverySweep, Schedule
 except ImportError as e:
     print(f"[✗] Import error: {e}")
     print("    Run this script from the project root directory.")

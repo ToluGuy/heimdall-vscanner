@@ -167,8 +167,8 @@ DB_PASSWORD=your-password
 
 ```bash
 python3 -c "
-from backend.app.db import engine, Base
-from backend.app.models import Agent, Job, Result, DiscoverySweep, Schedule, Host, Setting, Plugin, TargetAuthorization
+from backend.db import engine, Base
+from backend.models import Agent, Job, Result, DiscoverySweep, Schedule, Host, Setting, Plugin, TargetAuthorization
 Base.metadata.create_all(bind=engine)
 "
 ```
@@ -222,7 +222,7 @@ The `discovery_sweeps` and `hosts` tables are created automatically by SQLAlchem
 ### 8. Start the server
 
 ```bash
-uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
 ```
 
 The dashboard is available at `http://localhost:8000/dashboard`.
@@ -437,7 +437,7 @@ cd plugins/
 ./uninstall_plugin.sh <job_type> <scanner:NAME|agent>
 ```
 
-`install_plugin.sh` copies the plugin's code onto this machine (`backend/app/installed_plugins/<job_type>/` for a scanner, `agent/installed_plugins/<job_type>/` for an agent), updates that scanner/agent's advertised capabilities, and restarts the relevant systemd service if one exists. `uninstall_plugin.sh` is the reverse — removes the code and drops the capability.
+`install_plugin.sh` copies the plugin's code onto this machine (`backend/installed_plugins/<job_type>/` for a scanner, `agent/installed_plugins/<job_type>/` for an agent), updates that scanner/agent's advertised capabilities, and restarts the relevant systemd service if one exists. `uninstall_plugin.sh` is the reverse — removes the code and drops the capability.
 
 Both scripts locate the repo root relative to their own file location (one level up, since they live in `plugins/`), not your current directory — they work the same whether you run `./install_plugin.sh ...` from inside `plugins/` or `plugins/install_plugin.sh ...` from the repo root. **If you move either script, that assumption is what needs updating.**
 
@@ -457,24 +457,24 @@ Doing only the first leaves the job type registered with no code backing it on t
 ### Two `plugins/` directories — this is intentional
 
 - **`plugins/`** at the repo root is the *source* — install_plugin.sh, uninstall_plugin.sh, and a ready-to-deploy copy of each first-party plugin (`plugins/ffuf/`, `plugins/whatweb/`, etc). This is what's committed to the repo.
-- **`backend/app/installed_plugins/`** and **`agent/installed_plugins/`** are *deployment targets* — where `install_plugin.sh` copies a plugin's code once you actually enable it on a specific machine. These are per-machine artifacts, not source, and shouldn't be committed — see `.gitignore` below.
+- **`backend/installed_plugins/`** and **`agent/installed_plugins/`** are *deployment targets* — where `install_plugin.sh` copies a plugin's code once you actually enable it on a specific machine. These are per-machine artifacts, not source, and shouldn't be committed — see `.gitignore` below.
 
-The one exception is `backend/app/installed_plugins/hooks/`, which ships pre-installed (it's how webhook notifications work out of the box) rather than requiring a manual install step.
+The one exception is `backend/installed_plugins/hooks/`, which ships pre-installed (it's how webhook notifications work out of the box) rather than requiring a manual install step.
 
 ```gitignore
 # Locally-deployed plugin code — per-machine artifacts, not source.
 # Only hooks/ and asset_inventory_scan/ ship pre-installed with the repo.
-backend/app/installed_plugins/*
-!backend/app/installed_plugins/hooks/
-!backend/app/installed_plugins/asset_inventory_scan/
+backend/installed_plugins/*
+!backend/installed_plugins/hooks/
+!backend/installed_plugins/asset_inventory_scan/
 agent/installed_plugins/*
 ```
 
-If a plugin folder under `backend/app/installed_plugins/` or `agent/installed_plugins/` was already committed before adding this, the `.gitignore` entry alone won't untrack it — you'll also need `git rm -r --cached <path>` once, after which it'll be ignored normally.
+If a plugin folder under `backend/installed_plugins/` or `agent/installed_plugins/` was already committed before adding this, the `.gitignore` entry alone won't untrack it — you'll also need `git rm -r --cached <path>` once, after which it'll be ignored normally.
 
 ### Hooks
 
-Plugins can also register for lifecycle events (`job.completed`, `job.failed`, `host.new`) rather than adding a scan type — the webhook notifications plugin (`backend/app/installed_plugins/hooks/webhook/`) is the built-in example, and ships pre-installed.
+Plugins can also register for lifecycle events (`job.completed`, `job.failed`, `host.new`) rather than adding a scan type — the webhook notifications plugin (`backend/installed_plugins/hooks/webhook/`) is the built-in example, and ships pre-installed.
 
 ---
 
@@ -510,31 +510,30 @@ heimdall-vscanner/
 │   ├── SETUP_GUIDE.md        # Agent and local scanner setup guide
 │   └── installed_plugins/    # Deployed agent-side plugin code, per-machine
 ├── backend/
-│   └── app/
-│       ├── main.py           # FastAPI app assembly only — routes live in routes/
-│       ├── core.py           # Job type registry, risk tiers, settings defaults
-│       ├── models.py         # SQLAlchemy database models
-│       ├── schemas.py        # Pydantic request/response schemas
-│       ├── db.py             # Database connection and session
-│       ├── logger.py         # Logging configuration
-│       ├── ai_analysis.py    # AI-powered scan analysis (optional)
-│       ├── scanner.py        # Agentless remote scanner (runs alongside the backend)
-│       ├── routes/           # One module per resource — agents, jobs, results, hosts,
-│       │                     # schedules, discovery, reports, insights, topology,
-│       │                     # settings, dashboard, plugins, authorizations
-│       ├── services/
-│       │   ├── scheduler.py  # Recurring schedule dispatch
-│       │   └── hooks.py      # Fires job.completed/job.failed/host.new to plugins
-│       ├── installed_plugins/ # Deployed scanner-side plugin code
-│       │   ├── hooks/webhook/          # Ships pre-installed (not gitignored)
-│       │   ├── asset_inventory_scan/   # Ships pre-installed (not gitignored)
-│       │   └── ...                     # Everything else here is gitignored —
-│       │                                # per-machine, deployed via install_plugin.sh
-│       └── static/
-│           ├── index.html    # Dashboard markup
-│           ├── app.js        # Dashboard logic
-│           ├── app.css       # Theme (dark + light)
-│           └── favicon.svg
+│   ├── main.py                # FastAPI app assembly only — routes live in routes/
+│   ├── core.py                # Job type registry, risk tiers, settings defaults
+│   ├── models.py              # SQLAlchemy database models
+│   ├── schemas.py             # Pydantic request/response schemas
+│   ├── db.py                  # Database connection and session
+│   ├── logger.py              # Logging configuration
+│   ├── ai_analysis.py         # AI-powered scan analysis (optional)
+│   ├── scanner.py             # Agentless remote scanner (runs alongside the backend)
+│   ├── routes/                # One module per resource — agents, jobs, results, hosts,
+│   │                          # schedules, discovery, reports, insights, topology,
+│   │                          # settings, dashboard, plugins, authorizations
+│   ├── services/
+│   │   ├── scheduler.py       # Recurring schedule dispatch
+│   │   └── hooks.py           # Fires job.completed/job.failed/host.new to plugins
+│   ├── installed_plugins/     # Deployed scanner-side plugin code
+│   │   ├── hooks/webhook/          # Ships pre-installed (not gitignored)
+│   │   ├── asset_inventory_scan/   # Ships pre-installed (not gitignored)
+│   │   └── ...                     # Everything else here is gitignored —
+│   │                                # per-machine, deployed via install_plugin.sh
+│   └── static/
+│       ├── index.html         # Dashboard markup
+│       ├── app.js             # Dashboard logic
+│       ├── app.css            # Theme (dark + light)
+│       └── favicon.svg
 ├── plugins/                   # Plugin SOURCE
 │   ├── install_plugin.sh     # Deploys a plugin's code onto a scanner/agent
 │   ├── uninstall_plugin.sh   # Removes it again
@@ -647,4 +646,4 @@ Common mistakes:
 - For a `scanner:NAME` target, the script looks for a systemd service named `vapt-scanner-NAME` to restart. If you're running that scanner manually (not via systemd), you'll see a message saying so — that's not an error, just restart it yourself.
 
 **There are two `plugins/` folders — which one do I use?**
-`plugins/` at the repo root is where you run `install_plugin.sh` from, and where first-party plugin source lives. `backend/app/installed_plugins/` (and `agent/installed_plugins/`) are deployment targets that `install_plugin.sh` writes to — you shouldn't need to touch those directly, and they shouldn't be committed (see [Plugins](#plugins) above for the `.gitignore` entry). If `backend/app/installed_plugins/` has a folder you don't recognize, it's either something `install_plugin.sh` deployed, or `hooks/`/`asset_inventory_scan/`, which ship pre-installed.
+`plugins/` at the repo root is where you run `install_plugin.sh` from, and where first-party plugin source lives. `backend/installed_plugins/` (and `agent/installed_plugins/`) are deployment targets that `install_plugin.sh` writes to — you shouldn't need to touch those directly, and they shouldn't be committed (see [Plugins](#plugins) above for the `.gitignore` entry). If `backend/installed_plugins/` has a folder you don't recognize, it's either something `install_plugin.sh` deployed, or `hooks/`/`asset_inventory_scan/`, which ship pre-installed.

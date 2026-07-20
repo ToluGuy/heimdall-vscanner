@@ -20,7 +20,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
-    from backend.app.db import SessionLocal
+    from backend.db import SessionLocal
     import sqlalchemy
 except ImportError as e:
     print(f"[✗] Import error: {e}")
