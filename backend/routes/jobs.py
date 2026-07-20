@@ -1,4 +1,4 @@
-# backend/app/routes/jobs.py
+# backend/routes/jobs.py
 
 import json
 import threading

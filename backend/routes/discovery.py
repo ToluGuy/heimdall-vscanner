@@ -1,4 +1,4 @@
-# backend/app/routes/discovery.py
+# backend/routes/discovery.py
 
 import json
 import threading

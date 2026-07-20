@@ -1,4 +1,4 @@
-# backend/app/routes/dashboard.py
+# backend/routes/dashboard.py
 #
 # serve_static() is a small hand-written route rather than Starlette's
 # StaticFiles mount: StaticFiles/FileResponse pull in aiofiles on some
@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse, Response
 
 router = APIRouter()
 
-# static/ lives at backend/app/static — one level up from this routes/ package
+# static/ lives at backend/static — one level up from this routes/ package
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
 STATIC_MEDIA_TYPES = {"app.js": "application/javascript", "app.css": "text/css", "favicon.svg": "image/svg+xml"}
 

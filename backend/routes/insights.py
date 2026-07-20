@@ -1,4 +1,4 @@
-# backend/app/routes/insights.py
+# backend/routes/insights.py
 
 import json
 from datetime import datetime, timedelta

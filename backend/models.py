@@ -1,4 +1,4 @@
-# backend/app/models.py
+# backend/models.py
 
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Text
 from datetime import datetime

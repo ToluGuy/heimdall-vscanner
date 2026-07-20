@@ -1,4 +1,4 @@
-# backend/app/routes/authorizations.py
+# backend/routes/authorizations.py
 #
 # Backs the authorization gate checked in routes/jobs.py's create_job() for
 # any job type whose risk_tier is "high". See

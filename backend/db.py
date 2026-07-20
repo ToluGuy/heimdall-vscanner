@@ -1,4 +1,4 @@
-# backend/app/db.py
+# backend/db.py
 
 import os
 from urllib.parse import quote_plus

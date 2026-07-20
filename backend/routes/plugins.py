@@ -1,4 +1,4 @@
-# backend/app/routes/plugins.py
+# backend/routes/plugins.py
 #
 # Registers plugin METADATA only — see PLUGIN_ARCHITECTURE_PROPOSAL.md
 # section 1. Nothing here ever transmits or executes plugin code; a

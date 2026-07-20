@@ -1,4 +1,4 @@
-# backend/app/plugins/hooks/webhook/run.py
+# backend/plugins/hooks/webhook/run.py
 #
 # Built-in reference hook plugin — posts a JSON payload to a configured
 # webhook URL. Ships pre-installed so the common notification case works

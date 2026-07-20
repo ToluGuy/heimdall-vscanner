@@ -1,4 +1,4 @@
-# backend/app/routes/results.py
+# backend/routes/results.py
 
 import json
 import threading

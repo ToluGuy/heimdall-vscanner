@@ -1,4 +1,4 @@
-# backend/app/routes/agents.py
+# backend/routes/agents.py
 #
 # Everything to do with the Agent resource: dashboard-facing registration/
 # management (HTTP Basic auth) and the agent daemon's own self-reporting

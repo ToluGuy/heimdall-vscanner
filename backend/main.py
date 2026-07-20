@@ -1,4 +1,4 @@
-# backend/app/main.py
+# backend/main.py
 #
 # FastAPI app assembly only. Route handlers live in routes/*.py (one file per
 # resource), background jobs live in services/scheduler.py, and shared

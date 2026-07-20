@@ -1,4 +1,4 @@
-# backend/app/routes/schedules.py
+# backend/routes/schedules.py
 
 from datetime import datetime, timedelta
 

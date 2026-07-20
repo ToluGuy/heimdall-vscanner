@@ -1,4 +1,4 @@
-# backend/app/core.py
+# backend/core.py
 #
 # Shared config, auth, and helpers used by 2+ route modules. Route-specific
 # helpers (used by only one routes/*.py file) live in that file instead —
@@ -22,11 +22,11 @@ STALE_AGENT_HOURS = int(os.environ.get("STALE_AGENT_HOURS", "24"))
 SCHEDULE_TICK_SECONDS = 60   # how often the scheduler wakes up to check
 
 # ── Scanner auto-spawn settings ───────────────────────────────────────────────
-# INSTALL_DIR: the project root (two levels up from this file: backend/app/core.py)
-INSTALL_DIR  = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# INSTALL_DIR: the project root (one level up from this file: backend/core.py)
+INSTALL_DIR  = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PYTHON_BIN   = _sys.executable
 ENV_FILE     = os.path.join(INSTALL_DIR, ".env")
-SCANNER_PY   = os.path.join(INSTALL_DIR, "backend", "app", "scanner.py")
+SCANNER_PY   = os.path.join(INSTALL_DIR, "backend", "scanner.py")
 # Set SCANNER_AUTOSTART=true in .env to allow the dashboard to spawn scanner
 # instances via systemctl. Requires the sudoers rule added by install.sh.
 SCANNER_AUTOSTART = os.environ.get("SCANNER_AUTOSTART", "false").lower() == "true"
