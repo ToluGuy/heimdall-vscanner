@@ -1294,7 +1294,7 @@ VAPT_AGENT_NAME=${name} \
 VAPT_SERVER_URL=${serverUrl} \
 VAPT_CAPABILITIES=${data.capabilities} \
 VAPT_KEY_FILE=${data.key_file || name + '_key.txt'} \
-python3 backend/app/scanner.py`;
+python3 backend/scanner.py`;
 
             const serviceFile = `[Unit]
 Description=Heimdall V-Scanner — ${name}
@@ -1310,7 +1310,7 @@ Environment=VAPT_AGENT_NAME=${name}
 Environment=VAPT_SERVER_URL=${serverUrl}
 Environment=VAPT_CAPABILITIES=${data.capabilities}
 Environment=VAPT_KEY_FILE=${data.key_file || name + '_key.txt'}
-ExecStart=${data.key_file ? data.key_file.replace(/\/[^/]+$/, '') + '/venv/bin/python ' + data.key_file.replace(/\/[^/]+$/, '') + '/backend/app/scanner.py' : '/opt/vapt-scanner-project/venv/bin/python /opt/vapt-scanner-project/backend/app/scanner.py'}
+ExecStart=${data.key_file ? data.key_file.replace(/\/[^/]+$/, '') + '/venv/bin/python ' + data.key_file.replace(/\/[^/]+$/, '') + '/backend/scanner.py' : '/opt/vapt-scanner-project/venv/bin/python /opt/vapt-scanner-project/backend/scanner.py'}
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
@@ -1344,7 +1344,7 @@ VAPT_AGENT_NAME=${name} \
 VAPT_SERVER_URL=${serverUrl} \
 VAPT_CAPABILITIES=${caps} \
 VAPT_KEY_FILE=${name}_key.txt \
-python3 backend/app/scanner.py`;
+python3 backend/scanner.py`;
 
             const serviceFile = `[Unit]
 Description=Heimdall V-Scanner — ${name}
@@ -1360,7 +1360,7 @@ Environment=VAPT_AGENT_NAME=${name}
 Environment=VAPT_SERVER_URL=${serverUrl}
 Environment=VAPT_CAPABILITIES=${caps}
 Environment=VAPT_KEY_FILE=/opt/vapt-scanner-project/${name}_key.txt
-ExecStart=/opt/vapt-scanner-project/venv/bin/python /opt/vapt-scanner-project/backend/app/scanner.py
+ExecStart=/opt/vapt-scanner-project/venv/bin/python /opt/vapt-scanner-project/backend/scanner.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

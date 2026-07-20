@@ -1,4 +1,4 @@
-# backend/app/services/scheduler.py
+# backend/services/scheduler.py
 #
 # Background threads started at app startup (see main.py's startup event):
 # stale-agent flagging (hourly) and schedule-driven job creation (every

@@ -1,4 +1,4 @@
-# backend/app/services/hooks.py
+# backend/services/hooks.py
 #
 # Dispatches server-side events (job completed, host discovered, ...) to any
 # enabled plugin subscribed to them. Same safety boundary as scan plugins'
