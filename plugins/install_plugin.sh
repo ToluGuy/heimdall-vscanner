@@ -22,7 +22,7 @@
 # <job_type>            Must match the "type" in that plugin's plugin.json.
 # scanner:NAME          A scanner registered through the dashboard, e.g.
 #                       scanner:scanner-default — installs to
-#                       backend/app/installed_plugins/<job_type>/ and restarts
+#                       backend/installed_plugins/<job_type>/ and restarts
 #                       vapt-scanner-NAME via systemd.
 # agent                 The endpoint agent on this machine — installs to
 #                       agent/installed_plugins/<job_type>/. Not assumed to run under
@@ -53,7 +53,7 @@ SERVICE_NAME=""
 
 if [[ "$TARGET" == scanner:* ]]; then
     SCANNER_NAME="${TARGET#scanner:}"
-    DEST="$INSTALL_DIR/backend/app/installed_plugins/$JOB_TYPE"
+    DEST="$INSTALL_DIR/backend/installed_plugins/$JOB_TYPE"
     ENV_FILE="$INSTALL_DIR/.env"
     SERVICE_NAME="vapt-scanner-$SCANNER_NAME"
 elif [ "$TARGET" == "agent" ]; then

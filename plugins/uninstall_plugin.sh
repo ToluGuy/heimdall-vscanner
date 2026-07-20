@@ -35,7 +35,7 @@ SERVICE_NAME=""
 
 if [[ "$TARGET" == scanner:* ]]; then
     SCANNER_NAME="${TARGET#scanner:}"
-    DEST="$INSTALL_DIR/backend/app/installed_plugins/$JOB_TYPE"
+    DEST="$INSTALL_DIR/backend/installed_plugins/$JOB_TYPE"
     ENV_FILE="$INSTALL_DIR/.env"
     SERVICE_NAME="vapt-scanner-$SCANNER_NAME"
 elif [ "$TARGET" == "agent" ]; then
