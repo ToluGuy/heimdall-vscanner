@@ -1,5 +1,62 @@
 # Changelog
 
+## [v3.2.1] - 22-07-2026
+ 
+### Changed
+- Collapsed `backend/app/` into `backend/` — the extra nesting level had
+  nothing else in it and nothing was using it (no Dockerfile, no
+  per-service tooling, no Alembic). `main.py`, `core.py`, `models.py`,
+  `schemas.py`, `db.py`, `logger.py`, `ai_analysis.py`, `scanner.py`,
+  `routes/`, `services/`, `installed_plugins/`, and `static/` are now
+  direct children of `backend/`.
+- Updated every hardcoded reference to the old path: `tools/reset_stuck_jobs.py`,
+  `reset_db.py`, `seed_test_jobs.py`, `check_db.py`, `purge_history.py`
+  (import paths), `install.sh`/`update.sh` (their embedded migration
+  snippets, plus the generated systemd `ExecStart` lines),
+  `vapt-server.service`, `plugins/install_plugin.sh`,
+  `plugins/uninstall_plugin.sh`, and the README.
+- Internal relative imports (`.db`, `..models`, etc.) needed no changes —
+  confirmed by actually importing the collapsed package end to end
+  (stubbing out FastAPI/SQLAlchemy where a real install isn't available)
+  rather than assuming the theory held.
+### Fixed
+- `backend/core.py` computed `INSTALL_DIR` as two directory levels up
+  from itself and hardcoded `backend/app/scanner.py` for `SCANNER_PY` —
+  both were only correct at the pre-collapse depth. Neither broke basic
+  server startup (`main.py` loads `.env` independently of these), but
+  both would have broken the scanner auto-spawn feature in
+  `routes/agents.py` the next time it was used. Verified the fix by
+  resolving both paths against a matching directory layout, not just
+  reading the code.
+- `plugins/install_plugin.sh` and `plugins/uninstall_plugin.sh` had only
+  been partially updated and still pointed at the pre-collapse
+  `backend/app/installed_plugins` path.
+- `.gitignore` still had `agent/plugins/*` from the earlier
+  `installed_plugins` rename (v3.1.1) — never actually updated at the
+  time, meaning `agent/installed_plugins/` deployments may not have been
+  correctly ignored since.
+- `vapt-scanner.service` (the checked-in template) still pointed at a
+  repo-root `scanner.py` that hasn't existed since the v2.0 refactor.
+  `install.sh` itself already generated the correct path when actually
+  creating the service, so this was a stale template file only, not a
+  live bug — fixed to match.
+- Cleaned up stale `# backend/app/...` header comments left across most
+  of `backend/` — harmless to execution, but misleading during
+  debugging.
+### Action required
+- Any scanner or agent with an existing `backend/app/` deployment needs
+  it moved by hand:
+```bash
+  mv backend/app/* backend/ && rmdir backend/app
+```
+  Until that's done on a given machine, imports will fail at startup —
+  this isn't a partial-degradation case, the service won't come up.
+- If you're starting the server manually rather than via
+  `vapt-server.service`, the command itself changes:
+  `uvicorn backend.main:app --reload` (not `backend.app.main:app`).
+
+---
+
 ## [v3.2] - 18-07-2026
  
 ### Added
