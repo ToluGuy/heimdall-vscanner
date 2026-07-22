@@ -6,7 +6,7 @@ __pycache__/
 logs/
 Changelogformat.md
 migrations/
-backend/app/installed_plugins/*
-!backend/app/installed_plugins/hooks/
-!backend/app/installed_plugins/asset_inventory_scan/
+backend/installed_plugins/*
+!backend/installed_plugins/hooks/
+!backend/installed_plugins/asset_inventory_scan/
 agent/plugins/*
