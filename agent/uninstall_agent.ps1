@@ -22,7 +22,7 @@ Write-Host "  ──────────────────────
 Write-Host ""
 
 $AgentDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$InstallDir = "$env:USERPROFILE\vapt-agent"
+$InstallDir = "$env:USERPROFILE\heimdall-agent"
 
 # ── Stop and remove NSSM service if present ───────────────────────────────────
 $NssmPath = (Get-Command nssm -ErrorAction SilentlyContinue)?.Source
