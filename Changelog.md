@@ -1,5 +1,45 @@
 # Changelog
 
+## [v3.2.2] - 23-07-2026
+
+### Fixed
+- Re-synced the repository with `.gitignore` — a few files that should
+  have been excluded (e.g. `ffuf_scan` under `backend/installed_plugins/`)
+  were still being tracked from before the relevant ignore rules
+  existed. Untracked everything and re-added it (`git rm -r --cached .`
+  + `git add .`) to bring tracking back in line with what's actually
+  meant to be committed. No code changes.
+- `agent/uninstall_agent.ps1` looked for the install directory at
+  `%USERPROFILE%\vapt-agent`, but `setup_agent.ps1` actually installs to
+  `%USERPROFILE%\heimdall-agent` — a naming mismatch that meant the
+  uninstaller would stop the service and remove shortcuts correctly, but
+  silently fail to remove the actual install directory. Fixed to match.
+
+### Documentation
+- `agent/SETUP_GUIDE.md` brought up to date — it predated the entire
+  plugin system and had drifted in a few other ways too:
+  - Documented `VAPT_REGISTRATION_TOKEN` and expanded the Capabilities
+    reference table to include all five Loki tools alongside the
+    built-ins
+  - Added an **Installing plugins on an agent** section, including a
+    documented gotcha: `install_plugin.sh ... agent` deploys relative to
+    the repo, which never reaches an agent set up via the automated
+    setup scripts (they run from a separate install directory) — noted
+    with a workaround
+  - Documented `setup_agent.sh` (the automated Linux setup script) and
+    both `uninstall_agent.sh`/`uninstall_agent.ps1`, none of which were
+    previously mentioned anywhere in the guide despite already existing
+  - Restructured the Linux section to present the automated script
+    first and manual setup as the fallback, matching how the Windows
+    section was already organized
+  - Added an **Uninstalling** section covering both platforms, including
+    the note that neither uninstaller touches `installed_plugins/` —
+    that's a separate cleanup step if any Loki tools were deployed
+  - Fixed the same stale `vapt-agent` install-path naming in the guide's
+    own Windows prose, to match the `uninstall_agent.ps1` fix above
+
+---
+
 ## [v3.2.1] - 22-07-2026
  
 ### Changed
